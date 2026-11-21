@@ -593,20 +593,36 @@ export function createRoutingEvaluator(db: Db, opts: RoutingOptions) {
     if (task === undefined) return false;
     const ws = workspaceOf(db, taskId);
     if (ws === undefined) return false;
-    const source = "engine-verification";
-    const rel = feedbackRelPath(taskId, source);
+    // SOURCE from the entry row (re-judge finding): a wedge created by a
+    // crash between rejectGate and the op's requeue recovers with the
+    // GATE-REJECT label and the operator's feedback (the entry row's
+    // reason), not a mislabeled engine-verification artifact.
+    const entry = db
+      .prepare(
+        `SELECT from_state, reason FROM state_transition_logs
+          WHERE task_id = ? AND to_state = 'changes_requested'
+          ORDER BY created_at DESC, id DESC LIMIT 1`,
+      )
+      .get(taskId) as { from_state: string; reason: string | null } | undefined;
+    const source = entry?.from_state === "awaiting_gate" ? "gate-reject" : "engine-verification";
     const abs = join(novaflowDir(ws.root), "runs", taskId, "feedback", `${source}.json`);
     let content: string;
     if (existsSync(abs)) {
       content = readFileSync(abs, "utf8");
     } else {
       const run = latestRun(db, taskId);
+      const recoveredSummary =
+        entry?.reason ?? run?.error_summary ?? "engine verification failed (recovered at boot)";
       content =
         JSON.stringify(
           {
-            kind: "novaflow-self-verification-feedback",
+            kind:
+              source === "gate-reject"
+                ? "novaflow-gate-reject-feedback"
+                : "novaflow-self-verification-feedback",
             task_id: taskId,
-            summary: run?.error_summary ?? "engine verification failed (recovered at boot)",
+            ...(source === "gate-reject" ? { rejected_at_boot: true } : {}),
+            summary: recoveredSummary,
           },
           null,
           2,

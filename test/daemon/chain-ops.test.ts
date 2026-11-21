@@ -1093,6 +1093,10 @@ test("boot order: an unrouted review occurrence survives the crash window — ro
         .prepare("SELECT created_at FROM state_transition_logs WHERE task_id = ? AND from_state = 'completed' AND to_state = 'changes_requested' LIMIT 1")
         .get(t) as { created_at: string }).created_at;
       ro2.close();
+      // `>` would flake on created_at's ms resolution: the chain's
+      // completed_at may land in the same millisecond as the re-entry.
+      // The synchronous sweep order IS the guarantee (routing completes
+      // before the chain sweep evaluates); the timestamps corroborate.
       assert.ok(
         chainAt !== null && entryAt !== null && chainAt >= entryAt,
         `the chain closed only after the routed rerun (entry ${entryAt}, chain ${chainAt})`,
@@ -1159,3 +1163,90 @@ test("self-path boot recovery: a member wedged in changes_requested by a crash r
     }
     rmSync(dir, { recursive: true, force: true });
   });
+
+test("self-path boot recovery, budget spent: the ESCALATION arm (re-judge finding 1)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-selfesc-"));
+  const seeded = seedFileStore(dir);
+  const { tasks } = importChainOffline(seeded, dir, {
+    version: "1.0.0",
+    project_slug: "prj",
+    tasks: [{ key: "S", title: "Self", objective: "The objective of the self task.", profile_name: "dev" }],
+    edges: [],
+  });
+  const s = tasks["S"]!.id;
+  const rw = new Database(seeded.dbPath);
+  applyTransition(rw, s, ENQUEUE_TRIGGER, { triggerType: "human", actor: "seed" });
+  applyTransition(rw, s, START_TRIGGER, { triggerType: "engine", actor: "seed" });
+  applyTransition(rw, s, VALIDATING_TRIGGER, { triggerType: "engine", actor: "seed" });
+  applyTransition(rw, s, VERIFY_FAILED_TRIGGER, { triggerType: "engine", actor: "seed", reason: "engine verification failed" });
+  // the entry's side effect + a SPENT budget: retry_count floored at max
+  rw.prepare("UPDATE tasks SET retry_count = 1, max_retries = 1 WHERE id = ?").run(s);
+  rw.close();
+
+  const env = await bootOn(dir, seeded.dbPath, seeded.wsRoot);
+  try {
+    await new Promise((r) => setTimeout(r, 400));
+    const ro = new Database(seeded.dbPath);
+    const row = ro.prepare("SELECT state FROM tasks WHERE id = ?").get(s) as { state: string };
+    const escalations = ro
+      .prepare("SELECT COUNT(*) AS n FROM state_transition_logs WHERE task_id = ? AND from_state = 'changes_requested' AND to_state = 'awaiting_gate'")
+      .get(s) as { n: number };
+    const requeues = ro
+      .prepare("SELECT COUNT(*) AS n FROM state_transition_logs WHERE task_id = ? AND from_state = 'changes_requested' AND to_state = 'queued'")
+      .get(s) as { n: number };
+    ro.close();
+    assert.equal(row.state, "awaiting_gate", "the escalation arm fired — the gate owns the spent budget");
+    assert.equal(escalations.n, 1, "exactly one escalation row");
+    assert.equal(requeues.n, 0, "no requeue on a spent budget");
+  } finally {
+    await shutdown(env);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("boot summary recovery: present → untouched, deleted → rewritten (re-judge finding 2)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-sumrec-"));
+  const seeded = seedFileStore(dir);
+  const { chainRun, tasks } = importChainOffline(seeded, dir, {
+    version: "1.0.0",
+    project_slug: "prj",
+    tasks: [{ key: "M", title: "Member", objective: "The objective of the member task.", profile_name: "dev" }],
+    edges: [],
+  });
+  const m = tasks["M"]!.id;
+  const rw = new Database(seeded.dbPath);
+  driveToCompleted(rw, m);
+  // the chain's guarded completed move + an EXISTING summary file
+  rw.prepare("UPDATE chain_runs SET state = 'completed', completed_at = ? WHERE id = ? AND state = 'active'")
+    .run(new Date().toISOString(), chainRun.id);
+  rw.close();
+  const summaryDir = join(seeded.wsRoot, ".novaflow", "projects", "prj");
+  mkdirSync(summaryDir, { recursive: true });
+  const summaryFile = join(summaryDir, "PROJECT_SUMMARY.md");
+  writeFileSync(summaryFile, "the original report\n");
+
+  // ARM 1: file present → boot must not touch it
+  const env = await bootOn(dir, seeded.dbPath, seeded.wsRoot);
+  try {
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(readFileSync(summaryFile, "utf8"), "the original report\n", "present summary untouched at boot");
+  } finally {
+    // stop WITHOUT the dir cleanup (shutdown wipes it) — arm 2 reuses the store
+    env.client.close();
+    await env.handle.stop();
+  }
+
+  // ARM 2: file deleted → boot recovers it
+  rmSync(summaryFile);
+  const env2 = await bootOn(dir, seeded.dbPath, seeded.wsRoot);
+  try {
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(existsSync(summaryFile), "the deleted summary was recovered at boot");
+    const content = readFileSync(summaryFile, "utf8");
+    assert.match(content, /Member/); // the aggregated member section
+  } finally {
+    env2.client.close();
+    await env2.handle.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
