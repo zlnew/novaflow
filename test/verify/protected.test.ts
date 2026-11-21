@@ -125,6 +125,39 @@ test("globMatch: no brace expansion, no character classes — those are literals
   assert.equal(globMatch("{a,b}.ts", "{a,b}.ts"), true); // matches itself literally
 });
 
+test("globMatch: multiple `*` inside one segment (two-pointer scan semantics)", () => {
+  assert.equal(globMatch("a*b*c.ts", "axxbyyc.ts"), true);
+  assert.equal(globMatch("a*b*c.ts", "abbc.ts"), true);
+  assert.equal(globMatch("a*b*c.ts", "ac.ts"), false);
+  assert.equal(globMatch("a*b*c.ts", "xaxxb"), false);
+  assert.equal(globMatch("*a*", "a"), true);
+  assert.equal(globMatch("*a*", "b"), false);
+});
+
+test("globMatch: pathological patterns stay linear (no catastrophic backtracking)", () => {
+  // live-verified before the fix: the recursive matcher took 146 s on
+  // the first case and explodes exponentially on `**` chains. The
+  // matcher runs synchronously in startRun preflight and verification —
+  // it must be bounded. Generous wall-time slack to avoid flakes.
+  const deep = Array.from({ length: 60 }, (_, i) => `seg${i}`).join("/");
+  const cases: Array<[string, string]> = [
+    ["*".repeat(10) + "!", "a".repeat(60)],
+    ["**".repeat(30), deep],
+    ["*".repeat(30) + "a", "a".repeat(200)],
+    ["**/x/**/y/**", deep],
+  ];
+  for (const [pattern, path] of cases) {
+    const start = Date.now();
+    const result = globMatch(pattern, path);
+    const elapsed = Date.now() - start;
+    assert.ok(
+      elapsed < 500,
+      `globMatch(${JSON.stringify(pattern.slice(0, 40))}…) took ${elapsed} ms`,
+    );
+    void result;
+  }
+});
+
 /* ------------------------------ pre-run digest snapshot -------------------------- */
 
 test("writeProtectedDigests snapshots the protected set (SHA-256) into protected-digests.json", () => {

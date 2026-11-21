@@ -38,6 +38,13 @@ import { runGroupedCommand, type GroupedCommandOptions } from "./runner.ts";
  *     classes, NO `?`, NO negation. Patterns are matched against the
  *     path RELATIVE to the target root, in full (a pattern without a
  *     slash matches only root-level paths).
+ *
+ * Matcher performance: the naive recursive matcher backtracks
+ * catastrophically (146 s on `"*".repeat(10)+"!"` vs a 60-char
+ * segment; exponential on `**` chains). The matcher runs synchronously
+ * in startRun preflight and verification, so it is O(n·m) and bounded:
+ * `segmentMatch` is a linear two-pointer wildcard scan (no regex), and
+ * `matchSegments` memoizes on (pattern index, path index).
  */
 
 /** The snapshot's filename inside the run dir (shape documented below). */
@@ -51,28 +58,65 @@ export const GIT_STATUS_TIMEOUT_MS = 30_000;
 
 /* --------------------------------- glob matching ---------------------------------- */
 
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** One path segment: literal text with `*` wildcards (nothing else). */
+/**
+ * One path segment: literal text with `*` wildcards (nothing else).
+ * Linear two-pointer wildcard scan — the classic greedy algorithm
+ * (no regex: a `split("*").join(".*")` regex backtracks
+ * catastrophically on many-star patterns; see module doc).
+ */
 function segmentMatch(patternSegment: string, pathSegment: string): boolean {
-  const re = new RegExp(`^${patternSegment.split("*").map(escapeRe).join(".*")}$`);
-  return re.test(pathSegment);
+  let pi = 0;
+  let si = 0;
+  let starPat = -1; // index of the last `*` seen in the pattern
+  let starStr = 0; // the path position that `*` last matched through
+  while (si < pathSegment.length) {
+    if (pi < patternSegment.length && patternSegment[pi] === "*") {
+      starPat = pi++;
+      starStr = si;
+    } else if (pi < patternSegment.length && patternSegment[pi] === pathSegment[si]) {
+      pi++;
+      si++;
+    } else if (starPat >= 0) {
+      // backtrack: widen the last `*` by one character
+      pi = starPat + 1;
+      si = ++starStr;
+    } else {
+      return false;
+    }
+  }
+  while (pi < patternSegment.length && patternSegment[pi] === "*") pi++;
+  return pi === patternSegment.length;
 }
 
+/**
+ * Match a pattern's segments against a path's segments. Memoized on
+ * (pattern index, path index) — `**` chains otherwise retry
+ * exponentially many segment splits (see module doc).
+ */
 function matchSegments(pat: string[], path: string[]): boolean {
-  if (pat.length === 0) return path.length === 0;
-  const head = pat[0]!;
-  if (head === "**") {
-    for (let i = 0; i <= path.length; i++) {
-      if (matchSegments(pat.slice(1), path.slice(i))) return true;
+  const width = path.length + 1;
+  // 0 = unknown, 1 = true, -1 = false
+  const memo = new Int8Array((pat.length + 1) * width);
+  const visit = (pi: number, si: number): boolean => {
+    const hit = memo[pi * width + si]!;
+    if (hit !== 0) return hit === 1;
+    let res: boolean;
+    if (pi === pat.length) {
+      res = si === path.length;
+    } else if (pat[pi] === "**") {
+      res = false;
+      for (let k = si; k <= path.length && !res; k++) res = visit(pi + 1, k);
+    } else if (si === path.length) {
+      res = false;
+    } else if (segmentMatch(pat[pi]!, path[si]!)) {
+      res = visit(pi + 1, si + 1);
+    } else {
+      res = false;
     }
-    return false;
-  }
-  if (path.length === 0) return false;
-  if (!segmentMatch(head, path[0]!)) return false;
-  return matchSegments(pat.slice(1), path.slice(1));
+    memo[pi * width + si] = res ? 1 : -1;
+    return res;
+  };
+  return visit(0, 0);
 }
 
 /** Match a glob from the documented subset against a target-relative path. */
