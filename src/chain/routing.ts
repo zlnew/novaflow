@@ -12,13 +12,13 @@ import { REVIEW_REENTRY_TRIGGER } from "../fsm/triggers.ts";
 import { CHAIN_ENGINE_ACTOR } from "./readiness.ts";
 import { listChainMembers } from "./import.ts";
 import {
-  fireHalt,
   taskHaltNotifier,
   type HaltNotifier,
   type NotifyOptions,
   type NotifyResult,
 } from "../notify.ts";
 import { novaflowDir } from "../workspaces.ts";
+import { projectSummaryPath, writeProjectSummary } from "./summary.ts";
 
 /**
  * The FEEDBACK ROUTING evaluator (architecture 8.1 feedback routing
@@ -521,12 +521,19 @@ export function createRoutingEvaluator(db: Db, opts: RoutingOptions) {
    * that happened during downtime (or in a crash window) fires exactly
    * once — the per-target markers and the state guards back that up.
    */
-  async function bootScan(): Promise<{ chains: number; reviewRouted: number; fallbackEnqueued: number }> {
+  async function bootScan(): Promise<{
+    chains: number;
+    reviewRouted: number;
+    fallbackEnqueued: number;
+    selfPathResumed: number;
+    summariesRecovered: number;
+  }> {
     const chains = db
       .prepare("SELECT id FROM chain_runs WHERE state IN ('active', 'failed') ORDER BY id")
       .all() as Array<{ id: string }>;
     let reviewRouted = 0;
     let fallbackEnqueued = 0;
+    let selfPathResumed = 0;
     for (const chain of chains) {
       const members = listChainMembers(db, chain.id);
       for (const m of members) {
@@ -537,13 +544,91 @@ export function createRoutingEvaluator(db: Db, opts: RoutingOptions) {
           } else if (m.state === "failed" && isTerminalGateFailure(db, m.id)) {
             const out = await routeFailurePath(m.id);
             if (out !== null) fallbackEnqueued += out.enqueued.length;
+          } else if (m.state === "changes_requested") {
+            // SELF-PATH crash window (review round, judge A): a crash
+            // between the changes_requested entry and its requeue wedged
+            // the member — the routing rule promises "the task retries
+            // itself", so boot finishes the interrupted delivery. The
+            // feedback file usually exists (delivery precedes the entry
+            // in the live path); when it does not, the latest run's
+            // error_summary is the honest reconstruction.
+            selfPathResumed += resumeSelfPath(m.id) ? 1 : 0;
           }
         } catch (err) {
           warn(`chain ${chain.id}: boot routing of member ${m.id} refused — ${(err as Error).message}`);
         }
       }
     }
-    return { chains: chains.length, reviewRouted, fallbackEnqueued };
+    // FR-PRJ-05 crash window (review round): a crash between the guarded
+    // completed move and the file write leaves a completed chain with no
+    // report — recover it (write-once guard inside refuses duplicates).
+    let summariesRecovered = 0;
+    const done = db
+      .prepare("SELECT id FROM chain_runs WHERE state = 'completed' ORDER BY id")
+      .all() as Array<{ id: string }>;
+    for (const chain of done) {
+      try {
+        const summaryPath = projectSummaryPath(db, chain.id);
+        if (summaryPath !== null && !existsSync(summaryPath)) {
+          writeProjectSummary(db, chain.id);
+          summariesRecovered += 1;
+        }
+      } catch (err) {
+        warn(`chain ${chain.id}: boot summary recovery failed — ${(err as Error).message}`);
+      }
+    }
+    return { chains: chains.length, reviewRouted, fallbackEnqueued, selfPathResumed, summariesRecovered };
+  }
+
+  /**
+   * Finish an interrupted self-path delivery for a member found in
+   * changes_requested at boot: budget spent → the shared escalation;
+   * budget remaining → the shared requeue with the feedback file (the
+   * live path's own content when present, else the run's error_summary).
+   */
+  function resumeSelfPath(taskId: string): boolean {
+    const task = db
+      .prepare("SELECT retry_count, max_retries FROM tasks WHERE id = ?")
+      .get(taskId) as { retry_count: number; max_retries: number } | undefined;
+    if (task === undefined) return false;
+    const ws = workspaceOf(db, taskId);
+    if (ws === undefined) return false;
+    const source = "engine-verification";
+    const rel = feedbackRelPath(taskId, source);
+    const abs = join(novaflowDir(ws.root), "runs", taskId, "feedback", `${source}.json`);
+    let content: string;
+    if (existsSync(abs)) {
+      content = readFileSync(abs, "utf8");
+    } else {
+      const run = latestRun(db, taskId);
+      content =
+        JSON.stringify(
+          {
+            kind: "novaflow-self-verification-feedback",
+            task_id: taskId,
+            summary: run?.error_summary ?? "engine verification failed (recovered at boot)",
+          },
+          null,
+          2,
+        ) + "\n";
+    }
+    if (task.retry_count >= task.max_retries) {
+      const notifications: Promise<NotifyResult>[] = [];
+      escalateIfBudgetSpent(
+        db,
+        taskId,
+        task.retry_count,
+        task.max_retries,
+        { triggerType: "engine", actor: CHAIN_ENGINE_ACTOR },
+        notifyFor(taskId),
+        notifications,
+      );
+      return true;
+    }
+    if (driveSelfPathRequeue(db, taskId, source, content, CHAIN_ENGINE_ACTOR) !== null) {
+      return true;
+    }
+    return false;
   }
 
   return { routeReviewPath, routeFailurePath, bootScan };

@@ -902,11 +902,27 @@ test("write discipline: the daemon modules never issue a raw state UPDATE (grep-
     "src/chain/readiness.ts",
     "src/chain/graph.ts",
     "src/chain/yaml.ts",
+    "src/chain/routing.ts",
+    "src/chain/summary.ts",
     "src/daemonconfig.ts",
   ];
   for (const f of files) {
     const src = readFileSync(join(import.meta.dirname, "..", "..", f), "utf8");
-    assert.doesNotMatch(src, /UPDATE\s+tasks\b/i, `${f} must not UPDATE tasks directly`);
+    if (f === "src/chain/routing.ts") {
+      // the ONE sanctioned tasks write (FR-TSK-04 delivery): the context
+      // column append — every UPDATE tasks in routing.ts must be exactly
+      // this guarded form; all other columns stay forbidden
+      const taskWrites = src.match(/UPDATE\s+tasks\b/gi) ?? [];
+      const sanctioned = src.match(
+        /UPDATE tasks SET context_files_json = \?, updated_at = \? WHERE id = \?/g,
+      ) ?? [];
+      assert.equal(
+        taskWrites.length, sanctioned.length,
+        "routing.ts: every UPDATE tasks must be the sanctioned context_files_json form",
+      );
+    } else {
+      assert.doesNotMatch(src, /UPDATE\s+tasks\b/i, `${f} must not UPDATE tasks directly`);
+    }
     if (f.startsWith("src/chain/")) {
       // chain modules own chain_runs TERMINAL moves — every one must be the
       // guarded form (never a raw state write; a terminal chain never moves

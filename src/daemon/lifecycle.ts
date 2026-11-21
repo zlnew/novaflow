@@ -400,8 +400,15 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
     // once — the durable markers back the sweep up)
     await schedules.bootScan();
     retry.bootScan(); // spent budgets escalate; elapsed delays requeue
-    await chains.bootScan();
+    // BOOT ORDER (review round, judge-proven): routing BEFORE the chain
+    // sweep — a crash between completeValidation and routeReviewPath
+    // leaves an unrouted review occurrence on an all-completed chain;
+    // sweeping chains first would complete the chain and the routing
+    // sweep would then skip it, silently dropping the review round.
+    // Routing first re-enters the target (the chain stays active), THEN
+    // terminal rules evaluate against the true member states.
     await routing.bootScan();
+    await chains.bootScan();
 
     const daemonStatus = (): DaemonStatus => {
       const spend = globalSpend(db);
