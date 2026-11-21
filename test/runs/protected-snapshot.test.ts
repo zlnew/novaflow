@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import { execSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -83,14 +84,19 @@ function seed(): Seed {
   };
 }
 
-/** A scoped `directory` target with one protected file on disk. */
-function addTarget(s: Seed, root: string, protectedGlobs: string[]): string {
+/** A scoped target with one protected file on disk. */
+function addTarget(
+  s: Seed,
+  root: string,
+  protectedGlobs: string[],
+  type: "directory" | "git_repo" = "directory",
+): string {
   const targetId = ulid();
   s.db
     .prepare(
-      "INSERT INTO project_targets (id, project_id, alias, target_type, root_path) VALUES (?, ?, 'app', 'directory', ?)",
+      "INSERT INTO project_targets (id, project_id, alias, target_type, root_path) VALUES (?, ?, 'app', ?, ?)",
     )
-    .run(targetId, s.projectId, root);
+    .run(targetId, s.projectId, type, root);
   s.db
     .prepare(
       `INSERT INTO task_target_scopes
@@ -170,6 +176,45 @@ test("a scoped target whose root is missing is a preflight failure — no spawn,
     assert.match(row.error_summary ?? "", /protected digests: target root missing/);
     // the stub was never spawned
     assert.equal(existsSync(s.pidfile), false);
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+    rmSync(join(s.pidfile, ".."), { recursive: true, force: true });
+  }
+});
+
+test("a scoped git_repo target with >20k files inside node_modules/ passes preflight (pruned walk)", async (t) => {
+  const s = seed();
+  const tgtRoot = mkdtempSync(join(tmpdir(), "novaflow-repo-"));
+  mkdirSync(join(tgtRoot, "tests"), { recursive: true });
+  writeFileSync(join(tgtRoot, "tests", "p.test.ts"), "test('p', () => {});\n");
+  writeFileSync(join(tgtRoot, "readme.md"), "# readme\n");
+  // a fat node_modules: 21 000 files, beyond the walk's safety bound —
+  // digest-invariant, pruned from every walk
+  execSync(`bash -c "mkdir -p node_modules && touch node_modules/f{1..21000}"`, {
+    cwd: tgtRoot,
+    stdio: "ignore",
+  });
+  // `**/*` has no literal prefix → the walk covers the whole (pruned) tree
+  addTarget(s, tgtRoot, ["**/*"], "git_repo");
+  try {
+    const outcome = await withBound(t.signal, BOUND_MS, startRun(s.db, s.taskId, "engine-worker", {
+      piBin: "node",
+      args: [STUB, "run-ok", s.pidfile],
+      pricesPath: s.pricesPath,
+      extensionPath: "/ext/novaflow.ts",
+    }));
+    assert.equal(outcome.finalState, "validating");
+    const row = runRow(s);
+    assert.equal(row.preflight_status, "passed");
+    const snap = JSON.parse(readFileSync(join(row.pi_session_dir, SNAPSHOT_FILENAME), "utf8")) as {
+      targets: Array<{ files: Record<string, string> }>;
+    };
+    assert.deepEqual(Object.keys(snap.targets[0]?.files ?? {}).sort(), [
+      "readme.md",
+      "tests/p.test.ts",
+    ]);
+    rmSync(tgtRoot, { recursive: true, force: true });
   } finally {
     s.db.close();
     rmSync(s.wsRoot, { recursive: true, force: true });

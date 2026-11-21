@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join, relative } from "node:path";
 import type { Db } from "../store/db.ts";
 import { runGroupedCommand, type GroupedCommandOptions } from "./runner.ts";
@@ -22,13 +30,15 @@ import { runGroupedCommand, type GroupedCommandOptions } from "./runner.ts";
  * check only):
  *   - `git_repo`: `git status --porcelain` in the target root (all
  *     entries — staged, unstaged, untracked — count as modified; rename
- *     entries contribute their destination path).
+ *     entries contribute BOTH their source and destination paths).
  *   - `directory`: spec-silent → digest-based only. No VCS baseline
  *     exists, so the preflight snapshot for a directory target covers
  *     the WHOLE tree (full_tree = true) and modified paths are the
  *     digest diffs (changed, created, deleted) against that baseline.
  * A modified path that matches NO glob in `write_scope_globs_json` is
- * scope creep (RSK-17) and fails verification.
+ * scope creep (RSK-17) and fails verification. Symlinks are digest
+ * entries too, hashed by their TARGET string (never followed) — an
+ * agent-created or retargeted link is a modified path like any file.
  *
  * Glob matcher subset (documented in-code, deliberately minimal):
  *   - segments split on `/`; `**` matches ZERO OR MORE whole segments
@@ -131,31 +141,119 @@ export function globMatchAny(patterns: readonly string[], relPath: string): bool
 
 /* ---------------------------------- tree walking ---------------------------------- */
 
-/** All regular files under root, as target-relative POSIX-style paths. */
-export function walkFiles(root: string): string[] {
+/**
+ * Digest-invariant directories pruned from every tree walk
+ * (spec-silent, documented for the agent): `.git` internals churn with
+ * every git operation — git_repo targets already cover repo state via
+ * `git status` — and `node_modules` changes with every install while
+ * routinely exceeding the walk's safety bound by orders of magnitude.
+ * Neither may be relied on to carry task state; neither participates in
+ * digest baselines or protected-set snapshots (pruning wins even when a
+ * glob names them explicitly).
+ */
+const PRUNED_DIRS = new Set([".git", "node_modules"]);
+
+/**
+ * All regular files and symlinks (never followed) under the walked
+ * roots, as target-relative paths. `subRoots` (root-relative,
+ * POSIX-style) restricts the walk to those subtrees — used when every
+ * protected glob is literal-prefixed, so a scoped target's snapshot
+ * never walks (or trips the file-count bound on) the rest of the tree;
+ * `undefined` walks the whole tree, `[]` walks nothing (empty protected
+ * set). `.git` and `node_modules` are pruned everywhere (PRUNED_DIRS).
+ * A walk root that is a FILE contributes itself as a bare entry (the
+ * documented `src/**`-matches-bare-`src` case); a missing root matches
+ * nothing. Throws at MAX_TREE_FILES — callers translate (preflight
+ * error naming the target / verification finding).
+ */
+export function walkFiles(root: string, subRoots?: string[]): string[] {
   const out: string[] = [];
+  const count = (): void => {
+    if (out.length > MAX_TREE_FILES) {
+      throw new Error(
+        `target tree exceeds ${MAX_TREE_FILES} files under ${root} — refusing the digest snapshot (safety bound; spec-silent)`,
+      );
+    }
+  };
   const recurse = (dir: string): void => {
     const entries = readdirSync(dir, { withFileTypes: true });
     for (const ent of entries) {
       const abs = join(dir, ent.name);
-      if (ent.isDirectory()) recurse(abs);
-      else if (ent.isFile()) {
+      if (ent.isDirectory()) {
+        if (PRUNED_DIRS.has(ent.name)) continue;
+        recurse(abs);
+      } else if (ent.isFile() || ent.isSymbolicLink()) {
         out.push(relative(root, abs));
-        if (out.length > MAX_TREE_FILES) {
-          throw new Error(
-            `target tree exceeds ${MAX_TREE_FILES} files under ${root} — refusing the digest snapshot (safety bound; spec-silent)`,
-          );
-        }
+        count();
       }
     }
   };
-  recurse(root);
+  for (const rel of subRoots ?? [""]) {
+    const firstSegment = rel === "" ? "" : rel.split("/")[0]!;
+    if (firstSegment !== "" && PRUNED_DIRS.has(firstSegment)) continue; // pruning wins
+    const abs = join(root, rel);
+    let st;
+    try {
+      st = lstatSync(abs);
+    } catch {
+      continue; // a missing walk root simply matches nothing
+    }
+    if (st.isDirectory()) {
+      recurse(abs);
+    } else if (st.isFile() || st.isSymbolicLink()) {
+      out.push(relative(root, abs));
+      count();
+    }
+  }
   out.sort();
   return out;
 }
 
-function sha256File(absPath: string): string {
-  return createHash("sha256").update(readFileSync(absPath)).digest("hex");
+/** Leading literal (wildcard-free) segments of a glob — `["src"]` for
+ * `src/**`, `[]` once a segment contains `*` (e.g. `*.md` or a leading
+ * `**` segment). */
+function literalPrefix(pattern: string): string[] {
+  const out: string[] = [];
+  for (const seg of pattern.split("/")) {
+    if (seg.includes("*")) break;
+    out.push(seg);
+  }
+  return out;
+}
+
+/** Dedupe prefix roots, dropping any root nested inside another. */
+function dedupeSubRoots(prefixes: string[]): string[] {
+  const out: string[] = [];
+  for (const p of [...new Set(prefixes)].sort()) {
+    if (out.some((q) => p.startsWith(q + "/"))) continue;
+    out.push(p);
+  }
+  return out;
+}
+
+/**
+ * Walk roots covering everything the protected globs can match.
+ * Returns `undefined` (walk the whole tree) when any glob starts with
+ * a wildcard segment, and `[]` (walk nothing) for an empty protected
+ * set — otherwise the deduped literal prefixes, so e.g. `tests/**`
+ * snapshots without ever touching the rest of the repo.
+ */
+function protectedWalkRoots(protectedGlobs: readonly string[]): string[] | undefined {
+  if (protectedGlobs.length === 0) return [];
+  const prefixes = protectedGlobs.map((g) => literalPrefix(g).join("/"));
+  if (prefixes.some((p) => p === "")) return undefined;
+  return dedupeSubRoots(prefixes);
+}
+
+/**
+ * SHA-256 of one tree entry. A symlink's identity is its TARGET string
+ * (readlink, never followed — an agent link may point outside the
+ * target tree), so created/retargeted links are detectable digests.
+ */
+function sha256Path(absPath: string): string {
+  const st = lstatSync(absPath);
+  const data = st.isSymbolicLink() ? readlinkSync(absPath) : readFileSync(absPath);
+  return createHash("sha256").update(data).digest("hex");
 }
 
 /* ------------------------------- the snapshot file -------------------------------- */
@@ -171,7 +269,8 @@ export type ProtectedTargetSnapshot = {
    * git_repo targets snapshot ONLY the protected set (git names the
    * modified paths post-run). directory targets snapshot the WHOLE
    * tree — that baseline is the modified-path source (spec-silent
-   * reading; see module doc).
+   * reading; see module doc) — minus the digest-invariant PRUNED_DIRS,
+   * with symlinks hashed by target string.
    */
   full_tree: boolean;
   /** relative path → sha256 hex digest, at preflight time. */
@@ -239,10 +338,19 @@ export function writeProtectedDigests(db: Db, taskId: string, runDir: string, ru
     }
     const fullTree = t.target_type === "directory";
     const files: Record<string, string> = {};
-    for (const rel of walkFiles(t.root_path)) {
-      if (fullTree || globMatchAny(t.protected_globs, rel)) {
-        files[rel] = sha256File(join(t.root_path, rel));
+    // walk only what the protected globs can reach: literal-prefixed
+    // globs restrict the walk to their subtrees, an empty protected set
+    // walks nothing; directory baselines always walk the whole tree
+    const walkRoots = fullTree ? undefined : protectedWalkRoots(t.protected_globs);
+    try {
+      for (const rel of walkFiles(t.root_path, walkRoots)) {
+        if (fullTree || globMatchAny(t.protected_globs, rel)) {
+          files[rel] = sha256Path(join(t.root_path, rel));
+        }
       }
+    } catch (err) {
+      // never a raw walk error out of preflight: name the target
+      throw new Error(`target ${t.alias} (${t.root_path}): ${(err as Error).message}`);
     }
     return {
       target_id: t.target_id,
@@ -357,7 +465,7 @@ export async function verifyProtectedAndScope(
       currentAll = {};
       try {
         for (const rel of walkFiles(t.root_path)) {
-          currentAll[rel] = sha256File(join(t.root_path, rel));
+          currentAll[rel] = sha256Path(join(t.root_path, rel));
         }
       } catch (err) {
         untouched = false;
@@ -371,10 +479,19 @@ export async function verifyProtectedAndScope(
         if (globMatchAny(t.protected_globs, rel)) currentProtected[rel] = digest;
       }
     } else {
-      for (const rel of walkFiles(t.root_path)) {
-        if (globMatchAny(t.protected_globs, rel)) {
-          currentProtected[rel] = sha256File(join(t.root_path, rel));
+      // the protected-set walk (same roots the snapshot used) may fail
+      // — a >20k or unreadable tree is a FINDING, never a throw out of
+      // verification
+      try {
+        for (const rel of walkFiles(t.root_path, protectedWalkRoots(t.protected_globs))) {
+          if (globMatchAny(t.protected_globs, rel)) {
+            currentProtected[rel] = sha256Path(join(t.root_path, rel));
+          }
         }
+      } catch (err) {
+        untouched = false;
+        notes.push(`cannot walk target tree ${t.alias}: ${(err as Error).message}`);
+        continue;
       }
     }
 

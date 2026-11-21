@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extractDdl } from "../helpers/spec.ts";
@@ -213,6 +213,160 @@ test("writeProtectedDigests refuses a scoped target whose root is missing (prefl
     assert.throws(() => writeProtectedDigests(s.db, s.taskId, runDir, ulid()), /target root missing/i);
   } finally {
     s.db.close();
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+/** 21 000 junk files beyond MAX_TREE_FILES — created via brace expansion (fast). */
+function manyJunkFiles(root: string, dir: string): void {
+  execSync(`bash -c "mkdir -p ${dir} && touch ${dir}/f{1..21000}"`, { cwd: root, stdio: "ignore" });
+}
+
+test("the tree walk prunes .git and node_modules — digests never depend on them", () => {
+  const s = seed();
+  // gitRepo gives the root a real .git (objects, config, …)
+  const root = gitRepo({
+    "tests/protected.test.ts": "test('protected', () => {});\n",
+    "node_modules/pkg/index.js": "module.exports = {};\n",
+  });
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "app", root, protected: ["**/*"] });
+    const path = writeProtectedDigests(s.db, s.taskId, runDir, ulid());
+    const snap = JSON.parse(readFileSync(path, "utf8")) as {
+      targets: Array<{ files: Record<string, string> }>;
+    };
+    // .git internals and node_modules are digest-invariant: pruned from
+    // every walk, so an all-matching glob still snapshots only real files
+    assert.deepEqual(Object.keys(snap.targets[0]?.files ?? {}), ["tests/protected.test.ts"]);
+  } finally {
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("literal-prefixed protected globs walk only their subtrees — junk elsewhere never trips the bound", () => {
+  const s = seed();
+  const root = mkdtempSync(join(tmpdir(), "novaflow-repo-"));
+  mkdirSync(join(root, "tests"), { recursive: true });
+  writeFileSync(join(root, "tests", "p.test.ts"), "test('p', () => {});\n");
+  manyJunkFiles(root, "vendor"); // 21 000 files OUTSIDE the protected subtree
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "app", root, protected: ["tests/**"] });
+    const path = writeProtectedDigests(s.db, s.taskId, runDir, ulid());
+    const snap = JSON.parse(readFileSync(path, "utf8")) as {
+      targets: Array<{ files: Record<string, string> }>;
+    };
+    assert.deepEqual(Object.keys(snap.targets[0]?.files ?? {}), ["tests/p.test.ts"]);
+  } finally {
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("an empty protected set snapshots no files and never walks the tree", () => {
+  const s = seed();
+  const root = mkdtempSync(join(tmpdir(), "novaflow-repo-"));
+  mkdirSync(join(root, "tests"), { recursive: true });
+  writeFileSync(join(root, "tests", "p.test.ts"), "test('p', () => {});\n");
+  manyJunkFiles(root, "vendor"); // would blow the walk bound if walked
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "app", root, protected: [] });
+    const path = writeProtectedDigests(s.db, s.taskId, runDir, ulid());
+    const snap = JSON.parse(readFileSync(path, "utf8")) as {
+      targets: Array<{ files: Record<string, string> }>;
+    };
+    assert.deepEqual(snap.targets[0]?.files, {});
+  } finally {
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("a snapshot walk failure is a preflight error naming the target", () => {
+  const s = seed();
+  const root = mkdtempSync(join(tmpdir(), "novaflow-dir-"));
+  mkdirSync(join(root, "locked"), { recursive: true });
+  chmodSync(join(root, "locked"), 0o000); // unreadable subtree
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "docs", type: "directory", root, protected: [], write: ["**/*"] });
+    assert.throws(
+      () => writeProtectedDigests(s.db, s.taskId, runDir, ulid()),
+      /target docs/, // the walk error must name the target, not just the path
+    );
+  } finally {
+    chmodSync(join(root, "locked"), 0o700);
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable subtree during a git target's protected walk is a finding, never a throw", async () => {
+  const s = seed();
+  const root = gitRepo({ "tests/p.test.ts": "test('p', () => {});\n" });
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    // `**/*` has no literal prefix → the verification walk covers the
+    // whole tree and must swallow the unreadable subtree as a finding
+    addTarget(s, { alias: "app", root, protected: ["**/*"], write: ["**/*"] });
+    writeProtectedDigests(s.db, s.taskId, runDir, ulid());
+    mkdirSync(join(root, "locked"), { recursive: true });
+    chmodSync(join(root, "locked"), 0o000);
+    const res = await verifyProtectedAndScope(s.db, s.taskId, runDir);
+    assert.equal(res.protectedFilesUntouched, false); // fail closed: no evidence, no pass
+    assert.ok(
+      res.notes.some((n) => n.includes("cannot walk target tree app")),
+      JSON.stringify(res.notes),
+    );
+  } finally {
+    chmodSync(join(root, "locked"), 0o700);
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("symlinks are digest entries — created and retargeted links count as modified paths", async () => {
+  const s = seed();
+  const root = mkdtempSync(join(tmpdir(), "novaflow-dir-"));
+  mkdirSync(join(root, "data"), { recursive: true });
+  writeFileSync(join(root, "data", "x.txt"), "x\n");
+  symlinkSync("x.txt", join(root, "data", "link")); // in-scope symlink at snapshot time
+  symlinkSync("a", join(root, "out.link")); // out-of-scope symlink at snapshot time
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "docs", type: "directory", root, protected: [], write: ["data/**"] });
+    const path = writeProtectedDigests(s.db, s.taskId, runDir, ulid());
+    const snap = JSON.parse(readFileSync(path, "utf8")) as {
+      targets: Array<{ files: Record<string, string> }>;
+    };
+    // a symlink's identity is its target string — snapshotted like a file
+    assert.match(snap.targets[0]?.files["data/link"] ?? "", SHA256_RE);
+    assert.match(snap.targets[0]?.files["out.link"] ?? "", SHA256_RE);
+
+    // an agent-created symlink outside the write scope is scope creep
+    symlinkSync("/tmp", join(root, "rogue-link"));
+    let res = await verifyProtectedAndScope(s.db, s.taskId, runDir);
+    assert.deepEqual(res.scopeCreepPaths, ["docs/rogue-link"]);
+
+    // retargeting an out-of-scope symlink is a modified path → creep
+    rmSync(join(root, "out.link"));
+    symlinkSync("b", join(root, "out.link"));
+    res = await verifyProtectedAndScope(s.db, s.taskId, runDir);
+    assert.ok(
+      res.scopeCreepPaths.includes("docs/out.link"),
+      JSON.stringify(res.scopeCreepPaths),
+    );
+  } finally {
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
     rmSync(runDir, { recursive: true, force: true });
   }
 });
