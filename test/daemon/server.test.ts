@@ -187,7 +187,7 @@ test("multiple requests on one connection answer in order (per-connection serial
 
 /* ------------------------------ task lifecycle ops ----------------------------- */
 
-test("task create → run (catalog probe) → dispatch → validating; result + logs ops", async () => {
+test("task create → run (catalog probe) → dispatch → settle → auto-verification → completed; result + logs ops", async () => {
   const env = await boot();
   try {
     const taskId = await createTaskVia(env, "TASK-1");
@@ -206,13 +206,26 @@ test("task create → run (catalog probe) → dispatch → validating; result + 
     // dispatch may already have granted the slot — assert the enqueue,
     // not a race: the task left draft on the draft→queued row
     assert.notEqual(taskState(env, taskId), "draft");
-    await waitForState(env, taskId, "validating"); // dispatch → startRun → settle
+    // dispatch → startRun → settle into validating → the daemon's
+    // auto-verification (FR-TSK-12, no commands configured → passed)
+    // → completed via the guarded validating→completed row
+    await waitForState(env, taskId, "completed");
+    assert.deepEqual(
+      transitions(env, taskId).map((x) => [x["from_state"], x["to_state"]]),
+      [
+        ["draft", "queued"],
+        ["queued", "running"],
+        ["running", "validating"],
+        ["validating", "completed"],
+      ],
+    );
 
     // nova_task_status: full record, current run, no elapsed when concluded
     const status = await env.client.request({ id: "s", op: "nova_task_status", args: { task_id: taskId } });
     const statusData = status["data"] as Record<string, unknown>;
-    assert.equal((statusData["task"] as Record<string, unknown>)["state"], "validating");
+    assert.equal((statusData["task"] as Record<string, unknown>)["state"], "completed");
     assert.equal((statusData["current_run"] as Record<string, unknown>)["status"], "succeeded");
+    assert.equal((statusData["current_run"] as Record<string, unknown>)["engine_verification_passed"], 1);
     assert.equal(statusData["elapsed_ms"], null);
 
     // nova_result_get (mcp.md §3.1 tool table — the wire name): the validated result.json
@@ -237,7 +250,7 @@ test("task create → run (catalog probe) → dispatch → validating; result + 
     assert.match(eventsPath, /events\.jsonl$/); // the read surface, never events.raw.jsonl
 
     // task list with a state filter
-    const list = await env.client.request({ id: "l", op: "nova_task_list", args: { state: "validating" } });
+    const list = await env.client.request({ id: "l", op: "nova_task_list", args: { state: "completed" } });
     const tasks = (list["data"] as Record<string, unknown>)["tasks"] as Array<Record<string, unknown>>;
     assert.equal(tasks.length, 1);
     assert.equal(tasks[0]!["id"], taskId);
@@ -303,6 +316,76 @@ test("nova_task_run with an unresolvable model → profile_unresolved, zero toke
     client.close();
     await handle.stop();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ------------------- auto-verification wiring (FR-TSK-12) ------------------- */
+
+test("auto-verification wiring: a settled run is verified, annotated, and completed end to end (stub pi, exit-0 command)", async () => {
+  const env = await boot();
+  try {
+    // a directory target whose verification command exits 0
+    const targetRoot = join(env.dir, "targetroot");
+    mkdirSync(targetRoot, { recursive: true });
+    writeFileSync(join(targetRoot, "note.txt"), "clean tree\n");
+    const db = new Database(env.dbPath);
+    db.prepare(
+      `INSERT INTO project_targets (id, project_id, alias, target_type, root_path)
+       VALUES (?, ?, 'app', 'directory', ?)`,
+    ).run(ulid(), env.projectId, targetRoot);
+    db.close();
+
+    // mcp.md §3.2 payload: the create carries the scoped verification command
+    const res = await env.client.request({
+      id: "c-ver",
+      op: "nova_task_create",
+      args: {
+        project_id: env.projectId,
+        key: "VERIFY",
+        title: "v",
+        objective: "Do the thing.",
+        profile_name: "dev",
+        target_scopes: [
+          { repo_alias: "app", access_mode: "read_write", verification_commands: ["exit 0"] },
+        ],
+      },
+    });
+    assert.equal(res["ok"], true, JSON.stringify(res));
+    const taskId = (res["data"] as { task: { id: string } }).task.id;
+    await runVia(env, taskId);
+
+    // stub run -> settle -> validating -> the daemon's auto-verification
+    // -> completed (before the wiring the task dead-ended in validating)
+    await waitForState(env, taskId, "completed", 8000);
+
+    const ro = readConnection(env.dbPath);
+    const run = ro
+      .prepare("SELECT * FROM task_runs WHERE task_id = ? ORDER BY attempt_number DESC LIMIT 1")
+      .get(taskId) as Record<string, unknown>;
+    ro.close();
+    assert.equal(run["engine_verification_passed"], 1);
+
+    // the artifact carries the engine-owned annotations (never agent-authored)
+    const artifact = JSON.parse(
+      readFileSync(String(run["artifact_path"]), "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal(artifact["engine_verified"], true);
+    assert.equal(artifact["protected_files_untouched"], true);
+    const vr = artifact["verification_results"] as Array<Record<string, unknown>>;
+    assert.equal(vr.length, 1);
+    assert.equal(vr[0]!["command"], "exit 0");
+    assert.equal(vr[0]!["passed"], true);
+    assert.equal(vr[0]!["exit_code"], 0);
+
+    // the guarded validating→completed row, engine-triggered, run-pinned
+    const tr = transitions(env, taskId);
+    const last = tr[tr.length - 1]!;
+    assert.equal(last["from_state"], "validating");
+    assert.equal(last["to_state"], "completed");
+    assert.equal(last["trigger_type"], "engine");
+    assert.match(String(last["reason"]), /engine verification passed/);
+  } finally {
+    await shutdown(env);
   }
 });
 

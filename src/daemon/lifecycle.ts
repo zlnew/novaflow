@@ -12,7 +12,11 @@ import { recoverOrphanedRuns, type RecoveryReport } from "./recovery.ts";
 import { createDispatcher, type DispatchStatus } from "./dispatch.ts";
 import { createRetryEvaluator, type RetryEvaluator } from "./retry.ts";
 import { bindControlServer, type ControlServer } from "./server.ts";
-import type { RunOptions } from "../runs/loop.ts";
+import { runVerification } from "../verify/runner.ts";
+import { verifyProtectedAndScope } from "../verify/protected.ts";
+import { annotateRunVerification } from "../verify/artifact-annotate.ts";
+import { completeValidation } from "../validating.ts";
+import type { RunOptions, RunOutcome } from "../runs/loop.ts";
 import type { NotifyOptions } from "../notify.ts";
 
 /**
@@ -95,6 +99,10 @@ function readVersion(): string {
   }
 }
 
+function warn(message: string): void {
+  console.warn(`[novaflow-daemon] ${message}`);
+}
+
 /** Global spend since the current UTC day/month start (spec-silent: UTC boundaries). */
 function globalSpend(db: Db): { today: number; month: number } {
   const now = new Date();
@@ -161,6 +169,66 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
     // an unregistered evaluator left its bootScan-armed timer alive
     // past a refused boot, firing on the closed store)
     retryRef = retry;
+
+    // FR-TSK-12 auto-verification wiring. THE SEAM: dispatch's
+    // run-conclusion hook — i.e. AFTER startRun has fully resolved
+    // (task settled into validating, child reaped), never inside the
+    // startRun call path, so the verification spawns can never recurse
+    // into dispatch. Scope (documented): the run-settle outcome only;
+    // a gate-APPROVED validating task is left to the operator/scheduler
+    // surfaces, and boot-recovery replays stay in validating (recovery
+    // owns §8.4 reconciliation, not new engine verdicts).
+    const verificationInFlight = new Set<Promise<void>>();
+    const settleVerification = (taskId: string, outcome: RunOutcome): void => {
+      const run = outcome.runs[outcome.runs.length - 1]!; // the settled attempt
+      const job = (async (): Promise<void> => {
+        try {
+          const verify = await runVerification(db, taskId);
+          const protectedCheck = await verifyProtectedAndScope(db, taskId, run.pi_session_dir);
+          annotateRunVerification(db, run.id, verify, protectedCheck);
+          const passed =
+            verify.passed &&
+            protectedCheck.protectedFilesUntouched &&
+            protectedCheck.scopeCreepPaths.length === 0 &&
+            !protectedCheck.scopeCheckInconclusive;
+          const summary = passed
+            ? `engine verification passed (${verify.results.length} command${
+                verify.results.length === 1 ? "" : "s"
+              })`
+            : [
+                verify.collectionError !== null
+                  ? `verification command collection failed: ${verify.collectionError}`
+                  : null,
+                ...verify.results
+                  .filter((r) => !r.passed)
+                  .map((r) => `command "${r.command}" failed (exit ${r.exitCode ?? "none"})`),
+                ...protectedCheck.scopeCreepPaths.map((p) => `scope creep: ${p}`),
+                ...protectedCheck.notes,
+              ]
+                .filter((s): s is string => s !== null)
+                .join("; ") || "engine verification failed";
+          const validation = completeValidation(
+            db,
+            taskId,
+            passed ? { passed } : { passed, summary },
+            "daemon-verify",
+            ...(opts.notifyOptions !== undefined ? [{ notifyOptions: opts.notifyOptions }] : []),
+          );
+          // the failure-entry hook fires naturally: a failed verdict
+          // reaches the retry/escalation evaluator exactly like a run
+          // failure (which the dispatch hook already routes)
+          if (validation.finalState === "failed") retry.evaluate(taskId);
+        } catch (err) {
+          // never-crash: a guard refusal (the task moved meanwhile —
+          // operator abort, gate op) or a store closing mid-verification
+          // is logged, and the task stays where the other surface put it
+          warn(`auto-verification of task ${taskId} did not complete: ${(err as Error).message}`);
+        }
+      })();
+      verificationInFlight.add(job);
+      void job.finally(() => verificationInFlight.delete(job));
+    };
+
     const dispatcher = createDispatcher(db, {
       globalConcurrency: daemonConfig.concurrency.global,
       runOptions,
@@ -168,6 +236,10 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       onRunConcluded: (taskId: string, outcome) => {
         if ("finalState" in outcome && outcome.finalState === "failed") {
           retry.evaluate(taskId);
+        } else if ("finalState" in outcome && outcome.finalState === "validating") {
+          // FR-TSK-12: a settled validating task gets its independent
+          // engine verification (see settleVerification's seam doc)
+          settleVerification(taskId, outcome);
         }
       },
     });
@@ -201,6 +273,10 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       if (server !== undefined) await server.close(); // stop accepting, unlink the socket
       await dispatcher.stop(); // reap live runs (operator-abort semantics)
       retry.stop(); // clear every armed timer
+      // the documented stop rule (header): no spawned process outlives
+      // the handle — in-flight verification commands are awaited (their
+      // own timeout/kill discipline bounds the wait)
+      await Promise.allSettled([...verificationInFlight]);
       db.close();
     };
 
