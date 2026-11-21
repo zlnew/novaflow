@@ -7,6 +7,8 @@ import { ulid } from "../../src/store/ids.ts";
 import { applyTransition, InvalidTransitionError } from "../../src/fsm/engine.ts";
 import { createTask, ENQUEUE_TRIGGER } from "../../src/tasks.ts";
 import { START_TRIGGER, RUN_FAILED_TRIGGER } from "../../src/runs/triggers.ts";
+import { ROWS } from "../../src/fsm/matrix.ts";
+import { confirmFailureGate } from "../../src/gates.ts";
 import {
   AUTO_RETRY_TRIGGER,
   OPERATOR_RETRY_TRIGGER,
@@ -75,6 +77,65 @@ function evaluator(s: Seed, delaySec: number) {
   });
 }
 
+/**
+ * An operator-CONFIRMED terminal gate failure: the task ran, settled
+ * into awaiting_gate, and the operator confirmed the failure gate
+ * (the verbatim awaiting_gate→failed terminal row, retry budget floored
+ * at max_retries) — through the REAL gate service, never a hand-built
+ * row.
+ */
+function makeConfirmedFailedTask(): Seed {
+  const db = new Database(":memory:");
+  db.exec(extractDdl());
+  db.prepare("INSERT INTO workspaces (id, slug, name, root_path) VALUES (?, 'ws', 'ws', '/tmp/nf-ws')").run(ulid());
+  const workspaceId = (db.prepare("SELECT id FROM workspaces").get() as { id: string }).id;
+  db.prepare(
+    "INSERT INTO projects (id, workspace_id, slug, name, objective) VALUES (?, ?, 'prj', 'prj', 'o')",
+  ).run(ulid(), workspaceId);
+  const projectId = (db.prepare("SELECT id FROM projects").get() as { id: string }).id;
+  db.prepare(
+    `INSERT INTO agent_profiles (id, workspace_id, name, provider, model, thinking_level,
+       system_prompt_path, max_timeout_sec, max_cost_usd)
+     VALUES (?, NULL, 'dev', 'anthropic', 'm', 'medium', 'p.md', 60, 5)`,
+  ).run(ulid());
+  const profileId = (db.prepare("SELECT id FROM agent_profiles").get() as { id: string }).id;
+  const task = createTask(db, {
+    projectId,
+    key: "TASK-CONFIRMED",
+    title: "t",
+    objective: "o",
+    profileId,
+  });
+  db.prepare("UPDATE tasks SET max_retries = 3, retry_count = 0 WHERE id = ?").run(task.id);
+  applyTransition(db, task.id, ENQUEUE_TRIGGER, { triggerType: "engine", actor: "test" });
+  applyTransition(db, task.id, START_TRIGGER, { triggerType: "engine", actor: "test" });
+  const runId = ulid();
+  db.prepare(
+    `INSERT INTO task_runs (id, task_id, attempt_number, pi_session_id, pi_session_dir,
+       status, preflight_status, model_used, events_log_path)
+     VALUES (?, ?, 1, ?, ?, 'succeeded', 'passed', 'm', '/tmp/nf-events.jsonl')`,
+  ).run(runId, task.id, runId, "/tmp/nf-run");
+  // running → awaiting_gate: the requires_human_gate settle row (verbatim)
+  const gateSettle = ROWS.find((r) => r.state === "running" && r.target === "awaiting_gate")!;
+  applyTransition(db, task.id, gateSettle.trigger, {
+    triggerType: "engine",
+    actor: "test",
+    runId,
+  });
+  // the operator confirms failure — the TERMINAL gate row
+  confirmFailureGate(
+    db,
+    { task_id: task.id, run_id: runId, approved_by: "maul", note: "confirmed broken" },
+    "human",
+    {
+      notify: () => Promise.resolve({ ok: true, topic: "ops" } as NotifyResult),
+    },
+  );
+  const alerts: HaltAlert[] = [];
+  const requeues: string[] = [];
+  return { db, taskId: task.id, alerts, requeues };
+}
+
 function state(s: Seed): string {
   return (s.db.prepare("SELECT state FROM tasks WHERE id = ?").get(s.taskId) as { state: string }).state;
 }
@@ -90,6 +151,49 @@ function wait(ms: number): Promise<void> {
 }
 
 /* --------------------------------- escalation path --------------------------------- */
+
+test("regression: an operator-CONFIRMED terminal gate failure is never resurrected at boot — stays failed, no notify, no timer", async () => {
+  const s = makeConfirmedFailedTask();
+  try {
+    const r = evaluator(s, 300);
+    const decisions = r.bootScan();
+    assert.deepEqual(decisions, [{ kind: "terminal-gate", finalState: "failed" }]);
+    assert.equal(state(s), "failed");
+    // no escalation notify fired — the evaluator's collector saw nothing
+    assert.equal(s.alerts.length, 0);
+    // no failed→awaiting_gate ESCALATION row was ever written (the seed's
+    // running→awaiting_gate settle row is the task's legitimate gate entry)
+    assert.equal(
+      (s.db.prepare("SELECT COUNT(*) AS n FROM state_transition_logs WHERE task_id = ? AND from_state = 'failed' AND to_state = 'awaiting_gate'").get(s.taskId) as { n: number }).n,
+      0,
+    );
+    // terminal means terminal: even a short-delay evaluator arms no
+    // auto-retry timer for it
+    const short = evaluator(s, 0.05);
+    const d = short.evaluate(s.taskId);
+    assert.deepEqual(d, { kind: "terminal-gate", finalState: "failed" });
+    await wait(300);
+    assert.equal(state(s), "failed"); // never requeued, never moved
+    r.stop();
+    short.stop();
+  } finally {
+    s.db.close();
+  }
+});
+
+test("a run-failed task with a spent budget still escalates — the terminal-gate skip is source-row-based, not budget-based", () => {
+  const s = makeFailedTask({ retryCount: 3, maxRetries: 3 });
+  try {
+    const r = evaluator(s, 300);
+    const d = r.evaluate(s.taskId);
+    assert.equal(d.kind, "escalated");
+    assert.equal(state(s), "awaiting_gate");
+    assert.equal(s.alerts.length, 1);
+    r.stop();
+  } finally {
+    s.db.close();
+  }
+});
 
 test("budget spent on entry to failed → the verbatim failed→awaiting_gate escalation + halt notify", () => {
   const s = makeFailedTask({ retryCount: 3, maxRetries: 3 });

@@ -23,6 +23,14 @@ import {
  *     verbatim failed→awaiting_gate escalation row + halt notify
  *     (FAILED_NEEDS_HUMAN_REVIEW is served by the gate surface);
  *     otherwise arm the auto-retry timer.
+ *   - EXCEPT an operator-CONFIRMED terminal gate failure: when the
+ *     task's most recent failed-targeting log row came from
+ *     awaiting_gate (the matrix's ONLY awaiting_gate→failed row is the
+ *     verbatim "operator confirms failure (terminal gate outcome)"
+ *     row, whose gate floors retry_count at max_retries), the failure
+ *     is terminal — no escalation, no retry timer, on boot or
+ *     evaluation. Resurrecting an operator's terminal decision on
+ *     every restart is the one thing this evaluator must never do.
  *   - The timer measures `retry.delay_sec` (daemon config, default 300)
  *     from the failed transition's state_transition_logs.created_at —
  *     data.md's authoritative transition time — so a delay already
@@ -58,6 +66,7 @@ export type RetryDecision =
   | { kind: "escalated"; finalState: "awaiting_gate" }
   | { kind: "timer-armed"; delaySec: number; fromCreatedAt: string }
   | { kind: "requeued"; finalState: "queued" }
+  | { kind: "terminal-gate"; finalState: "failed" }
   | { kind: "not-failed"; state: string };
 
 export type OperatorRetryMeta = {
@@ -93,6 +102,22 @@ export function createRetryEvaluator(db: Db, opts: RetryOptions) {
     return Number.isFinite(atMs)
       ? { createdAt: row.created_at, atMs }
       : { createdAt: row.created_at, atMs: Date.now() };
+  }
+
+  /**
+   * The source state of the LAST entry into failed. The log schema has
+   * no trigger column, so the source ROW is identified by from_state:
+   * the matrix's ONLY awaiting_gate→failed row is the verbatim
+   * "operator confirms failure (terminal gate outcome)" row — an
+   * operator's terminal decision, never resurrected.
+   */
+  function lastFailedEntryFrom(taskId: string): string | null {
+    const row = db
+      .prepare(
+        "SELECT from_state FROM state_transition_logs WHERE task_id = ? AND to_state = 'failed' ORDER BY created_at DESC, id DESC LIMIT 1",
+      )
+      .get(taskId) as { from_state: string } | undefined;
+    return row?.from_state ?? null;
   }
 
   function clearTimer(taskId: string): void {
@@ -149,6 +174,13 @@ export function createRetryEvaluator(db: Db, opts: RetryOptions) {
     if (!task) return { kind: "not-failed", state: "missing" };
     if (task.state !== "failed") return { kind: "not-failed", state: task.state };
     clearTimer(taskId);
+
+    // an operator-CONFIRMED terminal gate failure (the verbatim
+    // awaiting_gate→failed row) floors the budget and ends the task:
+    // no escalation, no timer — terminal means terminal
+    if (lastFailedEntryFrom(taskId) === "awaiting_gate") {
+      return { kind: "terminal-gate", finalState: "failed" };
+    }
 
     if (task.retry_count >= task.max_retries) {
       return escalate(task, taskId);
