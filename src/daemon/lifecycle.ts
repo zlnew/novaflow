@@ -127,6 +127,9 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
   let server: ControlServer | undefined;
   let dispatcherRef: ReturnType<typeof createDispatcher> | undefined;
   let retryRef: RetryEvaluator | undefined;
+  // assigned AT CREATION (the p3a retryRef lesson): a boot-failure catch must
+  // be able to stop an evaluator that exists when the throw lands
+  let schedulesRef: ScheduleEvaluator | undefined;
   let stopped = false;
   try {
     migrate(db);
@@ -251,6 +254,7 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       },
       actor: "scheduler",
     });
+    schedulesRef = schedules; // at creation, for the boot-failure catch
 
     const dispatcher = createDispatcher(db, {
       globalConcurrency: daemonConfig.concurrency.global,
@@ -341,6 +345,9 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
     // started (timers, dispatcher, socket) and closes the store
     if (dispatcherRef !== undefined) await dispatcherRef.stop();
     if (retryRef !== undefined) retryRef.stop();
+    // a boot-failure path closes the store too — an in-flight schedule fire
+    // is bound-awaited first (re-judge residual: same race as the stop path)
+    if (schedulesRef !== undefined) await schedulesRef.stop();
     if (server !== undefined) await server.close();
     db.close();
     throw err;

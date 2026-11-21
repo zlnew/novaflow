@@ -284,6 +284,11 @@ export function createScheduleEvaluator(db: Db, opts: ScheduleEvaluatorOptions) 
    * timeout-bounded, so the wait is bounded by that plus a grace (the
    * review round's shutdown race: db.close() must not land inside a
    * fire's continuation).
+   *
+   * Best-effort bound (re-judge note): it assumes the common single-due-row
+   * fire. A pass that serially probes N hanging rows can exceed it — the
+   * belt catch + quarantine keep that safe (no crash), straggler rows stay
+   * unadvanced and are absorbed at the next boot by their missed_policy.
    */
   async function stop(): Promise<void> {
     const probeBound = (opts.enqueueOptions?.timeoutMs ?? 5000) + 1500;
