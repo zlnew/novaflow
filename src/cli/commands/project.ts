@@ -3,6 +3,7 @@ import { parseArgs, UsageError, type ArgSpec } from "../args.ts";
 import { renderKv, renderTable } from "../format.ts";
 import { workspaceContext } from "../context.ts";
 import { operatorActor } from "../context.ts";
+import { readFileSync } from "node:fs";
 import type { CommandOpts } from "../opts.ts";
 
 /**
@@ -17,7 +18,7 @@ import type { CommandOpts } from "../opts.ts";
  */
 
 const SPEC: ArgSpec = {
-  valueFlags: ["objective", "workspace"],
+  valueFlags: ["objective", "workspace", "project"],
   repeatableFlags: ["target"],
 };
 
@@ -35,8 +36,10 @@ export async function projectCommand(argv: string[], opts: CommandOpts): Promise
       return status(p, opts);
     case "phase":
       return phase(p, opts);
+    case "import-dag":
+      return importDag(p, opts);
     default:
-      throw new UsageError(`nova project [create|list|status|phase]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`);
+      throw new UsageError(`nova project [create|list|status|phase|import-dag]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`);
   }
 }
 
@@ -207,6 +210,53 @@ async function phase(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promis
         ? `project phase: ${data.phase} (change audited)`
         : `project phase already: ${data.phase} (no change, nothing audited)`,
     );
+  }
+  return 0;
+}
+
+/**
+ * `nova project import-dag <file> [--project <slug>]` (srs 4.1.1;
+ * FR-PRJ-04): the CLI is a THIN CLIENT — it reads the file's RAW TEXT
+ * and passes it (+ a format hint derived from the extension: .json →
+ * json, .yaml/.yml → yaml, anything else → auto) to the daemon, the
+ * single parse+validate+import source. `--project` is a consistency
+ * pin only: the §4.3 schema CARRIES project_slug, and a mismatch
+ * refuses (exit 3) — the flag never retargets the import.
+ */
+async function importDag(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
+  const file = p.positionals[1];
+  if (file === undefined) {
+    throw new UsageError("nova project import-dag <file> [--project <slug>]");
+  }
+  let graphText: string;
+  try {
+    graphText = readFileSync(file, "utf8");
+  } catch (err) {
+    throw new OpFailureError("not_found", `cannot read ${file}: ${(err as Error).message}`);
+  }
+  const ext = file.slice(file.lastIndexOf(".") + 1).toLowerCase();
+  const format = ext === "json" ? "json" : ext === "yaml" || ext === "yml" ? "yaml" : undefined;
+  const ctx = await workspaceContext(p.values.get("workspace") ?? opts.workspace);
+  const data = (await daemonRequest("nova_project_import_dag", {
+    workspace_id: ctx.id,
+    graph_text: graphText,
+    ...(format !== undefined ? { format } : {}),
+    ...(p.values.get("project") !== undefined ? { project_slug: p.values.get("project") } : {}),
+  })) as {
+    chain_run_id: string;
+    chain_run: { state: string };
+    tasks: Record<string, { id: string; key: string; state: string }>;
+  };
+  if (opts.json) {
+    console.log(JSON.stringify(data));
+    return 0;
+  }
+  const members = Object.values(data.tasks);
+  console.log(
+    `imported chain ${data.chain_run_id} (${data.chain_run.state}) — ${members.length} member${members.length === 1 ? "" : "s"} in draft; enqueue roots with 'nova task run'`,
+  );
+  for (const m of members) {
+    console.log(`  ${m.key} (tsk_${m.id}) — ${m.state}`);
   }
   return 0;
 }

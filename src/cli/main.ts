@@ -15,6 +15,7 @@ import { profileCommand } from "./commands/profile.ts";
 import { taskCommand } from "./commands/task.ts";
 import { scheduleCommand } from "./commands/schedule.ts";
 import { daemonCommand } from "./commands/daemon.ts";
+import { chainCommand } from "./commands/chain.ts";
 import type { CommandOpts } from "./opts.ts";
 
 /**
@@ -22,10 +23,10 @@ import type { CommandOpts } from "./opts.ts";
  * JSONL socket surface: one command = one op call (single-writer rule,
  * architecture 8.1). The CLI never opens the SQLite store.
  *
- * Honest refusals: `nova chain` and `nova mcp` are NOT in this phase
- * (p4/p5) — invoking one prints a refusal to stderr and exits 2
- * (never fake success). The usage table lists them with their phase
- * note.
+ * Honest refusal: `nova mcp` is NOT in this phase (p5) — invoking it
+ * prints a refusal to stderr and exits 2 (never fake success). The
+ * usage table lists it with its phase note. `nova chain` shipped in
+ * p4a (list/status/abort + FR-TSK-08's pause/resume).
  */
 
 const VERSION = readVersion();
@@ -49,6 +50,7 @@ const USAGE = `USAGE: nova <noun> <sub> [args] [flags]
   nova workspace list | switch <slug> | archive <slug> | unregister <slug>
   nova project create <name> --objective <text> [--target alias=path[:git_repo|directory]]...
   nova project list | status <id|slug> | phase <id|slug> <label...>
+  nova project import-dag <file> [--project <slug>]
   nova profile create --file <path> | list | validate <name>
   nova task create <key> --title <t> --objective <o> --profile <name> --project <slug|id> [--gate] [--context <path>]...
   nova task run <id|key> [--watch] | status <id|key> [--watch] | list
@@ -61,7 +63,8 @@ const USAGE = `USAGE: nova <noun> <sub> [args] [flags]
   nova schedule attach <id|key> [--cron '<expr>' | --at <iso>] [--missed skip|run_immediately]
   nova schedule list [--task <id|key>] [--workspace <slug|id>]
   nova schedule pause <schedule-id> | resume <schedule-id>
-  nova chain ...      (not implemented in this phase)
+  nova chain list | status <chain-run-id>
+  nova chain abort | pause | resume <chain-run-id>
   nova mcp            (not implemented in this phase)`;
 
 /**
@@ -123,6 +126,7 @@ async function dispatch(argv: string[]): Promise<number> {
     case "version":
       return version(opts.json);
     case "chain":
+      return chainCommand(rest, opts);
     case "mcp":
       console.error(`nova ${noun} is not implemented in this phase — refusing rather than faking success`);
       return EXIT_USAGE;

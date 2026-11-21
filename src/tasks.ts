@@ -74,6 +74,12 @@ export type CreateTaskInput = {
   /** data.md 5.1 output_schema_version (DDL default '1.0.0'). */
   outputSchemaVersion?: string;
   /**
+   * Chain membership (data.md DDL: tasks.chain_run_id): stamped at chain
+   * import — NULL for single tasks. Callers other than the chain importer
+   * never pass it (the 8.1 chain run ownership rule).
+   */
+  chainRunId?: string;
+  /**
    * mcp.md §3.2 target_scopes — the caller resolves each repo_alias to
    * a project_targets row (task_target_scopes.target_id is the FK);
    * column defaults apply for the omitted glob/command fields.
@@ -112,10 +118,11 @@ export type EnqueueOptions = {
   /** Response-frame deadline for the catalog probe. */
   timeoutMs?: number | undefined;
   /** Surface issuing the enqueue: `human` (CLI), `mcp` (nova_task_run),
-   *  or `schedule` (the schedule evaluator, FR-SCH-01) — the surfaces
-   *  the DDL's state_transition_logs.trigger_type CHECK names. Logged
-   *  verbatim per the CHECK. */
-  triggerType?: "human" | "mcp" | "schedule" | undefined;
+   *  `schedule` (the schedule evaluator, FR-SCH-01), or `engine` (the
+   *  chain readiness evaluator, FR-TSK-07) — the surfaces the DDL's
+   *  state_transition_logs.trigger_type CHECK names. Logged verbatim per
+   *  the CHECK. */
+  triggerType?: "human" | "mcp" | "schedule" | "engine" | undefined;
 };
 
 export function getTask(db: Db, taskId: string): TaskRow | undefined {
@@ -144,8 +151,8 @@ export function createTask(db: Db, input: CreateTaskInput): TaskRow {
       `INSERT INTO tasks
          (id, project_id, key, title, objective, profile_id,
           priority, requires_human_gate, output_schema_version, overrides_json,
-          context_files_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          context_files_json, chain_run_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       input.projectId,
@@ -158,6 +165,7 @@ export function createTask(db: Db, input: CreateTaskInput): TaskRow {
       input.outputSchemaVersion ?? "1.0.0", // DDL default
       JSON.stringify(input.overrides ?? {}), // DDL default '{}'
       JSON.stringify(input.contextFiles ?? []),
+      input.chainRunId ?? null, // NULL for single tasks (data.md DDL)
     );
     for (const scope of input.targetScopes ?? []) {
       db.prepare(

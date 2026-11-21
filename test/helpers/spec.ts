@@ -59,6 +59,22 @@ export function extractProfileSchema(): Record<string, unknown> {
   return JSON.parse(m[1]) as Record<string, unknown>;
 }
 
+/** The §4.3 ChainedTaskGraphImport JSON Schema block, parsed live from data.md. */
+export function extractChainSchema(): Record<string, unknown> {
+  const text = specFile("data.md");
+  const start = text.indexOf(
+    "### 4.3 Chained Task Graph Import Schema (chain.yaml)",
+  );
+  if (start < 0) {
+    throw new Error("chain schema section (§4.3) not found in data.md");
+  }
+  const m = text.slice(start).match(/```json\n([\s\S]*?)```/);
+  if (!m || !m[1]) {
+    throw new Error("no ```json block found in data.md §4.3");
+  }
+  return JSON.parse(m[1]) as Record<string, unknown>;
+}
+
 const CANONICAL_STATES = [
   "draft",
   "queued",

@@ -55,6 +55,15 @@ import type { DaemonConfig } from "../daemonconfig.ts";
 import type { Dispatcher } from "./dispatch.ts";
 import type { RetryEvaluator } from "./retry.ts";
 import { abortTriggerFor } from "./triggers.ts";
+import {
+  importChain,
+  getChainRun,
+  setChainRunAborted,
+  listChainMembers,
+  ChainValidationError,
+} from "../chain/import.ts";
+import { memberReadiness, type ChainEvaluator } from "../chain/readiness.ts";
+import { parseYaml, YamlParseError } from "../chain/yaml.ts";
 
 /**
  * THE v1 CONTROL PLANE (architecture 8.1, control-surface transport):
@@ -145,6 +154,10 @@ export type ServerDeps = {
   db: Db;
   dispatcher: Dispatcher;
   retry: RetryEvaluator;
+  /** The chain readiness/terminal evaluator (p4a chains; FR-TSK-07). */
+  chains: ChainEvaluator;
+  /** The daemon's in-memory paused-chain set (FR-TSK-08 scheduler level). */
+  pausedChains: Set<string>;
   daemonConfig: DaemonConfig;
   /** The full nova_daemon_status payload (lifecycle owns uptime/version/budgets). */
   daemonStatus: () => Record<string, unknown>;
@@ -1054,7 +1067,277 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
       note: "failure confirmed",
     });
     const outcome = confirmFailureGate(deps.db, payload, surface as GateSurface);
+    // p4a chain wiring: the terminal gate outcome (awaiting_gate→failed)
+    // is the CHAIN FAILED rule's trigger (8.1 chain run ownership) —
+    // evaluate the member's chain terminal rules synchronously (no
+    // catalog probe involved; readiness propagation is completion's
+    // business, this is the confirmed-failure rule)
+    const member = deps.db
+      .prepare("SELECT chain_run_id FROM tasks WHERE id = ?")
+      .get(payload.task_id) as { chain_run_id: string | null } | undefined;
+    if (member !== undefined && member.chain_run_id !== null) {
+      deps.chains.applyTerminalRules(member.chain_run_id);
+    }
     return { final_state: outcome.finalState, retry_count: outcome.retryCount };
+  });
+
+
+  /* -------------------- chain ops (FR-PRJ-04, FR-TSK-07/08; p4a) -------------------- */
+
+  /**
+   * `nova project import-dag <file>` (srs 4.1.1; FR-PRJ-04).
+   *
+   * WIRE RULING (documented): the op receives RAW TEXT + a `format`
+   * hint ("json" | "yaml"; omitted = auto: JSON first, then the YAML
+   * subset — FR-PRJ-04 says "JSON or YAML"). The CLI is a thin client
+   * that reads the file and passes its content — the daemon is the
+   * single parse+validate+import source, so the two formats can never
+   * drift between surfaces.
+   *
+   * `project_slug` (the CLI's --project): a consistency pin only — the
+   * §4.3 schema CARRIES project_slug, so a mismatch refuses; the arg
+   * never retargets the import. Without `workspace_id`, the graph's
+   * project_slug must resolve unambiguously across workspaces (a slug
+   * repeated in N workspaces is a truthful duplicate refusal).
+   */
+  ops.set("nova_project_import_dag", (args, { deps }) => {
+    const graphText = reqString(args, "graph_text");
+    const format = args["format"];
+    if (format !== undefined && format !== "json" && format !== "yaml") {
+      throw new OpError("schema_invalid", 'args.format must be "json" or "yaml"');
+    }
+    // YamlParseError propagates to toErrorPayload (schema_invalid, line named)
+    const graph: unknown =
+      format === "yaml"
+        ? parseYaml(graphText)
+        : (() => {
+            try {
+              return JSON.parse(graphText) as unknown;
+            } catch (jsonErr) {
+              if (format === "json") {
+                throw new OpError(
+                  "schema_invalid",
+                  `graph_text is not valid JSON: ${(jsonErr as Error).message}`,
+                );
+              }
+              // auto (documented): JSON first, then the YAML subset
+              return parseYaml(graphText);
+            }
+          })();
+    if (typeof graph !== "object" || graph === null || Array.isArray(graph)) {
+      throw new OpError("schema_invalid", "the chain graph must be a JSON/YAML object");
+    }
+    const obj = graph as Record<string, unknown>;
+    if (typeof obj["project_slug"] !== "string" || obj["project_slug"] === "") {
+      throw new OpError(
+        "schema_invalid",
+        'the chain graph must declare a non-empty string "project_slug" (§4.3 required key)',
+      );
+    }
+    const slug = obj["project_slug"];
+    if (args["project_slug"] !== undefined && args["project_slug"] !== slug) {
+      throw new OpError(
+        "schema_invalid",
+        `the graph declares project_slug "${slug}" but "${String(args["project_slug"])}" was given — mismatch refused (the schema carries project_slug)`,
+      );
+    }
+    let workspace: WorkspaceRow | undefined;
+    let project: { id: string; workspace_id: string; slug: string } | undefined;
+    if (args["workspace_id"] !== undefined) {
+      workspace = requireWorkspaceById(deps.db, reqString(args, "workspace_id"));
+      project = deps.db
+        .prepare("SELECT id, workspace_id, slug FROM projects WHERE workspace_id = ? AND slug = ?")
+        .get(workspace.id, slug) as { id: string; workspace_id: string; slug: string } | undefined;
+      if (project === undefined) {
+        throw new OpError("not_found", `no project "${slug}" in workspace "${workspace.slug}"`);
+      }
+    } else {
+      const rows = deps.db
+        .prepare("SELECT id, workspace_id, slug FROM projects WHERE slug = ?")
+        .all(slug) as Array<{ id: string; workspace_id: string; slug: string }>;
+      if (rows.length === 0) {
+        throw new OpError("not_found", `no project "${slug}" in any workspace`);
+      }
+      if (rows.length > 1) {
+        throw new OpError(
+          "duplicate",
+          `project slug "${slug}" exists in ${rows.length} workspaces — pass workspace_id to disambiguate`,
+        );
+      }
+      project = rows[0]!;
+      workspace = requireWorkspaceById(deps.db, project.workspace_id);
+    }
+    // ChainValidationError propagates to toErrorPayload (its code IS the
+    // taxonomy: schema_invalid / not_found / duplicate / profile_unresolved)
+    const { chainRun, tasks } = importChain(
+      deps.db,
+      { id: workspace.id },
+      { id: project.id, slug: project.slug },
+      graph,
+    );
+    const taskViews: Record<string, { id: string; key: string; state: string }> = {};
+    for (const [key, row] of Object.entries(tasks)) {
+      taskViews[key] = { id: row.id, key: row.key, state: row.state };
+    }
+    // FR-PRJ-04 AC3: tasks in draft; roots are NOT auto-enqueued (the
+    // operator/orchestrator enqueues roots; readiness propagates after)
+    return { chain_run_id: chainRun.id, chain_run: chainRun, tasks: taskViews };
+  });
+
+  /**
+   * `nova chain list` (srs 4.1.1): chain runs with member counts and
+   * the pause flag. Filters mirror the other list ops: `workspace_id`
+   * and `project_id` (both validated); without either, every chain.
+   */
+  ops.set("nova_chain_list", (args, { deps }) => {
+    const workspaceId =
+      args["workspace_id"] === undefined ? undefined : reqString(args, "workspace_id");
+    const projectId =
+      args["project_id"] === undefined ? undefined : reqString(args, "project_id");
+    if (workspaceId !== undefined) requireWorkspaceById(deps.db, workspaceId);
+    if (projectId !== undefined && getProject(deps.db, projectId) === undefined) {
+      throw new OpError("not_found", `no such project: ${projectId}`);
+    }
+    const base =
+      `SELECT c.id, c.project_id, p.slug AS project_slug, c.state, c.started_at, c.completed_at,
+              (SELECT COUNT(*) FROM tasks t WHERE t.chain_run_id = c.id) AS member_count
+         FROM chain_runs c JOIN projects p ON p.id = c.project_id`;
+    const rows =
+      projectId !== undefined
+        ? deps.db.prepare(`${base} WHERE c.project_id = ? ORDER BY c.id`).all(projectId)
+        : workspaceId !== undefined
+          ? deps.db.prepare(`${base} WHERE p.workspace_id = ? ORDER BY c.id`).all(workspaceId)
+          : deps.db.prepare(`${base} ORDER BY c.id`).all();
+    return {
+      chains: (rows as Array<Record<string, unknown>>).map((r) => ({
+        ...r,
+        paused: deps.pausedChains.has(String(r["id"])),
+      })),
+    };
+  });
+
+  /**
+   * `nova chain status <chain-run-id>` (srs 4.1.1): the chain row,
+   * members with states + readiness, and the pause flag.
+   */
+  ops.set("nova_chain_status", (args, { deps }) => {
+    const chainRunId = reqString(args, "chain_run_id");
+    const chain = getChainRun(deps.db, chainRunId);
+    if (chain === undefined) throw new OpError("not_found", `no such chain run: ${chainRunId}`);
+    const members = memberReadiness(deps.db, chainRunId);
+    return { chain, members, paused: deps.pausedChains.has(chainRunId) };
+  });
+
+  /**
+   * `nova chain abort <chain-run-id>` (srs 4.1.1; mcp.md nova_chain_abort):
+   * every NON-TERMINAL member aborts per the matrix abort rows — live
+   * runs via dispatcher.abortTask (group kill; the loop owns the
+   * cancelled record + row), non-live members via the per-state
+   * operator-abort rows (abortTriggerFor — the same machinery as
+   * nova_task_abort, including the crashed-orphan fall-through for a
+   * running member with no live dispatcher entry). Terminal members
+   * (completed/cancelled) stay untouched; a draft member has no abort
+   * row in the matrix and stays draft (reported, never faked). The
+   * chain's terminal move is guarded: active → aborted only.
+   */
+  ops.set("nova_chain_abort", async (args, { deps, surface }) => {
+    const chainRunId = reqString(args, "chain_run_id");
+    const chain = getChainRun(deps.db, chainRunId);
+    if (chain === undefined) throw new OpError("not_found", `no such chain run: ${chainRunId}`);
+    if (chain.state !== "active") {
+      throw new OpError(
+        "invalid_transition",
+        `chain run ${chainRunId} is already ${chain.state} — a terminal chain never moves again`,
+      );
+    }
+    const actor = optString(args, "actor", "operator");
+    const members = listChainMembers(deps.db, chainRunId);
+    const outcomes: Array<Record<string, unknown>> = [];
+    for (const m of members) {
+      if (m.state === "completed" || m.state === "cancelled") {
+        outcomes.push({ task_id: m.id, key: m.key, from_state: m.state, outcome: "already-terminal" });
+        continue;
+      }
+      const trigger = abortTriggerFor(m.state);
+      if (trigger === null) {
+        // draft: the 8.1 matrix has no draft abort row — the member
+        // stays draft (inert: nothing dispatches or propagates into an
+        // aborted chain). Honest reporting, never an invented row.
+        outcomes.push({ task_id: m.id, key: m.key, from_state: m.state, outcome: "no-abort-row" });
+        continue;
+      }
+      deps.retry.clearFor(m.id); // a moved member never fires its armed timer
+      if (m.state === "running") {
+        const res = await deps.dispatcher.abortTask(m.id, { triggerType: surface, actor });
+        if (res.aborted) {
+          outcomes.push({ task_id: m.id, key: m.key, from_state: m.state, outcome: "cancelled", live_run: true });
+          continue;
+        }
+        // no live dispatcher entry — a boot-recovered crashed orphan:
+        // fall through to the matrix row so the member is never wedged
+        // (the crashed run row stays untouched), mirroring nova_task_abort
+      }
+      try {
+        applyTransition(deps.db, m.id, trigger, { triggerType: surface, actor });
+        outcomes.push({ task_id: m.id, key: m.key, from_state: m.state, outcome: "cancelled", live_run: false });
+      } catch (err) {
+        // a surface moved the member between read and apply — reported,
+        // never a wedge for the rest of the abort loop
+        outcomes.push({ task_id: m.id, key: m.key, from_state: m.state, outcome: `refused: ${(err as Error).message}` });
+      }
+    }
+    // the guarded terminal move (a terminal chain never moves again) -
+    // the chain module owns every chain_runs write (write discipline)
+    const moved = setChainRunAborted(deps.db, chainRunId);
+    return {
+      chain_run_id: chainRunId,
+      state: moved ? "aborted" : getChainRun(deps.db, chainRunId)?.state ?? "aborted",
+      members: outcomes,
+    };
+  });
+
+  /**
+   * `nova chain pause <chain-run-id>` (FR-TSK-08 — scheduler-level:
+   * NO paused task state, the chain_runs row stays 'active'). The
+   * in-memory flag withholds readiness propagation and makes dispatch
+   * skip the chain's queued members. Idempotent; an active-chain
+   * control (a terminal chain refuses invalid_transition). A daemon
+   * restart unpauses (same lifecycle as the daemon-level pause —
+   * documented).
+   */
+  ops.set("nova_chain_pause", (args, { deps }) => {
+    const chainRunId = reqString(args, "chain_run_id");
+    const chain = getChainRun(deps.db, chainRunId);
+    if (chain === undefined) throw new OpError("not_found", `no such chain run: ${chainRunId}`);
+    if (chain.state !== "active") {
+      throw new OpError(
+        "invalid_transition",
+        `chain run ${chainRunId} is ${chain.state} — pause is an active-chain control (FR-TSK-08)`,
+      );
+    }
+    deps.pausedChains.add(chainRunId);
+    return { chain_run_id: chainRunId, paused: true };
+  });
+
+  /**
+   * `nova chain resume <chain-run-id>` (FR-TSK-08): clears the flag and
+   * evaluates readiness IMMEDIATELY — a paused chain withheld
+   * propagation, so the ready members enqueue now (probe-bounded).
+   * Idempotent (resuming an unpaused chain is a no-op success).
+   */
+  ops.set("nova_chain_resume", async (args, { deps }) => {
+    const chainRunId = reqString(args, "chain_run_id");
+    const chain = getChainRun(deps.db, chainRunId);
+    if (chain === undefined) throw new OpError("not_found", `no such chain run: ${chainRunId}`);
+    if (chain.state !== "active") {
+      throw new OpError(
+        "invalid_transition",
+        `chain run ${chainRunId} is ${chain.state} — resume is an active-chain control (FR-TSK-08)`,
+      );
+    }
+    deps.pausedChains.delete(chainRunId);
+    const propagation = await deps.chains.propagateChain(chainRunId);
+    return { chain_run_id: chainRunId, paused: false, enqueued: propagation.enqueued };
   });
 
   /* ------------------------ schedule ops (FR-SCH-01/03) ----------------------- */
@@ -1287,6 +1570,18 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
 
 export function toErrorPayload(err: unknown): { code: TaxonomyCode; message: string } {
   if (err instanceof OpError) return { code: err.code, message: err.message };
+  if (err instanceof YamlParseError) {
+    return {
+      code: "schema_invalid",
+      message: `chain.yaml parse error at line ${err.line}: ${err.message}`,
+    };
+  }
+  if (err instanceof ChainValidationError) {
+    // the validator's code IS the taxonomy row (schema_invalid /
+    // not_found / duplicate / profile_unresolved — the documented
+    // ambiguity mapping lives in src/chain/graph.ts)
+    return { code: err.code, message: err.message };
+  }
   if (err instanceof InvalidTransitionError) {
     return { code: "invalid_transition", message: err.message };
   }
