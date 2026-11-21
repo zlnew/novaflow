@@ -14,8 +14,10 @@ import type { Db } from "../store/db.ts";
  * (tests > 0) — a marker with tests=0 is test gaming (a suite skipped
  * to zero tests and exited 0, RSK-15) and fails the command. A command
  * without the marker is exit-code-only (the count check is skipped).
- * The marker must be its own line: text embedded around the pattern is
- * not the marker.
+ * The marker must be its own line, in the FINAL non-blank lines of the
+ * output (trailing blank/whitespace lines allowed): text embedded
+ * around the pattern, or a marker buried under later output, is not
+ * the trailing marker.
  *
  * Every spawned process follows the run loop's containment discipline
  * (architecture 8.4): detached process group, bounded output capture,
@@ -58,17 +60,21 @@ const MARKER_LINE_RE = /^\[novaflow-verify\] tests=(\d+) pass=(\d+) fail=(\d+)[ 
 export type MarkerCounts = { tests: number; pass: number; fail: number };
 
 /**
- * Find the LAST `[novaflow-verify] tests=N pass=N fail=N` line in the
- * captured stdout (the marker is trailing by contract). Returns null
- * when no line matches.
+ * The TRAILING marker, per contract ("emits the trailing marker
+ * line"): scan back over trailing whitespace/blank lines only — the
+ * first non-blank line from the end must BE the marker. A marker
+ * buried under later non-marker output is not the trailing marker
+ * (documented judgment: the command is then exit-code-only, like any
+ * command without a marker). Returns null when the final non-blank
+ * line is not the marker.
  */
 export function parseVerifyMarker(stdout: string): MarkerCounts | null {
   const lines = stdout.split("\n");
   for (let i = lines.length - 1; i >= 0; i--) {
-    const m = lines[i]!.match(MARKER_LINE_RE);
-    if (m) {
-      return { tests: Number(m[1]), pass: Number(m[2]), fail: Number(m[3]) };
-    }
+    const line = lines[i]!;
+    if (line.trim() === "") continue; // trailing blank/whitespace lines are fine
+    const m = line.match(MARKER_LINE_RE);
+    return m ? { tests: Number(m[1]), pass: Number(m[2]), fail: Number(m[3]) } : null;
   }
   return null;
 }
@@ -209,7 +215,13 @@ export function runGroupedCommand(
       try {
         process.kill(-child.pid, sig);
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+        // ESRCH (group already gone) is a silent no-op; ANY other error
+        // (e.g. EPERM) is swallowed and recorded — this runs inside a
+        // timer callback, where throwing would crash the daemon
+        const e = err as NodeJS.ErrnoException;
+        if (e.code !== "ESRCH") {
+          console.warn(`[novaflow-verify] group kill ${sig} failed for pgid ${child.pid}: ${e.message}`);
+        }
       }
     };
 

@@ -291,6 +291,47 @@ test("each command executes with cwd = its target's root_path", async (t) => {
   }
 });
 
+test("a marker mid-output with later non-marker lines is NOT the trailing marker → exit-code-only", async (t) => {
+  const s = seed();
+  try {
+    const root = mkdtempSync(join(tmpdir(), "novaflow-tgt-"));
+    // the marker is buried under later output: the contract says the
+    // command "emits the trailing marker line", so this is not it.
+    // Documented judgment: not honored → exit-code-only (exit 0 passes).
+    addTarget(s, {
+      alias: "app",
+      root,
+      commands: ["printf '[novaflow-verify] tests=3 pass=3 fail=0\\n'; printf 'later output\\n'"],
+    });
+    const out = await withBound(t.signal, BOUND_MS, runVerification(s.db, s.taskId));
+    assert.equal(out.results[0]?.marker, null);
+    assert.equal(out.passed, true);
+    rmSync(root, { recursive: true, force: true });
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+  }
+});
+
+test("trailing blank/whitespace-only lines after the marker still honor it", async (t) => {
+  const s = seed();
+  try {
+    const root = mkdtempSync(join(tmpdir(), "novaflow-tgt-"));
+    addTarget(s, {
+      alias: "app",
+      root,
+      commands: ["printf '[novaflow-verify] tests=3 pass=3 fail=0\\n\\n   \\n'"],
+    });
+    const out = await withBound(t.signal, BOUND_MS, runVerification(s.db, s.taskId));
+    assert.deepEqual(out.results[0]?.marker, { tests: 3, pass: 3, fail: 0 });
+    assert.equal(out.passed, true);
+    rmSync(root, { recursive: true, force: true });
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+  }
+});
+
 /* ------------------------------- containment discipline -------------------------- */
 
 test("a hung verifier command never hangs the engine: bounded timeout, SIGTERM→SIGKILL group, reaped", async (t) => {
@@ -362,6 +403,61 @@ test("an unspawnable verification command fails without throwing, with the spawn
     assert.equal(r.passed, false);
     assert.equal(r.exitCode, null);
     assert.match(r.spawnError ?? "", /ENOTDIR|spawn/i);
+    rmSync(root, { recursive: true, force: true });
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+  }
+});
+
+test("a group-kill failure (EPERM) inside the timer backstops never escapes", async (t) => {
+  const s = seed();
+  try {
+    const root = mkdtempSync(join(tmpdir(), "novaflow-tgt-"));
+    // process.kill throws EPERM for every GROUP kill (negative pid);
+    // the leader then exits on its own — the backstop error must be
+    // swallowed-and-recorded, never an uncaught exception
+    const origKill = process.kill.bind(process);
+    const eperm = (pid: number, signal?: string | number): boolean => {
+      if (pid < 0) {
+        const err = new Error("operation not permitted") as NodeJS.ErrnoException;
+        err.code = "EPERM";
+        throw err;
+      }
+      return origKill(pid, signal as NodeJS.Signals);
+    };
+    process.kill = eperm as typeof process.kill;
+    let out: VerifyOutcome | undefined;
+    try {
+      addTarget(s, { alias: "app", root, commands: ["sleep 0.5"] });
+      out = await withBound(t.signal, BOUND_MS, runVerification(s.db, s.taskId, { timeoutMs: 100 }));
+    } finally {
+      process.kill = origKill as typeof process.kill;
+    }
+    assert.ok(out, "runVerification resolved — no uncaught exception");
+    assert.equal(out.passed, false);
+    assert.equal(out.results[0]?.timedOut, true);
+    rmSync(root, { recursive: true, force: true });
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+  }
+});
+
+test("a flooding child (~2 MB stdout) is captured bounded: ≤ 8 KiB tail, exit recorded, fast", async (t) => {
+  const s = seed();
+  try {
+    const root = mkdtempSync(join(tmpdir(), "novaflow-tgt-"));
+    addTarget(s, { alias: "app", root, commands: ["head -c 2097152 /dev/zero | tr '\\0' x"] });
+    const started = Date.now();
+    const out = await withBound(t.signal, BOUND_MS, runVerification(s.db, s.taskId));
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 5000, `flood capture must stay fast, took ${elapsed} ms`);
+    const r = out.results[0]!;
+    assert.equal(r.exitCode, 0); // the exit code is recorded honestly
+    assert.ok(r.stdoutTail.length <= 8192, `captured ${r.stdoutTail.length} bytes`);
+    assert.ok(r.stdoutTail.length > 0 && /^x+$/.test(r.stdoutTail), "the captured tail is the stream tail");
+    assert.equal(r.passed, true);
     rmSync(root, { recursive: true, force: true });
   } finally {
     s.db.close();
