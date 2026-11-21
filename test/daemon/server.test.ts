@@ -215,10 +215,10 @@ test("task create → run (catalog probe) → dispatch → validating; result + 
     assert.equal((statusData["current_run"] as Record<string, unknown>)["status"], "succeeded");
     assert.equal(statusData["elapsed_ms"], null);
 
-    // nova_task_result: the validated result.json
+    // nova_result_get (mcp.md §3.1 tool table — the wire name): the validated result.json
     const result = await env.client.request({
       id: "res",
-      op: "nova_task_result",
+      op: "nova_result_get",
       args: { task_id: taskId },
     });
     const artifact = (result["data"] as Record<string, unknown>)["artifact"] as Record<string, unknown>;

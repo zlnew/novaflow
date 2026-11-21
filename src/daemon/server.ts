@@ -258,7 +258,10 @@ export function buildOpTable(): Map<string, OpHandler> {
     return { tasks: rows };
   });
 
-  ops.set("nova_task_result", (args, { deps }) => {
+  // mcp.md §3.1 tool table: the wire name is `nova_result_get` — never
+  // `nova_task_result` (one contract, no alias; the MCP server (p5) and
+  // the CLI (p3b) build on exactly this name).
+  ops.set("nova_result_get", (args, { deps }) => {
     const taskId = reqString(args, "task_id");
     requireTask(deps.db, taskId);
     const run =
