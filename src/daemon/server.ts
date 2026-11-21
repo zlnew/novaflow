@@ -77,11 +77,20 @@ import { abortTriggerFor } from "./triggers.ts";
  * by tests).
  */
 
-/** The srs 4.1.1 error-code taxonomy, verbatim. */
+/**
+ * The srs 4.1.1 error-code taxonomy, verbatim. NOTE: `preflight_failed`
+ * and `budget_exceeded` are RESERVED-FOR-CLIENT-MAPPING in v1 — the
+ * daemon's ops never return them as response frames; those verdicts
+ * land on RUN ROWS (task_runs.error_summary: "preflight failure: …",
+ * "budget_exceeded: …"). The CLI (p3b) and MCP server (p5) map the
+ * run-row records to these codes client-side when surfacing outcomes.
+ */
 export type TaxonomyCode =
   | "invalid_transition"
   | "schema_invalid"
+  /** Reserved-for-client-mapping (see the type doc above). */
   | "preflight_failed"
+  /** Reserved-for-client-mapping (see the type doc above). */
   | "budget_exceeded"
   | "not_found"
   | "daemon_unreachable"
@@ -120,7 +129,16 @@ export type ServerDeps = {
 
 export type ControlServer = {
   socketPath: string;
-  /** Stop accepting, unlink the socket file, wait for in-flight op completions. */
+  /**
+   * Stop accepting, DESTROY every tracked connection, then unlink the
+   * socket file. An op still executing when close() runs is NOT awaited
+   * for delivery: its handler continuation finishes on the store side,
+   * but the response frame is dropped (the socket is destroyed — the
+   * write is a no-op on a destroyed stream). Resolves once the listener
+   * itself is closed. (The lifecycle's stop() ordering — socket first,
+   * then dispatcher, timers, store — is what actually bounds in-flight
+   * work.)
+   */
   close: () => Promise<void>;
 };
 
@@ -737,7 +755,14 @@ export async function bindControlServer(
     await listen();
   }
 
-  // TB-1: the socket file is operator-only from the first connection
+  // TB-1: the socket file is operator-only from the first connection.
+  // Known race window (documented): between bind and this chmod the
+  // socket file briefly carries the umask default permissions. The
+  // chmod runs synchronously on the same tick as the resolved bind, so
+  // the exposure is only the connect backlog of that instant; v1
+  // accepts it (loopback transport + single-operator host, TB-1's threat
+  // model) rather than pre-creating the file with 0600 — pre-creation
+  // would collide with the stale-socket probe's unlink-and-rebind rule.
   chmodSync(socketPath, 0o600);
 
   const sockets = new Set<Socket>();

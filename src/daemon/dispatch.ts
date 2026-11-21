@@ -23,6 +23,15 @@ import {
  * for transition time; tasks.created_at + monotonic ULID id is the FIFO
  * order for admission).
  *
+ * FIFO requeue-preemption (spec-silent, documented reading): admission
+ * order is the TASK's created_at, not its (re)queue time — a task that
+ * failed and re-entered queued via the retry rows (auto-retry or
+ * operator retry) re-enters AHEAD of newer work created after it. This
+ * is deliberate: ordering by transition time would starve retried tasks
+ * behind a steady stream of new ones, and created_at is data.md's
+ * authoritative admission key. Operators who need fresh work first
+ * pause or abort the retried task.
+ *
  * Single-flight discipline: a dispatch pass is fully synchronous (the
  * granted startRun's queued→running transition + spawn run inside it),
  * so passes can never overlap; requestDispatch() coalesces bursts into
