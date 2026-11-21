@@ -253,3 +253,31 @@ test("nextRun: everything is minute-aligned UTC (a whole-minute result)", () => 
   assert.notEqual(next, null);
   assert.equal(next! % MINUTE, 0);
 });
+
+test("the documented stepped-star-is-restricted ruling has its own OR-rule regression pin (review round)", () => {
+  // `*/2` in day-of-month = the stepped range {1,3,5,…,31} (field min 1) —
+  // RESTRICTED per the in-code ruling (Vixie's star-prefix quirk NOT
+  // inherited). With day-of-week also restricted, the OR rule applies.
+  // March 2026: Mar 2 = Monday; odd days = 1,3,5,….
+  // AND-semantics (real Vixie quirk) would wait for Monday-on-an-odd-day
+  // (Mar 9); OR semantics must return the next odd day (Mar 3).
+  assert.equal(
+    nextRun("0 0 */2 * 1", Date.parse("2026-03-02T00:00:01Z")),
+    Date.parse("2026-03-03T00:00:00Z"),
+  );
+  // from Wed Mar 4 (even day, not Monday) → next odd day Mar 5
+  assert.equal(
+    nextRun("0 0 */2 * 1", Date.parse("2026-03-04T00:00:01Z")),
+    Date.parse("2026-03-05T00:00:00Z"),
+  );
+  // from Sun Mar 8 (even, not Monday) → Mon Mar 9 (matches BOTH arms)
+  assert.equal(
+    nextRun("0 0 */2 * 1", Date.parse("2026-03-08T00:00:01Z")),
+    Date.parse("2026-03-09T00:00:00Z"),
+  );
+  // month rollover: from Mon Mar 30 (odd, matches) → Tue Mar 31 (odd)
+  assert.equal(
+    nextRun("0 0 */2 * 1", Date.parse("2026-03-30T00:00:01Z")),
+    Date.parse("2026-03-31T00:00:00Z"),
+  );
+});

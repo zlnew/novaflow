@@ -303,6 +303,9 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       if (server !== undefined) await server.close(); // stop accepting, unlink the socket
       await dispatcher.stop(); // reap live runs (operator-abort semantics)
       retry.stop(); // clear every armed timer
+      // a schedule fire straddling shutdown is awaited (bounded by its own
+      // probe timeout) — db.close() never lands inside a fire's continuation
+      await schedules.stop();
       // the documented stop rule (header): no spawned process outlives
       // the handle — in-flight verification commands are awaited (their
       // own timeout/kill discipline bounds the wait)

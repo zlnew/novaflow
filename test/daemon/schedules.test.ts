@@ -38,6 +38,8 @@ async function boot(
   over: {
     daemonConfig?: string;
     tickMs?: number;
+    probeArgs?: string[];
+    probeTimeoutMs?: number;
     seed?: (db: Database.Database, seeded: SeededStore) => void;
   } = {},
 ): Promise<Env> {
@@ -59,8 +61,8 @@ async function boot(
     socketPath: join(dir, "novaflow.sock"),
     daemonConfigPath: cfgPath,
     probePiBin: "node",
-    probeArgs: [STUB, "ok"],
-    probeTimeoutMs: 3000,
+    probeArgs: over.probeArgs ?? [STUB, "ok"],
+    probeTimeoutMs: over.probeTimeoutMs ?? 3000,
     runPiBin: "node",
     runArgs: [STUB, "run-ok"],
     extensionPath: "/ext/novaflow.ts",
@@ -79,6 +81,18 @@ async function boot(
     handle,
     client,
   };
+}
+
+
+/** A draft task inserted directly (schedule-seed helper; schedules fire the
+ *  guarded enqueue later, so raw insert of the DRAFT row is safe here). */
+function insertDraftTask(db: Database.Database, seeded: SeededStore, key: string): string {
+  const id = ulid();
+  db.prepare(
+    `INSERT INTO tasks (id, project_id, key, title, objective, profile_id)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(id, seeded.projectId, key, key, `Objective for ${key}.`, seeded.profileId);
+  return id;
 }
 
 async function shutdown(env: Env): Promise<void> {
@@ -544,3 +558,83 @@ function db_row(env: Env, taskId: string): Record<string, unknown> {
   ro.close();
   return row;
 }
+
+test("shutdown during a schedule fire: stop() awaits the in-flight pass — no unhandled rejection, the occurrence resolves cleanly (review round)", async () => {
+  // slow probe so a fire hangs long enough for stop() to land mid-flight
+  const env = await boot({ probeArgs: [STUB, "silent"], probeTimeoutMs: 2000, tickMs: 20 });
+  const rejections: unknown[] = [];
+  const onRejection = (err: unknown) => rejections.push(err);
+  process.on("unhandledRejection", onRejection);
+  const SCHED = "01ARZ3NDEKTSV4RRFFQ69G5FAVS";
+  try {
+    const taskId = await createTaskVia(env, "SD-RACE");
+    // attach a PAST one-shot post-boot (boot scan is done; the row goes due
+    // immediately) — the next tick fires it and its probe then hangs ~2 s
+    const attach = await env.client.request({
+      id: "attach-race",
+      op: "nova_schedule_attach",
+      args: { task_id: taskId, run_at: "2026-01-01T00:00:00Z" },
+    });
+    assert.equal(attach["ok"], true, JSON.stringify(attach));
+    const row0 = (attach["data"] as { schedule: { id: string } }).schedule;
+    // wait for the tick to fire (probe now hanging)
+    await new Promise((r) => setTimeout(r, 300));
+    const t0 = Date.now();
+    await env.handle.stop(); // mid-probe: must bound-await the in-flight pass
+    const waited = Date.now() - t0;
+    assert.ok(waited < 4500, `stop() took ${waited} ms`);
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(rejections.length, 0, `unhandled rejections: ${rejections.map(String).join("; ")}`);
+    // DISCRIMINATOR: the awaited pass completed against the still-open store
+    // — the probe timed out, the occurrence was cleanly SKIPPED (A3:
+    // last_run_at untouched, one-shot advanced to NULL). A gutted stop()
+    // closes the store mid-fire and the row is left with its past
+    // next_run_at (the pass died at its first store read).
+    const db = openDb(env.dbPath);
+    const row = db
+      .prepare("SELECT enabled, next_run_at, last_run_at FROM schedules WHERE id = ?")
+      .get(row0.id) as { enabled: number; next_run_at: string | null; last_run_at: string | null };
+    db.close();
+    assert.equal(row.enabled, 1, "the pass completed cleanly — no quarantine");
+    assert.equal(row.next_run_at, null, "the expired one-shot advanced to NULL");
+    assert.equal(row.last_run_at, null, "the refused occurrence claims no run");
+    void SCHED;
+  } finally {
+    process.off("unhandledRejection", onRejection);
+    env.client.close();
+    rmSync(env.dir, { recursive: true, force: true });
+  }
+});
+
+test("an out-of-band corrupt cron row is quarantined, not fatal: warn + enabled=0 + NULL next_run_at", async () => {
+  const env = await boot({
+    tickMs: 20,
+    seed: (db, seeded) => {
+      db.prepare(
+        `INSERT INTO schedules (id, workspace_id, target_type, target_id, cron_expr, next_run_at)
+         VALUES (?, ?, 'task', ?, 'not a cron', ?)`,
+      ).run(
+        "01ARZ3NDEKTSV4RRFFQ69G5FAWC",
+        seeded.workspaceId,
+        insertDraftTask(db, seeded, "SD-CORRUPT"),
+        "2026-01-01T00:00:00.000Z",
+      );
+    },
+  });
+  try {
+    // the first evaluation pass hits the corrupt row; the daemon survives
+    await new Promise((r) => setTimeout(r, 250));
+    const db = openDb(env.dbPath);
+    const row = db
+      .prepare("SELECT enabled, next_run_at FROM schedules WHERE cron_expr = 'not a cron'")
+      .get() as { enabled: number; next_run_at: string | null };
+    db.close();
+    assert.equal(row.enabled, 0, "the corrupt row is quarantined");
+    assert.equal(row.next_run_at, null, "never re-selected by a later tick");
+    // daemon still answers over the socket
+    const status = await env.client.request({ id: "alive", op: "nova_daemon_status", args: {} });
+    assert.equal(status["ok"], true, JSON.stringify(status));
+  } finally {
+    await shutdown(env);
+  }
+});

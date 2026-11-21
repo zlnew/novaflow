@@ -92,3 +92,11 @@ test("canonicalTimestamp: the store's canonical DDL form (strftime '%Y-%m-%dT%H:
   const coarse = canonicalTimestamp(Date.parse("2026-06-01T12:34:00.500Z"));
   assert.equal(coarse, "2026-06-01T12:34:00.500Z");
 });
+
+test("years below 0100 are rejected — ECMA's Date.UTC remap is never silently applied (review round)", () => {
+  for (const input of ["0099-01-01T00:00:00Z", "0000-01-01T00:00:00Z", "0068-06-15T12:00:00Z"]) {
+    const res = parseIsoRunAt(input);
+    assert.equal(res.ok, false, input);
+    assert.match(res.ok === false ? res.error : "", /years below 0100/);
+  }
+});

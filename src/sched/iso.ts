@@ -64,6 +64,12 @@ export function parseIsoRunAt(input: string): IsoParse {
   const second = m[6] === undefined ? 0 : Number(m[6]);
   const msPart = m[7] === undefined ? 0 : Number(m[7].padEnd(3, "0"));
 
+  if (year < 100) {
+    // ECMA-262: Date.UTC remaps years 0-99 to 1900+year — reject instead of
+    // silently normalizing (review finding: a validator that never silently
+    // normalizes must not let this one through)
+    return fail(input, "years below 0100 are not supported (ECMA remaps them)");
+  }
   if (month < 1 || month > 12) return fail(input, "the month must be 01-12");
   const days = month === 2 && isLeapYear(year) ? 29 : DAYS_IN_MONTH[month - 1]!;
   if (day < 1 || day > days) {

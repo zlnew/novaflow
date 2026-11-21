@@ -122,6 +122,25 @@ export function createScheduleEvaluator(db: Db, opts: ScheduleEvaluatorOptions) 
   const actor = opts.actor ?? "scheduler";
   /** Single-flight: a pass never overlaps itself (a fire probes a subprocess). */
   let inFlight = false;
+  /** The running pass (a shutdown awaits it, bounded — see stop()). */
+  let inFlightPromise: Promise<void> | undefined;
+
+  /**
+   * Quarantine a row that blew up its own pass (e.g. an out-of-band DB edit
+   * wrote an unparsable cron_expr): warn + disable so one corrupt row can
+   * never crash a live daemon at every tick. The quarantine write itself is
+   * best-effort — a closed store during shutdown must not re-throw.
+   */
+  function quarantine(row: ScheduleRow, err: unknown): void {
+    warn(
+      `schedule ${row.id}: evaluation failed (${(err as Error).message}) — quarantining the row (enabled=0, next_run_at NULL)`,
+    );
+    try {
+      db.prepare("UPDATE schedules SET enabled = 0, next_run_at = NULL WHERE id = ?").run(row.id);
+    } catch {
+      // the store is closing/closed — nothing more to persist
+    }
+  }
 
   function dueRows(nowMs: number, strictlyPast: boolean): ScheduleRow[] {
     const cmp = strictlyPast ? "<" : "<=";
@@ -186,8 +205,10 @@ export function createScheduleEvaluator(db: Db, opts: ScheduleEvaluatorOptions) 
       // a refused enqueue (unresolved profile, a concurrent surface
       // moved the task mid-probe) is logged and ADVANCES — never a
       // re-probe hot loop, never a wedge
-      warn(`schedule ${row.id}: enqueue of task ${row.target_id} refused — ${(err as Error).message}; advancing`);
-      advanceAfterFire(db, row, nowMs);
+      warn(`schedule ${row.id}: enqueue of task ${row.target_id} refused — ${(err as Error).message}; skipping (the run never happened) and advancing`);
+      // last_run_at stays untouched — consistent with every other refusal
+      // path (review finding: a refused occurrence must not claim a run)
+      advanceSkipping(db, row, nowMs);
       return "skipped";
     }
     advanceAfterFire(db, row, nowMs);
@@ -203,12 +224,24 @@ export function createScheduleEvaluator(db: Db, opts: ScheduleEvaluatorOptions) 
   async function evaluate(nowMs: number = Date.now()): Promise<void> {
     if (inFlight) return;
     inFlight = true;
-    try {
+    const pass = (async () => {
       for (const row of dueRows(nowMs, false)) {
-        await fireIfEligible(row, nowMs);
+        try {
+          await fireIfEligible(row, nowMs);
+        } catch (err) {
+          quarantine(row, err);
+        }
       }
+    })();
+    inFlightPromise = pass;
+    try {
+      await pass;
+    } catch (err) {
+      // belt under the per-row quarantine: a pass never rejects
+      warn(`schedule pass failed: ${(err as Error).message}`);
     } finally {
       inFlight = false;
+      inFlightPromise = undefined;
     }
   }
 
@@ -228,12 +261,16 @@ export function createScheduleEvaluator(db: Db, opts: ScheduleEvaluatorOptions) 
     inFlight = true;
     try {
       for (const row of dueRows(nowMs, true)) {
-        if (row.missed_policy === "run_immediately") {
-          const outcome = await fireIfEligible(row, nowMs);
-          if (outcome === "fired") fired += 1;
-        } else {
-          advanceSkipping(db, row, nowMs);
-          skipped += 1;
+        try {
+          if (row.missed_policy === "run_immediately") {
+            const outcome = await fireIfEligible(row, nowMs);
+            if (outcome === "fired") fired += 1;
+          } else {
+            advanceSkipping(db, row, nowMs);
+            skipped += 1;
+          }
+        } catch (err) {
+          quarantine(row, err);
         }
       }
     } finally {
@@ -242,7 +279,24 @@ export function createScheduleEvaluator(db: Db, opts: ScheduleEvaluatorOptions) 
     return { fired, skipped };
   }
 
-  return { evaluate, bootScan };
+  /**
+   * Await the in-flight pass, bounded: a fire's catalog probe is itself
+   * timeout-bounded, so the wait is bounded by that plus a grace (the
+   * review round's shutdown race: db.close() must not land inside a
+   * fire's continuation).
+   */
+  async function stop(): Promise<void> {
+    const probeBound = (opts.enqueueOptions?.timeoutMs ?? 5000) + 1500;
+    await Promise.race([
+      inFlightPromise ?? Promise.resolve(),
+      new Promise<void>((r) => {
+        const t = setTimeout(r, probeBound);
+        t.unref?.();
+      }),
+    ]);
+  }
+
+  return { evaluate, bootScan, stop };
 }
 
 export type ScheduleEvaluator = ReturnType<typeof createScheduleEvaluator>;

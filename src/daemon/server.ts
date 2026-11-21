@@ -1147,8 +1147,9 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
       const load = loadWorkspaceConfig(scope.ws_root);
       missedPolicy = load.ok ? load.config.missedRunPolicy : DEFAULT_MISSED_RUN_POLICY;
     }
-    const enabledArg = optBoolean(args, "enabled");
-    const enabled = enabledArg === undefined ? 1 : enabledArg ? 1 : 0;
+    // No wire `enabled` arg (review finding): the srs verb table covers the
+    // lifecycle with pause/resume — attach always creates an enabled row.
+    const enabled = 1;
     const id = ulid();
     deps.db
       .prepare(
