@@ -142,12 +142,35 @@ function validateFeedbackItems(items: unknown, errors: string[]): void {
     }
     if (typeof o["category"] !== "string") errors.push(`"feedback_items[${i}].category" must be a string`);
     if (typeof o["message"] !== "string") errors.push(`"feedback_items[${i}].message" must be a string`);
+    if ("file_location" in o) validateFileLocation(o["file_location"], i, errors);
     for (const k of Object.keys(o)) {
       if (!["severity", "category", "message", "file_location"].includes(k)) {
         errors.push(`"feedback_items[${i}]" has unknown key "${k}"`);
       }
     }
   });
+}
+
+/**
+ * §4.1 feedback_items[].file_location: {path: string, line: integer >= 1},
+ * additionalProperties false — the allow-listed key's VALUE is validated
+ * exactly like the rest of the block.
+ */
+function validateFileLocation(value: unknown, index: number, errors: string[]): void {
+  const where = `"feedback_items[${index}].file_location"`;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    errors.push(`${where} must be an object`);
+    return;
+  }
+  const o = value as Record<string, unknown>;
+  if (typeof o["path"] !== "string") errors.push(`${where}.path" must be a string`);
+  const line = o["line"];
+  if (typeof line !== "number" || !Number.isInteger(line) || line < 1) {
+    errors.push(`${where}.line" must be an integer >= 1`);
+  }
+  for (const k of Object.keys(o)) {
+    if (k !== "path" && k !== "line") errors.push(`${where} has unknown key "${k}"`);
+  }
 }
 
 function validateVerificationResults(items: unknown, errors: string[]): void {
@@ -235,7 +258,10 @@ export function validateArtifact(value: unknown): ArtifactValidation {
   if ("feedback_items" in o) validateFeedbackItems(o["feedback_items"], errors);
   if ("verification_results" in o) validateVerificationResults(o["verification_results"], errors);
 
-  if ("role" in o && typeof o["role"] !== "string") errors.push(`"role" must be a string`);
+  if ("role" in o) {
+    if (typeof o["role"] !== "string") errors.push(`"role" must be a string`);
+    else if ((o["role"] as string).length < 1) errors.push(`"role" must be at least 1 character`);
+  }
   if ("engine_verified" in o && typeof o["engine_verified"] !== "boolean") errors.push(`"engine_verified" must be a boolean`);
   if ("protected_files_untouched" in o && typeof o["protected_files_untouched"] !== "boolean") {
     errors.push(`"protected_files_untouched" must be a boolean`);

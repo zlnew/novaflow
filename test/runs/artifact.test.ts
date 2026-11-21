@@ -37,6 +37,14 @@ test("golden: the artifact validator is pinned to the live data.md §4.1 block",
   );
   // the summary minLength the block states
   assert.equal(props["summary"]?.["minLength"], 10);
+  // the role minLength the block states (engine-owned annotation)
+  assert.equal(props["role"]?.["minLength"], 1);
+  // feedback_items[].file_location is a closed {path, line} object with
+  // line >= 1 — the validator must enforce exactly this shape
+  const fileLocation = props["feedback_items"]?.["items"]?.["properties"]?.["file_location"] as Record<string, unknown>;
+  assert.deepEqual(fileLocation["required"], ["path", "line"]);
+  assert.equal((fileLocation["properties"] as Record<string, Record<string, unknown>>)["line"]?.["minimum"], 1);
+  assert.equal(fileLocation["additionalProperties"], false);
 });
 
 const TASK_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -114,6 +122,53 @@ test("validateArtifact rejects wrong types and constraint violations", () => {
     assert.equal(res.ok, false, `case ${name} must fail`);
     if (!res.ok) assert.ok(res.errors.some((e) => re.test(e)), `${name}: ${JSON.stringify(res.errors)}`);
   }
+});
+
+test("validateArtifact rejects a non-object file_location", () => {
+  const res = validateArtifact(
+    validArtifact({
+      task_id: TASK_ID,
+      feedback_items: [{ severity: "error", category: "c", message: "m", file_location: "garbage" }],
+    }),
+  );
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.ok(res.errors.some((e) => /file_location/.test(e)), JSON.stringify(res.errors));
+});
+
+test("validateArtifact rejects file_location constraint violations (line >= 1, closed keys, path string)", () => {
+  const cases: Array<[string, unknown, RegExp]> = [
+    ["line 0", { path: "p", line: 0 }, /line/],
+    ["line not integer", { path: "p", line: 1.5 }, /line/],
+    ["missing line", { path: "p" }, /line/],
+    ["path not string", { path: 7, line: 1 }, /path/],
+    ["unknown key", { path: "p", line: 1, extra: true }, /extra/],
+  ];
+  for (const [name, fileLocation, re] of cases) {
+    const res = validateArtifact(
+      validArtifact({
+        task_id: TASK_ID,
+        feedback_items: [{ severity: "error", category: "c", message: "m", file_location: fileLocation }],
+      }),
+    );
+    assert.equal(res.ok, false, `case ${name} must fail`);
+    if (!res.ok) assert.ok(res.errors.some((e) => re.test(e)), `${name}: ${JSON.stringify(res.errors)}`);
+  }
+});
+
+test("validateArtifact accepts a well-formed file_location", () => {
+  const res = validateArtifact(
+    validArtifact({
+      task_id: TASK_ID,
+      feedback_items: [{ severity: "error", category: "c", message: "m", file_location: { path: "src/auth.rs", line: 12 } }],
+    }),
+  );
+  assert.equal(res.ok, true);
+});
+
+test("validateArtifact rejects an empty role (minLength 1)", () => {
+  const res = validateArtifact(validArtifact({ task_id: TASK_ID, role: "" }));
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.ok(res.errors.some((e) => /role/.test(e)), JSON.stringify(res.errors));
 });
 
 test("readArtifactFile: missing file is a typed miss, never a crash", () => {
