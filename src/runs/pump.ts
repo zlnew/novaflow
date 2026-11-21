@@ -41,6 +41,10 @@ export function createPump(rawPath: string, redactedPath: string) {
     if (frame === null || typeof frame !== "object" || Array.isArray(frame)) return;
     const f = frame as { type?: unknown; usage?: unknown };
     if (f.type === "agent_settled") settled = true;
+    // Usage semantics (api.md §5): frames carry per-message deltas
+    // (message_update usage is 0) with the cumulative totals arriving on
+    // message_end — a running sum over all frames reproduces the trace's
+    // message_end totals, which is the basis for tallying this way.
     const usage = f.usage;
     if (usage !== null && typeof usage === "object" && !Array.isArray(usage)) {
       const u = usage as { input?: unknown; output?: unknown };
@@ -62,6 +66,13 @@ export function createPump(rawPath: string, redactedPath: string) {
     flushPartial(line: string): void {
       if (line.length === 0) return;
       consume(line);
+    },
+    /**
+     * An engine-authored line (e.g. the 8.4 crash failure frame) for
+     * the REDACTED read surface ONLY — never the verbatim raw file.
+     */
+    appendEngineLine(line: string): void {
+      appendFileSync(redactedPath, redactLine(line) + "\n");
     },
     get inputTokens(): number {
       return inputTokens;

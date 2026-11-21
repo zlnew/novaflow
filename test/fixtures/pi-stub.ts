@@ -25,6 +25,9 @@
  *   run-repair-ok  writes result.json ONLY when the engine-context (read via
  *                  NOVAFLOW_RUN_CONTEXT) says attempt_kind === "repair";
  *                  the first (execution) attempt behaves like run-missing
+ *   run-crash-stderr  like run-crash, but writes a marker (with a fake
+ *                  sk- token) to stderr before exiting 3 — exercises the
+ *                  crash-path stderr capture and scrubbing
  *   run-fork-grandchild  like run-hang, but forks a sleeping grandchild
  *                  (inheriting this stub's stdout pipe) that records its
  *                  own SIGTERM to the pidfile as "GRANDCHILD-SIGTERM";
@@ -56,7 +59,7 @@ const GET_STATE_MODES = new Set(["ok", "silent", "garbage", "wrongid"]);
 const RUN_MODES = new Set([
   "run-ok", "run-blocked", "run-missing", "run-invalid",
   "run-hang", "run-overspend", "run-crash", "run-repair-ok",
-  "run-fork-grandchild",
+  "run-crash-stderr", "run-fork-grandchild",
   "run-hang-ignore-term", "run-settle-linger",
 ]);
 
@@ -213,7 +216,8 @@ if (RUN_MODES.has(mode)) {
 
   const emitted: string[] =
     effective === "run-hang" || effective === "run-crash" ||
-      effective === "run-fork-grandchild" || effective === "run-hang-ignore-term"
+      effective === "run-crash-stderr" || effective === "run-fork-grandchild" ||
+      effective === "run-hang-ignore-term"
       ? [messageUpdate]
       : effective === "run-overspend"
         ? [messageUpdate, messageEnd({ input: 2_000_000, output: 1_000_000 })]
@@ -281,6 +285,12 @@ if (RUN_MODES.has(mode)) {
       // never settles; holds until the engine kills it
     } else if (effective === "run-crash") {
       for (const line of emitted) process.stdout.write(line + "\n");
+      process.exit(3);
+    } else if (effective === "run-crash-stderr") {
+      for (const line of emitted) process.stdout.write(line + "\n");
+      // stderr marker incl. a fake sk- token: the crash path must capture
+      // and scrub it
+      process.stderr.write("pi-stub crash marker: sk-abcdef1234567890 token\n");
       process.exit(3);
     } else if (effective === "run-hang-ignore-term") {
       for (const line of emitted) process.stdout.write(line + "\n");

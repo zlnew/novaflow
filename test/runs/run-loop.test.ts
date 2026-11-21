@@ -576,6 +576,39 @@ test("run-crash: nonzero exit before settle → run failed with exit_code, task 
   }
 });
 
+test("run-crash-stderr: the crash path captures stderr into error_summary and events.jsonl only — never events.raw.jsonl", async (t) => {
+  const s = seed();
+  try {
+    const outcome = await withBound(t.signal, BOUND_MS, run(s, "run-crash-stderr"));
+    assert.equal(outcome.finalState, "failed");
+    const row = runRow(s, 1);
+    assert.equal(row.exit_code, 3);
+    // the scrubbed stderr tail lands in error_summary — with the fake
+    // token masked, not copied verbatim
+    assert.match(row.error_summary ?? "", /pi-stub crash marker/);
+    assert.match(row.error_summary ?? "", /\[REDACTED\]/);
+    assert.doesNotMatch(row.error_summary ?? "", /sk-abcdef/);
+    // one engine failure frame in the REDACTED read surface…
+    const redacted = readFileSync(join(row.pi_session_dir, "events.jsonl"), "utf8").trim().split("\n");
+    const failure = redacted.filter((l) => l.includes("novaflow_run_failure"));
+    assert.equal(failure.length, 1);
+    const frame = JSON.parse(failure[0]!) as Record<string, unknown>;
+    assert.equal(frame["type"], "novaflow_run_failure");
+    assert.equal(frame["reason"], "crash");
+    assert.equal(frame["exit"], 3);
+    assert.match(String(frame["stderr_tail"]), /pi-stub crash marker/);
+    assert.match(String(frame["stderr_tail"]), /\[REDACTED\]/);
+    // …and NOT a byte of it in the verbatim raw file
+    const raw = readFileSync(join(row.pi_session_dir, "events.raw.jsonl"), "utf8");
+    assert.doesNotMatch(raw, /novaflow_run_failure|crash marker|sk-abcdef/);
+    await assertReaped(row.pid!);
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+    rmSync(join(s.pidfile, ".."), { recursive: true, force: true });
+  }
+});
+
 test("unspawnable pi binary → run failed, exit_code null, task failed", async (t) => {
   const s = seed();
   try {

@@ -14,6 +14,7 @@ import { buildEngineContext, writeEngineContext } from "./context.ts";
 import { composePrompt, type ComposedPrompt } from "./prompt.ts";
 import { buildRunArgv, defaultExtensionPath, runDirPath } from "./spawn.ts";
 import { createPump } from "./pump.ts";
+import { redactText } from "./redact.ts";
 import { readArtifactFile } from "./artifact.ts";
 import {
   costUsd,
@@ -421,9 +422,9 @@ export async function startRun(
     ];
     // detached: the child leads its own process group (architecture 8.4
     // killpg) so a budget/timeout kill reaches pi's grandchildren (bash
-    // tools etc.).
+    // tools etc.); stderr is piped and buffered for the crash path.
     const child = spawn(opts.piBin ?? "pi", argv, {
-      stdio: ["pipe", "pipe", "ignore"],
+      stdio: ["pipe", "pipe", "pipe"],
       detached: true,
       env: {
         ...process.env,
@@ -460,6 +461,15 @@ export async function startRun(
 
     // budget breach cost, filled in when the kill is issued
     let breachCost = 0;
+
+    // stderr capture for the 8.4 Subprocess Crashes row: buffered in
+    // memory (bounded), only ever read into the REDACTED surfaces
+    let stderrBuf = "";
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      stderrBuf += chunk;
+      if (stderrBuf.length > 8192) stderrBuf = stderrBuf.slice(-4096);
+    });
 
     // architecture 8.4: killpg() — signal the child's whole process
     // group. ESRCH (group already gone) is fine on both signals.
@@ -570,10 +580,20 @@ export async function startRun(
       // state — one engine frame in events.jsonl (the REDACTED read
       // surface only, never the raw file), the scrubbed tail (last ~2 KB)
       // in the run's error_summary.
+      const stderrTail = redactText(stderrBuf.slice(-2048));
+      pump.appendEngineLine(
+        JSON.stringify({
+          type: "novaflow_run_failure",
+          reason: outcome.kind === "crash" ? "crash" : "spawn",
+          exit: outcome.kind === "crash" ? outcome.code : null,
+          stderr_tail: stderrTail,
+        }),
+      );
       const error =
         outcome.kind === "spawn-error"
           ? `spawn failed: ${outcome.message}`
-          : `subprocess exited before agent_settled (exit=${outcome.code ?? "null"})`;
+          : `subprocess exited before agent_settled (exit=${outcome.code ?? "null"})` +
+            (stderrTail !== "" ? `\nstderr tail: ${stderrTail}` : "");
       finalizeRun(db, runId, {
         status: "failed",
         preflightStatus: "passed",
