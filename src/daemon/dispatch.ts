@@ -83,6 +83,14 @@ export type DispatchOptions = {
    * before re-eligibility — the poison-task hot-loop breaker.
    */
   startFailureCooldownMs?: number | undefined;
+  /**
+   * Periodic schedule evaluation (FR-SCH-01/03): invoked on THIS
+   * module's tick, only while unpaused — the schedule evaluator's
+   * single-flight pass (src/daemon/schedules.ts). One timer, one
+   * pause: a paused daemon freezes schedule evaluation exactly like
+   * it freezes new spawns.
+   */
+  scheduleTick?: (() => void) | undefined;
 };
 
 export type RunStartFailure = { taskId: string; error: string };
@@ -128,7 +136,10 @@ export function createDispatcher(db: Db, opts: DispatchOptions) {
   const startFailureCooldownMs = opts.startFailureCooldownMs ?? 5000;
   /** taskId → epoch ms until which it is skipped (start-failure cooldown). */
   const cooldownUntil = new Map<string, number>();
-  const tick = setInterval(() => requestDispatch(), tickMs);
+  const tick = setInterval(() => {
+    requestDispatch();
+    if (!paused && !stopped) opts.scheduleTick?.();
+  }, tickMs);
   tick.unref?.();
 
   function workspaceLimit(rootPath: string): number {
