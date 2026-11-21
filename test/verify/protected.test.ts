@@ -775,3 +775,46 @@ test("non-ASCII modified paths arrive raw (core.quotePath=false) — no unescapi
     rmSync(runDir, { recursive: true, force: true });
   }
 });
+
+test("pruning wins even when a protected glob names .git explicitly — documented, pinned (re-judge finding 4)", () => {
+  const s = seed();
+  const root = gitRepo({
+    "tests/protected.test.ts": "test('protected', () => {});\n",
+  });
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "app", root, protected: [".git/hooks/**"], write: ["src/**"] });
+    const path = writeProtectedDigests(s.db, s.taskId, runDir, ulid());
+    const snap = JSON.parse(readFileSync(path, "utf8")) as {
+      targets: Array<{ files: Record<string, string> }>;
+    };
+    // Intentional: PRUNED_DIRS never enter a snapshot, glob or no glob.
+    assert.deepEqual(snap.targets[0]?.files, {});
+  } finally {
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("a protected subtree itself exceeding MAX_TREE_FILES is a preflight error naming the target (count-bound branch, re-judge finding 3)", () => {
+  const s = seed();
+  const root = gitRepo({ "src/app.ts": "export {};\n" });
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "app", root, protected: ["tests/**"], write: ["src/**"] });
+    manyJunkFiles(root, "tests");
+    assert.throws(
+      () => writeProtectedDigests(s.db, s.taskId, runDir, ulid()),
+      (err: unknown) => {
+        const msg = (err as Error).message;
+        return /exceeds 20000/i.test(msg) && /app/i.test(msg);
+      },
+      "the >20k protected walk must fail as a named preflight error, not succeed or throw raw",
+    );
+  } finally {
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
