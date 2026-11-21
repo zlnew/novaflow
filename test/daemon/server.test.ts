@@ -875,6 +875,8 @@ test("write discipline: the daemon modules never issue a raw state UPDATE (grep-
     "src/daemon/triggers.ts",
     "src/chain/import.ts",
     "src/chain/readiness.ts",
+    "src/chain/graph.ts",
+    "src/chain/yaml.ts",
     "src/daemonconfig.ts",
   ];
   for (const f of files) {
@@ -885,12 +887,18 @@ test("write discipline: the daemon modules never issue a raw state UPDATE (grep-
       // guarded form (never a raw state write; a terminal chain never moves
       // again). All other SET state = writes stay forbidden.
       const writes = src.match(/UPDATE\s+chain_runs\s+SET\s+state\s*=\s*'(?:aborted|failed|completed)'\s*,\s*completed_at\s*=\s*\?\s+WHERE\s+id\s*=\s*\?\s+AND\s+state\s*=\s*'active'/g) ?? [];
-      const raw = src.match(/SET\s+state\s*=/g) ?? [];
+      // case-INsensitive raw count (re-judge: SET STATE = smuggled past a
+      // case-sensitive counter); the guarded form stays exact-case, so any
+      // case variant counts raw but not guarded and fails
+      const raw = src.match(/SET\s+state\s*=/gi) ?? [];
       assert.equal(
         writes.length, raw.length,
         `${f}: every chain_runs state write must be the guarded terminal form`,
       );
-      assert.ok(raw.length <= 3, `${f}: unexpected chain_runs state write count`);
+      // graph/yaml are pure modules — zero state writes; the chain modules
+      // own at most the three guarded terminal movers
+      const max = f.endsWith("graph.ts") || f.endsWith("yaml.ts") ? 0 : 3;
+      assert.ok(raw.length <= max, `${f}: unexpected chain_runs state write count (${raw.length} > ${max})`);
     } else {
       assert.doesNotMatch(src, /SET\s+state\s*=/i, `${f} must not write state columns`);
     }

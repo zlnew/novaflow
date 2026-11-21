@@ -11,7 +11,7 @@ import { VERIFY_PASSED_TRIGGER, GATE_FAIL_TRIGGER } from "../../src/fsm/triggers
 import { abortTriggerFor } from "../../src/daemon/triggers.ts";
 import { InvalidTransitionError } from "../../src/fsm/engine.ts";
 import { importChain, getChainRun, type ChainRunRow } from "../../src/chain/import.ts";
-import { createChainEvaluator, CHAIN_ENGINE_ACTOR } from "../../src/chain/readiness.ts";
+import { createChainEvaluator, CHAIN_ENGINE_ACTOR, memberReadiness } from "../../src/chain/readiness.ts";
 import { enqueueTask } from "../../src/tasks.ts";
 
 /**
@@ -308,6 +308,40 @@ test("boot sweep: a restart-shaped store (ready members implied by member states
       .get(one.b) as { n: number };
     assert.equal(queuedLogs.n, 1);
     assert.ok(report.enqueued >= 1);
+  } finally {
+    s.db.close();
+  }
+});
+
+test("memberReadiness pins all three branches: root / dep-met ready / dep-unmet (re-judge finding 1)", () => {
+  const s = seed();
+  try {
+    const { chainId, a, b } = importLinearChain(s);
+    complete(s, a); // A reaches completed via the legal matrix rows
+    const view = memberReadiness(s.db, chainId);
+    const rowA = view.find((m) => m.id === a)!;
+    const rowB = view.find((m) => m.id === b)!;
+    // A: root (no depends_on in-edge) — completed, never engine-started
+    assert.equal(rowA.root, true);
+    assert.equal(rowA.ready, false);
+    // B: dep met + draft + has an in-edge — the READY positive branch,
+    // exactly what the evaluator would enqueue
+    assert.equal(rowB.root, false);
+    assert.equal(rowB.state, "draft");
+    assert.equal(rowB.ready, true);
+  } finally {
+    s.db.close();
+  }
+});
+
+test("memberReadiness with an unmet dependency: ready stays false", () => {
+  const s = seed();
+  try {
+    const { chainId, b } = importLinearChain(s);
+    const view = memberReadiness(s.db, chainId);
+    const rowB = view.find((m) => m.id === b)!;
+    assert.equal(rowB.root, false);
+    assert.equal(rowB.ready, false); // A still draft — dep unmet
   } finally {
     s.db.close();
   }
