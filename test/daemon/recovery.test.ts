@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -65,6 +66,8 @@ type Seed = {
   wsRoot: string;
   taskId: string;
   pricesPath: string;
+  /** The temp dir holding pricesPath — cleanup() removes it (leak pin). */
+  pricesDir: string;
 };
 
 function seed(): Seed {
@@ -102,7 +105,7 @@ function seed(): Seed {
   const dir = mkdtempSync(join(tmpdir(), "novaflow-recp-"));
   const pricesPath = join(dir, "prices.json");
   writeFileSync(pricesPath, JSON.stringify(PRICES));
-  return { db, wsRoot, taskId: task.id, pricesPath };
+  return { db, wsRoot, taskId: task.id, pricesPath, pricesDir: dir };
 }
 
 type Orphan = { runId: string; runDir: string };
@@ -151,7 +154,14 @@ function lastTransition(s: Seed): Record<string, unknown> {
 function cleanup(s: Seed): void {
   s.db.close();
   rmSync(s.wsRoot, { recursive: true, force: true });
+  rmSync(s.pricesDir, { recursive: true, force: true });
 }
+
+/** The suite's temp-dir footprint (both rec- and recp- prefixed roots). */
+function recTempDirs(): string[] {
+  return readdirSync(tmpdir()).filter((d) => d.startsWith("novaflow-rec"));
+}
+const recTempDirsBefore = recTempDirs();
 
 /* ----------------------------- replayed settlement ------------------------------ */
 
@@ -354,6 +364,12 @@ test("guard-refusal finalize preserves the orphan's preflight_status (a 'pending
   } finally {
     cleanup(s);
   }
+});
+
+test("suite cleanup: zero temp dirs leaked (before/after delta 0)", () => {
+  // every seed() in this suite cleans its wsRoot AND its prices dir —
+  // the leak this pins was ~6 novaflow-recp- dirs per run
+  assert.deepEqual(recTempDirs().filter((d) => !recTempDirsBefore.includes(d)), []);
 });
 
 test("recovery is idempotent: a second pass finds no orphans", () => {
