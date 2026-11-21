@@ -111,9 +111,11 @@ export type EnqueueOptions = {
   args?: string[] | undefined;
   /** Response-frame deadline for the catalog probe. */
   timeoutMs?: number | undefined;
-  /** Surface issuing the enqueue: `human` (CLI) or `mcp` (nova_task_run) —
-   *  the two surfaces the 8.1 trigger names. Logged per the DDL CHECK. */
-  triggerType?: "human" | "mcp" | undefined;
+  /** Surface issuing the enqueue: `human` (CLI), `mcp` (nova_task_run),
+   *  or `schedule` (the schedule evaluator, FR-SCH-01) — the surfaces
+   *  the DDL's state_transition_logs.trigger_type CHECK names. Logged
+   *  verbatim per the CHECK. */
+  triggerType?: "human" | "mcp" | "schedule" | undefined;
 };
 
 export function getTask(db: Db, taskId: string): TaskRow | undefined {

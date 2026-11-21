@@ -11,6 +11,7 @@ import {
 import { recoverOrphanedRuns, type RecoveryReport } from "./recovery.ts";
 import { createDispatcher, type DispatchStatus } from "./dispatch.ts";
 import { createRetryEvaluator, type RetryEvaluator } from "./retry.ts";
+import { createScheduleEvaluator, type ScheduleEvaluator } from "./schedules.ts";
 import { bindControlServer, type ControlServer } from "./server.ts";
 import { runVerification } from "../verify/runner.ts";
 import { verifyProtectedAndScope } from "../verify/protected.ts";
@@ -32,6 +33,10 @@ import type { NotifyOptions } from "../notify.ts";
  *   4. the retry evaluator's boot scan (spent budgets escalate,
  *      elapsed delays requeue — requeues dispatch because the
  *      dispatcher already exists);
+ *   4b. the schedule evaluator's missed-run boot scan (FR-SCH-03 AC2:
+ *      skip advances, run_immediately fires exactly once) — BEFORE
+ *      the first dispatch tick can fire a missed schedule without
+ *      its policy;
  *   5. the dispatch loop (FIFO semaphores) and the JSONL socket.
  *
  * stop() rule (documented): the daemon is the single owner of every
@@ -122,6 +127,9 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
   let server: ControlServer | undefined;
   let dispatcherRef: ReturnType<typeof createDispatcher> | undefined;
   let retryRef: RetryEvaluator | undefined;
+  // assigned AT CREATION (the p3a retryRef lesson): a boot-failure catch must
+  // be able to stop an evaluator that exists when the throw lands
+  let schedulesRef: ScheduleEvaluator | undefined;
   let stopped = false;
   try {
     migrate(db);
@@ -229,10 +237,32 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       void job.finally(() => verificationInFlight.delete(job));
     };
 
+    // the schedule evaluator (FR-SCH-01/03): every fire goes through
+    // enqueueTask — the ONE draft→queued row, trigger_type 'schedule',
+    // actor 'scheduler' — and its missed-run boot scan runs before the
+    // first dispatch tick. Evaluation rides the dispatcher's tick;
+    // a fired enqueue requests a dispatch pass (late-bound like retry).
+    const enqueueOptions = {
+      ...(opts.probePiBin !== undefined ? { piBin: opts.probePiBin } : {}),
+      ...(opts.probeArgs !== undefined ? { args: opts.probeArgs } : {}),
+      ...(opts.probeTimeoutMs !== undefined ? { timeoutMs: opts.probeTimeoutMs } : {}),
+    };
+    const schedules: ScheduleEvaluator = createScheduleEvaluator(db, {
+      enqueueOptions,
+      onEnqueued: (taskId: string) => {
+        dispatcherRef?.requestDispatch();
+      },
+      actor: "scheduler",
+    });
+    schedulesRef = schedules; // at creation, for the boot-failure catch
+
     const dispatcher = createDispatcher(db, {
       globalConcurrency: daemonConfig.concurrency.global,
       runOptions,
       ...(opts.tickMs !== undefined ? { tickMs: opts.tickMs } : {}),
+      scheduleTick: () => {
+        void schedules.evaluate();
+      },
       onRunConcluded: (taskId: string, outcome) => {
         if ("finalState" in outcome && outcome.finalState === "failed") {
           retry.evaluate(taskId);
@@ -244,6 +274,10 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       },
     });
     dispatcherRef = dispatcher;
+    // FR-SCH-03 AC2 first: missed-run recovery applies each schedule's
+    // policy (skip | run_immediately) BEFORE any tick can fire a
+    // missed schedule unreviewed; then the retry boot scan.
+    await schedules.bootScan();
     retry.bootScan(); // spent budgets escalate; elapsed delays requeue
 
     const daemonStatus = (): DaemonStatus => {
@@ -273,6 +307,9 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       if (server !== undefined) await server.close(); // stop accepting, unlink the socket
       await dispatcher.stop(); // reap live runs (operator-abort semantics)
       retry.stop(); // clear every armed timer
+      // a schedule fire straddling shutdown is awaited (bounded by its own
+      // probe timeout) — db.close() never lands inside a fire's continuation
+      await schedules.stop();
       // the documented stop rule (header): no spawned process outlives
       // the handle — in-flight verification commands are awaited (their
       // own timeout/kill discipline bounds the wait)
@@ -291,13 +328,7 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
           void stop();
         },
         ...(opts.probePiBin !== undefined || opts.probeArgs !== undefined || opts.probeTimeoutMs !== undefined
-          ? {
-              enqueueOptions: {
-                ...(opts.probePiBin !== undefined ? { piBin: opts.probePiBin } : {}),
-                ...(opts.probeArgs !== undefined ? { args: opts.probeArgs } : {}),
-                ...(opts.probeTimeoutMs !== undefined ? { timeoutMs: opts.probeTimeoutMs } : {}),
-              },
-            }
+          ? { enqueueOptions }
           : {}),
       },
       opts.socketPath ?? join(homedir(), ".novaflow", "novaflow.sock"),
@@ -314,6 +345,9 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
     // started (timers, dispatcher, socket) and closes the store
     if (dispatcherRef !== undefined) await dispatcherRef.stop();
     if (retryRef !== undefined) retryRef.stop();
+    // a boot-failure path closes the store too — an in-flight schedule fire
+    // is bound-awaited first (re-judge residual: same race as the stop path)
+    if (schedulesRef !== undefined) await schedulesRef.stop();
     if (server !== undefined) await server.close();
     db.close();
     throw err;
