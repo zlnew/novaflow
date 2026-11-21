@@ -27,6 +27,22 @@ export function extractDdl(): string {
   return m[1].trimEnd() + "\n";
 }
 
+/** The §4.2 profile.json JSON Schema block, parsed live from data.md. */
+export function extractProfileSchema(): Record<string, unknown> {
+  const text = specFile("data.md");
+  const start = text.indexOf(
+    "### 4.2 Agent Profile Configuration Schema (profile.json)",
+  );
+  if (start < 0) {
+    throw new Error("profile schema section (§4.2) not found in data.md");
+  }
+  const m = text.slice(start).match(/```json\n([\s\S]*?)```/);
+  if (!m || !m[1]) {
+    throw new Error("no ```json block found in data.md §4.2");
+  }
+  return JSON.parse(m[1]) as Record<string, unknown>;
+}
+
 const CANONICAL_STATES = [
   "draft",
   "queued",
