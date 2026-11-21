@@ -13,6 +13,7 @@ import { createDispatcher, type DispatchStatus } from "./dispatch.ts";
 import { createRetryEvaluator, type RetryEvaluator } from "./retry.ts";
 import { createScheduleEvaluator, type ScheduleEvaluator } from "./schedules.ts";
 import { createChainEvaluator, type ChainEvaluator } from "../chain/readiness.ts";
+import { createRoutingEvaluator, driveSelfPathRequeue, type RoutingEvaluator } from "../chain/routing.ts";
 import { bindControlServer, type ControlServer } from "./server.ts";
 import { runVerification } from "../verify/runner.ts";
 import { verifyProtectedAndScope } from "../verify/protected.ts";
@@ -183,13 +184,13 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
     // run-conclusion hook — i.e. AFTER startRun has fully resolved
     // (task settled into validating, child reaped), never inside the
     // startRun call path, so the verification spawns can never recurse
-    // into dispatch. Scope (documented): the run-settle outcome only;
-    // a gate-APPROVED validating task is left to the operator/scheduler
-    // surfaces, and boot-recovery replays stay in validating (recovery
-    // owns §8.4 reconciliation, not new engine verdicts).
+    // into dispatch. Scope (documented): the run-settle outcome, AND
+    // (p4b, the p4a residual) the gate-APPROVED validating task — the
+    // ONE driveVerification pipeline drives every validating task to
+    // its engine verdict; boot-recovery replays stay in validating
+    // (recovery owns §8.4 reconciliation, not new engine verdicts).
     const verificationInFlight = new Set<Promise<void>>();
-    const settleVerification = (taskId: string, outcome: RunOutcome): void => {
-      const run = outcome.runs[outcome.runs.length - 1]!; // the settled attempt
+    const driveVerification = (taskId: string, run: { id: string; pi_session_dir: string }): void => {
       const job = (async (): Promise<void> => {
         try {
           const verify = await runVerification(db, taskId);
@@ -227,6 +228,39 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
           // reaches the retry/escalation evaluator exactly like a run
           // failure (which the dispatch hook already routes)
           if (validation.finalState === "failed") retry.evaluate(taskId);
+          // the SELF path (8.1 routing rule path 1): a task whose own
+          // verification failed retries itself within its budget — the
+          // engine's findings are the feedback artifact (p4b review
+          // finding: this row previously had no caller; changes_requested
+          // dead-ended while the review path requeued fine)
+          if (validation.finalState === "changes_requested") {
+            driveSelfPathRequeue(
+              db,
+              taskId,
+              "engine-verification",
+              JSON.stringify(
+                {
+                  kind: "novaflow-self-verification-feedback",
+                  task_id: taskId,
+                  summary,
+                },
+                null,
+                2,
+              ) + "\n",
+              "daemon-verify",
+            );
+            dispatcher.requestDispatch();
+          }
+          // THE p4b REVIEW-ROUTING SEAM (8.1 feedback routing rule): a
+          // member that just COMPLETED with a changes_requested artifact
+          // routes its on_changes_requested targets FIRST — the re-entry
+          // is part of the completion's consequences, so the chain's own
+          // terminal/readiness evaluation below sees the true member
+          // states (otherwise "all members completed" could complete a
+          // chain that a pending review immediately reopens)
+          if (validation.finalState === "completed") {
+            await routing.routeReviewPath(taskId);
+          }
           // THE p4a CHAIN SEAM (the single natural evaluation point):
           // the ONLY place the engine turns a settled/gate-approved
           // validating task into a terminal outcome is completeValidation
@@ -236,14 +270,15 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
           // confirm it — that failure came from validating). Non-chain
           // tasks are a no-op inside evaluateForTask.
           //
-          // The gate-approve→validating→completed path: a gate-APPROVED
-          // validating task is left to the operator/scheduler surfaces by
-          // the engine's existing documented scope (this seam's own doc,
-          // above) — the chain rides the SAME seam, so whatever surface
-          // drives that validation to a verdict lands here too. The gate
-          // surface's terminal FAILURE (awaiting_gate→failed, the chain-
-          // failed rule) is wired at the nova_gate_confirm_failure op,
-          // which owns that matrix row.
+          // The gate-APPROVED validating task drives through the SAME
+          // pipeline (onGateApproved below), so whatever verdict the
+          // engine reaches lands here too — approving never bypasses
+          // engine verification (FR-TSK-12: the operator approved the
+          // GATE; the engine still decides the validating→terminal
+          // verdict). The gate surface's own terminal FAILURE
+          // (awaiting_gate→failed — the chain-failed rule AND the
+          // on_failure fallback) is wired at the nova_gate_confirm_failure
+          // op, which owns those matrix rows.
           await chains.evaluateForTask(taskId);
         } catch (err) {
           // never-crash: a guard refusal (the task moved meanwhile —
@@ -254,6 +289,12 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       })();
       verificationInFlight.add(job);
       void job.finally(() => verificationInFlight.delete(job));
+    };
+    // the settle seam (dispatch's run-conclusion hook) derives the
+    // settled attempt and hands it to the ONE pipeline
+    const settleVerification = (taskId: string, outcome: RunOutcome): void => {
+      const run = outcome.runs[outcome.runs.length - 1]!; // the settled attempt
+      driveVerification(taskId, { id: run.id, pi_session_dir: run.pi_session_dir });
     };
 
     // the schedule evaluator (FR-SCH-01/03): every fire goes through
@@ -295,6 +336,41 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       isPaused: (chainRunId: string) => pausedChains.has(chainRunId),
     });
 
+    // The chain FEEDBACK ROUTING evaluator (p4b; 8.1 feedback routing
+    // rule + failure routing rule): the review path rides the settle/
+    // gate-approve verification pipeline above (routeReviewPath before
+    // chains.evaluateForTask), the failure path rides the
+    // nova_gate_confirm_failure op, and the boot sweep closes both
+    // crash windows. No timers — evaluation is event-driven, same as
+    // the readiness evaluator.
+    const routing: RoutingEvaluator = createRoutingEvaluator(db, {
+      enqueueOptions,
+      onEnqueued: (taskId: string) => {
+        dispatcherRef?.requestDispatch();
+      },
+      ...(opts.notifyOptions !== undefined ? { notifyOptions: opts.notifyOptions } : {}),
+    });
+
+    // The gate-approved verification driver (p4b — the p4a residual):
+    // nova_gate_approve moves awaiting_gate→validating and NOTHING
+    // drove it; now the SAME pipeline the settle seam uses decides the
+    // verdict. The reading (documented): the operator approved the
+    // GATE; engine verification still decides the validating→terminal
+    // verdict per FR-TSK-12 — approving never bypasses verification.
+    // Fire-and-forget (tracked in verificationInFlight, bounded by
+    // stop()): the op returns at validating, the verdict lands async
+    // exactly like the settle path's.
+    const onGateApproved = (taskId: string, runId: string): void => {
+      const run = db
+        .prepare("SELECT pi_session_dir FROM task_runs WHERE id = ?")
+        .get(runId) as { pi_session_dir: string } | undefined;
+      if (run === undefined) {
+        warn(`gate-approved verification of task ${taskId} dropped: run ${runId} is missing`);
+        return;
+      }
+      driveVerification(taskId, { id: runId, pi_session_dir: run.pi_session_dir });
+    };
+
     const dispatcher = createDispatcher(db, {
       globalConcurrency: daemonConfig.concurrency.global,
       runOptions,
@@ -317,11 +393,21 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
     // FR-SCH-03 AC2 first: missed-run recovery applies each schedule's
     // policy (skip | run_immediately) BEFORE any tick can fire a
     // missed schedule unreviewed; then the retry boot scan; then the
-    // chain boot sweep (FR-TSK-07: a completion that happened while the
+    // chain boot sweeps (FR-TSK-07: a completion that happened while the
     // daemon was down still propagates exactly once, and a
-    // terminal-implied chain moves at boot).
+    // terminal-implied chain moves at boot; p4b: a review occurrence or
+    // a confirmed-failure fallback missed during downtime fires exactly
+    // once — the durable markers back the sweep up)
     await schedules.bootScan();
     retry.bootScan(); // spent budgets escalate; elapsed delays requeue
+    // BOOT ORDER (review round, judge-proven): routing BEFORE the chain
+    // sweep — a crash between completeValidation and routeReviewPath
+    // leaves an unrouted review occurrence on an all-completed chain;
+    // sweeping chains first would complete the chain and the routing
+    // sweep would then skip it, silently dropping the review round.
+    // Routing first re-enters the target (the chain stays active), THEN
+    // terminal rules evaluate against the true member states.
+    await routing.bootScan();
     await chains.bootScan();
 
     const daemonStatus = (): DaemonStatus => {
@@ -367,9 +453,11 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
         dispatcher,
         retry,
         chains,
+        routing,
         pausedChains,
         daemonConfig,
         daemonStatus,
+        onGateApproved,
         requestStop: () => {
           void stop();
         },

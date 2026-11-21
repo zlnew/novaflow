@@ -63,6 +63,7 @@ import {
   ChainValidationError,
 } from "../chain/import.ts";
 import { memberReadiness, type ChainEvaluator } from "../chain/readiness.ts";
+import { deliveredFeedbackPaths, driveSelfPathRequeue, type RoutingEvaluator } from "../chain/routing.ts";
 import { parseYaml, YamlParseError } from "../chain/yaml.ts";
 
 /**
@@ -156,6 +157,17 @@ export type ServerDeps = {
   retry: RetryEvaluator;
   /** The chain readiness/terminal evaluator (p4a chains; FR-TSK-07). */
   chains: ChainEvaluator;
+  /** The chain feedback-routing evaluator (p4b; 8.1 feedback + failure routing rules). */
+  routing: RoutingEvaluator;
+  /**
+   * The gate-approved verification driver (p4b — the p4a residual):
+   * invoked by nova_gate_approve AFTER the awaiting_gate→validating
+   * move; runs the SAME verification pipeline the settle seam uses so
+   * the ENGINE still decides the validating→terminal verdict
+   * (FR-TSK-12 — approving never bypasses verification). Fire-and-
+   * forget: the op returns at validating, the verdict lands async.
+   */
+  onGateApproved: (taskId: string, runId: string) => void;
   /** The daemon's in-memory paused-chain set (FR-TSK-08 scheduler level). */
   pausedChains: Set<string>;
   daemonConfig: DaemonConfig;
@@ -1043,6 +1055,11 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
     // the 8.1 gate approval contract: all four fields required
     const payload = gatePayload(deps.db, args);
     const outcome = approveGate(deps.db, payload, surface as GateSurface);
+    // p4b (the p4a residual): the operator approved the GATE; the ENGINE
+    // still decides the validating→terminal verdict per FR-TSK-12. The
+    // same verification pipeline the settle seam uses drives this task
+    // now (fire-and-forget — the response returns at validating).
+    deps.onGateApproved(payload.task_id, payload.run_id);
     return { final_state: outcome.finalState, retry_count: outcome.retryCount };
   });
 
@@ -1057,10 +1074,38 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
       note: "gate rejection",
     });
     const outcome = rejectGate(deps.db, payload, feedback, surface as GateSurface);
-    return { final_state: outcome.finalState, retry_count: outcome.retryCount };
+    // the SELF path for gate rejections (8.1 routing rule path 1): a
+    // rejected task with remaining budget retries itself — the operator's
+    // feedback is the artifact (p4b review finding: no requeue driver)
+    let feedbackPath: string | null = null;
+    let finalState = outcome.finalState;
+    if (outcome.finalState === "changes_requested") {
+      feedbackPath = driveSelfPathRequeue(
+        deps.db,
+        payload.task_id,
+        "gate-reject",
+        JSON.stringify(
+          {
+            kind: "novaflow-gate-reject-feedback",
+            task_id: payload.task_id,
+            run_id: payload.run_id,
+            rejected_by: payload.approved_by,
+            feedback,
+          },
+          null,
+          2,
+        ) + "\n",
+        payload.approved_by,
+      );
+      if (feedbackPath !== null) {
+        finalState = "queued"; // the requeue row moved it — report the truth
+        deps.dispatcher.requestDispatch();
+      }
+    }
+    return { final_state: finalState, retry_count: outcome.retryCount, feedback_path: feedbackPath };
   });
 
-  ops.set("nova_gate_confirm_failure", (args, { deps, surface }) => {
+  ops.set("nova_gate_confirm_failure", async (args, { deps, surface }) => {
     const payload = gatePayload(deps.db, args, {
       fillRun: true,
       approvedBy: "operator",
@@ -1075,10 +1120,23 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
     const member = deps.db
       .prepare("SELECT chain_run_id FROM tasks WHERE id = ?")
       .get(payload.task_id) as { chain_run_id: string | null } | undefined;
+    let fallbackEnqueued: string[] | undefined;
     if (member !== undefined && member.chain_run_id !== null) {
       deps.chains.applyTerminalRules(member.chain_run_id);
+      // p4b: the 8.1 failure routing rule — UNORDERED with the
+      // chain-failed rule above (both happen): the chain records
+      // failed while member-level routing continues (nothing halts
+      // members on chain state in v1). Draft on_failure targets
+      // enqueue via the guarded draft→queued row with the synthesized
+      // failure context file; non-draft targets are consumed.
+      const fallback = await deps.routing.routeFailurePath(payload.task_id);
+      fallbackEnqueued = fallback === null ? [] : fallback.enqueued;
     }
-    return { final_state: outcome.finalState, retry_count: outcome.retryCount };
+    return {
+      final_state: outcome.finalState,
+      retry_count: outcome.retryCount,
+      ...(fallbackEnqueued !== undefined ? { fallback_enqueued: fallbackEnqueued } : {}),
+    };
   });
 
 
@@ -1224,7 +1282,12 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
     const chainRunId = reqString(args, "chain_run_id");
     const chain = getChainRun(deps.db, chainRunId);
     if (chain === undefined) throw new OpError("not_found", `no such chain run: ${chainRunId}`);
-    const members = memberReadiness(deps.db, chainRunId);
+    const members = memberReadiness(deps.db, chainRunId).map((m) => ({
+      ...m,
+      // p4b (ops surface, derived — no invented state): the delivered
+      // feedback context paths recorded on each member (FR-TSK-04)
+      feedback: deliveredFeedbackPaths(deps.db, m.id),
+    }));
     return { chain, members, paused: deps.pausedChains.has(chainRunId) };
   });
 

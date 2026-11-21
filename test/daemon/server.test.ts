@@ -610,10 +610,21 @@ test("gate ops over the socket: approve (contract), reject (mcp payload + defaul
     });
     assert.equal(approve["ok"], true, JSON.stringify(approve));
     assert.equal((approve["data"] as Record<string, unknown>)["final_state"], "validating");
+    // the approval row (p4b: the engine's verification verdict now
+    // FOLLOWS the approval async, so the approval is no longer the last
+    // row — pin it by its matrix row instead of by position)
     const tr = transitions(env, gateTask);
-    const last = tr[tr.length - 1]!;
-    assert.equal(last["trigger_type"], "human");
-    assert.match(String(last["reason"]), /gate approved by maul: ship it/);
+    const approval = tr.find((t) => t["from_state"] === "awaiting_gate" && t["to_state"] === "validating")!;
+    assert.equal(approval["trigger_type"], "human");
+    assert.match(String(approval["reason"]), /gate approved by maul: ship it/);
+    // the p4b gate-approved verification driver: the ENGINE decides the
+    // validating→terminal verdict (FR-TSK-12 — approval is not bypass)
+    await waitForState(env, gateTask, "completed", 8000);
+    const verdict = transitions(env, gateTask);
+    const vlast = verdict[verdict.length - 1]!;
+    assert.equal(vlast["from_state"], "validating");
+    assert.equal(vlast["to_state"], "completed");
+    assert.equal(vlast["trigger_type"], "engine");
 
     // a second gate task: reject via the mcp payload shape {task_id, feedback}
     const rejectTask = await createTaskVia(env, "TASK-R", { requires_human_gate: true });
@@ -626,13 +637,27 @@ test("gate ops over the socket: approve (contract), reject (mcp payload + defaul
       args: { task_id: rejectTask, feedback: "the tests are wrong, fix them" },
     });
     assert.equal(reject["ok"], true, JSON.stringify(reject));
-    assert.equal((reject["data"] as Record<string, unknown>)["final_state"], "changes_requested");
+    // the SELF path (p4b fix): a rejected task with budget retries itself —
+    // the operator's feedback is the delivered artifact
+    assert.equal((reject["data"] as Record<string, unknown>)["final_state"], "queued");
     assert.equal((reject["data"] as Record<string, unknown>)["retry_count"], 1); // incremented on entry
+    assert.match(
+      String((reject["data"] as Record<string, unknown>)["feedback_path"]),
+      /feedback\/gate-reject\.json/,
+    );
     const rtr = transitions(env, rejectTask);
-    const rlast = rtr[rlastIdx(rtr)]!;
-    assert.equal(rlast["trigger_type"], "mcp"); // the surface rule (mcp.md §5)
-    assert.equal(rlast["from_state"], "awaiting_gate");
-    assert.equal(rlast["to_state"], "changes_requested");
+    const rejectRow = rtr.find(
+      (r) => r["from_state"] === "awaiting_gate" && r["to_state"] === "changes_requested",
+    );
+    assert.ok(rejectRow !== undefined, "the reject row exists");
+    assert.equal(rejectRow!["trigger_type"], "mcp"); // the surface rule (mcp.md §5)
+    // the requeued task may already be running again — find the row, don't
+    // assume it is the last one
+    const requeueRow = rtr.find(
+      (r) => r["from_state"] === "changes_requested" && r["to_state"] === "queued",
+    );
+    assert.ok(requeueRow !== undefined, "the self-path requeue row exists");
+    assert.match(String(requeueRow!["reason"]), /feedback artifact delivered to next attempt: .*gate-reject/);
 
     // confirm-failure: the terminal gate outcome
     const failTask = await createTaskVia(env, "TASK-F", { requires_human_gate: true });
@@ -877,11 +902,27 @@ test("write discipline: the daemon modules never issue a raw state UPDATE (grep-
     "src/chain/readiness.ts",
     "src/chain/graph.ts",
     "src/chain/yaml.ts",
+    "src/chain/routing.ts",
+    "src/chain/summary.ts",
     "src/daemonconfig.ts",
   ];
   for (const f of files) {
     const src = readFileSync(join(import.meta.dirname, "..", "..", f), "utf8");
-    assert.doesNotMatch(src, /UPDATE\s+tasks\b/i, `${f} must not UPDATE tasks directly`);
+    if (f === "src/chain/routing.ts") {
+      // the ONE sanctioned tasks write (FR-TSK-04 delivery): the context
+      // column append — every UPDATE tasks in routing.ts must be exactly
+      // this guarded form; all other columns stay forbidden
+      const taskWrites = src.match(/UPDATE\s+tasks\b/gi) ?? [];
+      const sanctioned = src.match(
+        /UPDATE tasks SET context_files_json = \?, updated_at = \? WHERE id = \?/g,
+      ) ?? [];
+      assert.equal(
+        taskWrites.length, sanctioned.length,
+        "routing.ts: every UPDATE tasks must be the sanctioned context_files_json form",
+      );
+    } else {
+      assert.doesNotMatch(src, /UPDATE\s+tasks\b/i, `${f} must not UPDATE tasks directly`);
+    }
     if (f.startsWith("src/chain/")) {
       // chain modules own chain_runs TERMINAL moves — every one must be the
       // guarded form (never a raw state write; a terminal chain never moves

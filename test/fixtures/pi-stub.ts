@@ -17,6 +17,9 @@
  *                  result.json written into --session-dir, then agent_end +
  *                  agent_settled
  *   run-blocked    same stream, result.json with status "blocked"
+ *   run-review     same stream, result.json with status "changes_requested"
+ *                  (a reviewer-shaped emitter — exercises the p4b feedback
+ *                  routing rule end to end)
  *   run-missing    settles, writes no result.json
  *   run-invalid    settles, writes a schema-invalid result.json
  *   run-hang       emits one frame, never settles (timeout path)
@@ -60,7 +63,7 @@ const RUN_MODES = new Set([
   "run-ok", "run-blocked", "run-missing", "run-invalid",
   "run-hang", "run-overspend", "run-crash", "run-repair-ok",
   "run-crash-stderr", "run-fork-grandchild",
-  "run-hang-ignore-term", "run-settle-linger",
+  "run-hang-ignore-term", "run-settle-linger", "run-review",
 ]);
 
 const mode: string | undefined = process.argv[2];
@@ -226,20 +229,33 @@ if (RUN_MODES.has(mode)) {
   const taskId = sessionDir.split("/").filter(Boolean).slice(-2, -1)[0] ?? "";
 
   function writeResult(): void {
-    if (effective === "run-ok" || effective === "run-blocked" || effective === "run-settle-linger") {
+    if (effective === "run-ok" || effective === "run-blocked" || effective === "run-settle-linger" || effective === "run-review") {
       const artifact = {
         schema_version: "1.0.0",
         task_id: taskId,
         run_id: sessionId,
-        status: effective === "run-blocked" ? "blocked" : "completed",
-        summary: "Implemented the requested objective end to end.",
+        status: effective === "run-blocked" ? "blocked" : effective === "run-review" ? "changes_requested" : "completed",
+        summary:
+          effective === "run-review"
+            ? "Reviewed the change; correctness issues found and changes requested."
+            : "Implemented the requested objective end to end.",
         assumptions_made: ["none worth noting"],
         open_questions: [],
         artifacts_modified: [
           { target_alias: "app", path: "src/auth.rs", action: "modified", diff_summary: "rewrote the handler" },
         ],
-        feedback_items: [],
-        next_recommended_action: effective === "run-blocked" ? "human_review" : "proceed_to_next",
+        feedback_items:
+          effective === "run-review"
+            ? [
+                {
+                  severity: "error",
+                  category: "correctness",
+                  message: "The auth handler does not refresh tokens.",
+                },
+              ]
+            : [],
+        next_recommended_action:
+          effective === "run-blocked" ? "human_review" : effective === "run-review" ? "retry_with_context" : "proceed_to_next",
       };
       writeFileSync(join(sessionDir, "result.json"), JSON.stringify(artifact, null, 2) + "\n");
     } else if (effective === "run-invalid") {
@@ -269,7 +285,7 @@ if (RUN_MODES.has(mode)) {
       ) + "\n",
     );
 
-    if (effective === "run-ok" || effective === "run-blocked") {
+    if (effective === "run-ok" || effective === "run-blocked" || effective === "run-review") {
       // result.json is written before the settle signal, like the real extension
       writeResult();
       for (const line of emitted.slice(0, 4)) process.stdout.write(line + "\n");

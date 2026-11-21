@@ -220,7 +220,9 @@ test("nova project import-dag + nova chain end to end through the binary", async
     const status = runNova(["chain", "status", chainRun.id], h.env);
     assert.equal(status.code, 0, status.stderr);
     assert.match(status.stdout, /state:\s+active/);
-    assert.match(status.stdout, /KEY\s+STATE\s+READY/);
+    // p4b (additive): the FEEDBACK column — the delivered feedback context
+    // count per member (derived recording, never new state)
+    assert.match(status.stdout, /KEY\s+STATE\s+READY\s+FEEDBACK/);
     // roots render "root" — the engine never auto-enqueues them (review fix)
     assert.match(status.stdout, /A\s+draft\s+root/);
     assert.match(status.stdout, /B\s+draft\s+no/); // dep unmet (A still draft)
