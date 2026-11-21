@@ -1,0 +1,18 @@
+#!/usr/bin/env node
+/**
+ * nova — the NovaFlow CLI launcher shim (srs 4.1.1).
+ *
+ * Mechanism (documented choice): Node 24's native type stripping cannot
+ * run this codebase — the sources use constructor parameter properties
+ * (OpError, ProfileValidationError, …), which are NON-ERASABLE syntax
+ * (verified on this box: node v24.21.0 refuses to strip them without
+ * the --experimental-transform-types flag). The shim therefore drives
+ * the already-installed tsx loader (a devDependency — zero new
+ * dependencies) through its documented ESM register API and imports
+ * the TS entry in-process.
+ */
+const { register } = await import("tsx/esm/api");
+const tsx = register({ namespace: "nova-cli" });
+
+const { main } = await tsx.import("../src/cli/main.ts", import.meta.url);
+process.exit(await main(process.argv.slice(2)));
