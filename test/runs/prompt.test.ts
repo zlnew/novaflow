@@ -101,6 +101,32 @@ test("composePrompt: a mapped context file that does not exist is a hard error t
   }
 });
 
+test("composePrompt: a mapped context file escaping the workspace root is a hard error naming the path", () => {
+  const root = workspace();
+  try {
+    for (const bad of ["../outside.md", "../../etc/passwd", "/etc/passwd"]) {
+      assert.throws(
+        () =>
+          composePrompt({
+            objective: "o",
+            contextFiles: [bad],
+            workspaceRoot: root,
+          }),
+        (err: unknown) => {
+          assert.ok(
+            (err as Error).message.includes(`context file "${bad}" escapes the workspace root`),
+            `${bad}: ${(err as Error).message}`,
+          );
+          return true;
+        },
+        bad,
+      );
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("composePrompt: the repair attempt additionally carries the failure feedback (FR-TSK-06)", () => {
   const root = workspace();
   try {

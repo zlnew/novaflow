@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { resolve, sep } from "node:path";
 
 /**
  * Prompt composition per FR-TSK-04 (novaflow-v1/srs): inject ONLY the
@@ -37,8 +37,15 @@ export type ComposedPrompt = {
 /** Deterministic, line-exact message format (asserted in tests). */
 export function composePrompt(input: ComposePromptInput): ComposedPrompt {
   const files: PromptFile[] = [];
+  const root = resolve(input.workspaceRoot);
   for (const rel of input.contextFiles) {
-    const resolved = join(input.workspaceRoot, rel);
+    const resolved = resolve(root, rel);
+    // containment: a mapped path may resolve ANYWHERE via .. or an
+    // absolute path — anything outside the workspace root is a hard
+    // error naming the path, same as an unreadable file (never read)
+    if (resolved !== root && !resolved.startsWith(root + sep)) {
+      throw new Error(`context file "${rel}" escapes the workspace root`);
+    }
     let content: string;
     try {
       content = readFileSync(resolved, "utf8");
