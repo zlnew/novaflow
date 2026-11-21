@@ -221,7 +221,9 @@ test("nova project import-dag + nova chain end to end through the binary", async
     assert.equal(status.code, 0, status.stderr);
     assert.match(status.stdout, /state:\s+active/);
     assert.match(status.stdout, /KEY\s+STATE\s+READY/);
-    assert.match(status.stdout, /A\s+draft\s+yes/); // a root is ready-to-run info
+    // roots render "root" — the engine never auto-enqueues them (review fix)
+    assert.match(status.stdout, /A\s+draft\s+root/);
+    assert.match(status.stdout, /B\s+draft\s+no/); // dep unmet (A still draft)
     const statusJson = JSON.parse(runNova(["chain", "status", chainRun.id, "--json"], h.env).stdout) as {
       chain: { state: string };
       members: Array<{ key: string; state: string }>;

@@ -431,31 +431,47 @@ function assertAcyclic(tasks: ValidatedChainTask[], edges: ValidatedChainEdge[])
   for (const e of edges) {
     if (e.edgeType === "depends_on") deps.get(e.sourceKey)!.push(e.targetKey);
   }
-  const visiting = new Set<string>();
-  const done = new Set<string>();
-  const path: string[] = [];
-  const visit = (key: string): void => {
-    if (done.has(key)) return;
-    if (visiting.has(key)) {
-      const cycleStart = path.indexOf(key);
-      const cycle = [...path.slice(cycleStart), key].join(" -> ");
-      fail(
-        "schema_invalid",
-        `the chain graph contains a depends_on cycle: ${cycle} — FR-PRJ-04 AC2 rejects cyclic graphs`,
-      );
-    }
-    visiting.add(key);
-    path.push(key);
-    for (const next of deps.get(key) ?? []) {
+  // ITERATIVE three-color DFS (review round): the recursive form overflowed
+  // Node's stack on large legal chains (~5k members inside the op-handler
+  // call depth) and surfaced as an untyped RangeError. Same cycle-path
+  // naming, O(V+E), no stack growth.
+  const WHITE = 0 as const, GRAY = 1 as const, BLACK = 2 as const;
+  const color = new Map<string, 0 | 1 | 2>(tasks.map((t) => [t.key, WHITE]));
+  for (const start of tasks) {
+    if (color.get(start.key) !== WHITE) continue;
+    const path: string[] = [];
+    const stack: Array<{ key: string; iter: Iterator<string> }> = [];
+    const enter = (key: string): void => {
+      color.set(key, GRAY);
+      path.push(key);
+      stack.push({ key, iter: (deps.get(key) ?? [])[Symbol.iterator]() });
+    };
+    enter(start.key);
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1]!;
+      const next = top.iter.next();
+      if (next.done) {
+        color.set(top.key, BLACK);
+        path.pop();
+        stack.pop();
+        continue;
+      }
+      const n = next.value;
       // a missing node here is impossible (node refs were checked first),
       // guarded anyway — never crash on a corrupt edge row
-      if (byKey.has(next)) visit(next);
+      if (!byKey.has(n)) continue;
+      const c = color.get(n)!;
+      if (c === GRAY) {
+        const cycleStart = path.indexOf(n);
+        const cycle = [...path.slice(cycleStart), n].join(" -> ");
+        fail(
+          "schema_invalid",
+          `the chain graph contains a depends_on cycle: ${cycle} — FR-PRJ-04 AC2 rejects cyclic graphs`,
+        );
+      }
+      if (c === WHITE) enter(n);
     }
-    path.pop();
-    visiting.delete(key);
-    done.add(key);
-  };
-  for (const t of tasks) visit(t.key);
+  }
 }
 
 /**

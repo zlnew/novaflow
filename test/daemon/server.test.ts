@@ -873,12 +873,27 @@ test("write discipline: the daemon modules never issue a raw state UPDATE (grep-
     "src/daemon/recovery.ts",
     "src/daemon/lifecycle.ts",
     "src/daemon/triggers.ts",
+    "src/chain/import.ts",
+    "src/chain/readiness.ts",
     "src/daemonconfig.ts",
   ];
   for (const f of files) {
     const src = readFileSync(join(import.meta.dirname, "..", "..", f), "utf8");
     assert.doesNotMatch(src, /UPDATE\s+tasks\b/i, `${f} must not UPDATE tasks directly`);
-    assert.doesNotMatch(src, /SET\s+state\s*=/i, `${f} must not write state columns`);
+    if (f.startsWith("src/chain/")) {
+      // chain modules own chain_runs TERMINAL moves — every one must be the
+      // guarded form (never a raw state write; a terminal chain never moves
+      // again). All other SET state = writes stay forbidden.
+      const writes = src.match(/UPDATE\s+chain_runs\s+SET\s+state\s*=\s*'(?:aborted|failed|completed)'\s*,\s*completed_at\s*=\s*\?\s+WHERE\s+id\s*=\s*\?\s+AND\s+state\s*=\s*'active'/g) ?? [];
+      const raw = src.match(/SET\s+state\s*=/g) ?? [];
+      assert.equal(
+        writes.length, raw.length,
+        `${f}: every chain_runs state write must be the guarded terminal form`,
+      );
+      assert.ok(raw.length <= 3, `${f}: unexpected chain_runs state write count`);
+    } else {
+      assert.doesNotMatch(src, /SET\s+state\s*=/i, `${f} must not write state columns`);
+    }
   }
 });
 

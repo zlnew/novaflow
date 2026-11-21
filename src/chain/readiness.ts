@@ -235,25 +235,35 @@ export function createChainEvaluator(db: Db, opts: ChainEvaluatorOptions) {
 export type ChainEvaluator = ReturnType<typeof createChainEvaluator>;
 
 /** The member rows a chain status surface needs (id, key, state, readiness). */
-export type MemberReadiness = MemberCore & { key: string; ready: boolean };
+export type MemberReadiness = MemberCore & { key: string; ready: boolean; root: boolean };
 
 /**
  * Readiness view for the status surface: each member's state plus its
- * ready flag (draft with every depends_on source completed).
+ * ready flag. `ready` matches the EVALUATOR exactly (review round finding):
+ * draft AND has a depends_on in-edge AND every source completed. Roots
+ * (no depends_on in-edge) are never auto-enqueued by the engine — the
+ * operator starts them — so they carry ready=false and root=true.
  */
 export function memberReadiness(db: Db, chainRunId: string): MemberReadiness[] {
   const members = listChainMembers(db, chainRunId);
   return members.map((m: MemberCore & { key: string }) => {
-    const unmet = (
-      db
-        .prepare(
-          `SELECT COUNT(*) AS n
-             FROM task_edges e JOIN tasks s ON s.id = e.source_task_id
-            WHERE e.target_task_id = ? AND e.edge_type = 'depends_on'
-              AND s.state != 'completed'`,
-        )
-        .get(m.id) as { n: number }
-    ).n;
-    return { id: m.id, key: m.key, state: m.state, ready: m.state === "draft" && unmet === 0 };
+    const row = db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM task_edges
+             WHERE target_task_id = ? AND edge_type = 'depends_on') AS in_edges,
+           (SELECT COUNT(*) FROM task_edges e JOIN tasks s ON s.id = e.source_task_id
+             WHERE e.target_task_id = ? AND e.edge_type = 'depends_on'
+               AND s.state != 'completed') AS unmet`,
+      )
+      .get(m.id, m.id) as { in_edges: number; unmet: number };
+    const root = row.in_edges === 0;
+    return {
+      id: m.id,
+      key: m.key,
+      state: m.state,
+      root,
+      ready: m.state === "draft" && !root && row.unmet === 0,
+    };
   });
 }

@@ -97,6 +97,9 @@ function intake(text: string): Line[] {
     if (raw.includes("\t")) {
       fail(idx + 1, "tabs are not part of the YAML subset — indent with spaces");
     }
+    // whitespace-only lines are blank lines (review fix: trailing editor
+    // spaces must not trip the indent-parity check on a visually empty line)
+    if (raw.trim() === "") continue;
     const indent = raw.length - raw.trimStart().length;
     if (indent % 2 !== 0) {
       fail(idx + 1, `unsupported indentation of ${indent} spaces — the subset nests by exactly 2`);
@@ -135,6 +138,15 @@ function parseScalar(text: string, lineNo: number): unknown {
   if (head === "|") fail(lineNo, "block scalars (|) — multi-line strings — are not part of the subset; quote a single line");
   if (head === ">") fail(lineNo, "folded scalars (>) — multi-line strings — are not part of the subset; quote a single line");
   if (head === "@" || head === "`") fail(lineNo, `"${head}" is a reserved character in YAML and not part of the subset`);
+  // reserved indicators (review fix): a plain scalar beginning with these is
+  // ambiguous YAML (nested lists, complex keys, directives, flow separators)
+  // — refuse rather than import a value literally named "- x" (allow -<digits>)
+  if ((head === "-" && !PLAIN_INT.test(text)) || head === "?" || head === "%" || head === ",") {
+    fail(
+      lineNo,
+      `a plain scalar may not begin with "${head}" (reserved YAML indicator) — quote the value if a string is meant`,
+    );
+  }
   if (text === "~" || text === "null") {
     fail(lineNo, "the subset defines no null literal — write an explicit quoted string if a string is meant");
   }

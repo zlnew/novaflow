@@ -106,7 +106,7 @@ async function status(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
       started_at: string;
       completed_at: string | null;
     };
-    members: Array<{ id: string; key: string; state: string; ready: boolean }>;
+    members: Array<{ id: string; key: string; state: string; ready: boolean; root: boolean }>;
     paused: boolean;
   };
   if (opts.json) {
@@ -124,7 +124,9 @@ async function status(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
   );
   console.log(
     renderTable(
-      data.members.map((m) => ({ ...m, ready: m.ready ? "yes" : "no" })),
+      // roots render as "root": the engine never auto-enqueues them — the
+      // operator starts a chain by running its roots (review round finding)
+      data.members.map((m) => ({ ...m, ready: m.root ? "root" : m.ready ? "yes" : "no" })),
       [
         { key: "key", header: "KEY" },
         { key: "state", header: "STATE" },

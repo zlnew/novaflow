@@ -253,3 +253,21 @@ test("empty document refuses honestly", () => {
 test("an over-indented line after a nested block refuses (no silent wrapping)", () => {
   expectReject("a:\n  b: 1\n      c: 2", 3, /indent/);
 });
+
+test("review round: whitespace-only lines never trip the indent check; reserved-indicator plain scalars refuse", () => {
+  // trailing editor spaces on a blank line are a blank line
+  assert.deepEqual(parseYaml("a: 1\n   \nb: 2\n"), { a: 1, b: 2 });
+  assert.deepEqual(parseYaml("a: 1\n \nb: 2\n"), { a: 1, b: 2 });
+  // a list item that is itself a nested list ("- - x") refuses, never
+  // imports the literal string "- x"
+  // "- - x" nested as a list VALUE hits the reserved-indicator guard; at the
+  // document root the root-must-be-a-map guard fires first (also correct)
+  for (const src of ["a:\n  - - x\n", "a: %directive\n", "a: ?complex\n", "a: ,flow\n"]) {
+    assert.throws(() => parseYaml(src), (err: unknown) => {
+      const msg = (err as Error).message;
+      return /reserved YAML indicator|not part of the subset/.test(msg);
+    }, src);
+  }
+  // "-42" stays a legal integer
+  assert.deepEqual(parseYaml("a: -42\n"), { a: -42 });
+});
