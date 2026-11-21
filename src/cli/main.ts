@@ -13,6 +13,7 @@ import { workspaceCommand } from "./commands/workspace.ts";
 import { projectCommand } from "./commands/project.ts";
 import { profileCommand } from "./commands/profile.ts";
 import { taskCommand } from "./commands/task.ts";
+import { scheduleCommand } from "./commands/schedule.ts";
 import { daemonCommand } from "./commands/daemon.ts";
 import type { CommandOpts } from "./opts.ts";
 
@@ -21,10 +22,10 @@ import type { CommandOpts } from "./opts.ts";
  * JSONL socket surface: one command = one op call (single-writer rule,
  * architecture 8.1). The CLI never opens the SQLite store.
  *
- * Honest refusals: `nova schedule`, `nova chain`, and `nova mcp` are
- * NOT in this phase (p3c/p4/p5) — invoking one prints a refusal to
- * stderr and exits 2 (never fake success). The usage table lists them
- * with their phase note.
+ * Honest refusals: `nova chain` and `nova mcp` are NOT in this phase
+ * (p4/p5) — invoking one prints a refusal to stderr and exits 2
+ * (never fake success). The usage table lists them with their phase
+ * note.
  */
 
 const VERSION = readVersion();
@@ -57,7 +58,9 @@ const USAGE = `USAGE: nova <noun> <sub> [args] [flags]
   nova daemon start [--foreground] | stop | status | pause | resume | kill-all
   nova daemon logs [--lines <n>]
   nova version
-  nova schedule ...   (not implemented in this phase)
+  nova schedule attach <id|key> [--cron '<expr>' | --at <iso>] [--missed skip|run_immediately]
+  nova schedule list [--task <id|key>] [--workspace <slug|id>]
+  nova schedule pause <schedule-id> | resume <schedule-id>
   nova chain ...      (not implemented in this phase)
   nova mcp            (not implemented in this phase)`;
 
@@ -113,11 +116,12 @@ async function dispatch(argv: string[]): Promise<number> {
       return profileCommand(rest, opts);
     case "task":
       return taskCommand(rest, opts);
+    case "schedule":
+      return scheduleCommand(rest, opts);
     case "daemon":
       return daemonCommand(rest, opts);
     case "version":
       return version(opts.json);
-    case "schedule":
     case "chain":
     case "mcp":
       console.error(`nova ${noun} is not implemented in this phase — refusing rather than faking success`);
