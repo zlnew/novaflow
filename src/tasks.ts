@@ -74,6 +74,12 @@ export type CreateTaskInput = {
   /** data.md 5.1 output_schema_version (DDL default '1.0.0'). */
   outputSchemaVersion?: string;
   /**
+   * Chain membership (data.md DDL: tasks.chain_run_id): stamped at chain
+   * import — NULL for single tasks. Callers other than the chain importer
+   * never pass it (the 8.1 chain run ownership rule).
+   */
+  chainRunId?: string;
+  /**
    * mcp.md §3.2 target_scopes — the caller resolves each repo_alias to
    * a project_targets row (task_target_scopes.target_id is the FK);
    * column defaults apply for the omitted glob/command fields.
@@ -144,8 +150,8 @@ export function createTask(db: Db, input: CreateTaskInput): TaskRow {
       `INSERT INTO tasks
          (id, project_id, key, title, objective, profile_id,
           priority, requires_human_gate, output_schema_version, overrides_json,
-          context_files_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          context_files_json, chain_run_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       input.projectId,
@@ -158,6 +164,7 @@ export function createTask(db: Db, input: CreateTaskInput): TaskRow {
       input.outputSchemaVersion ?? "1.0.0", // DDL default
       JSON.stringify(input.overrides ?? {}), // DDL default '{}'
       JSON.stringify(input.contextFiles ?? []),
+      input.chainRunId ?? null, // NULL for single tasks (data.md DDL)
     );
     for (const scope of input.targetScopes ?? []) {
       db.prepare(
