@@ -11,7 +11,19 @@
  * dependencies) through its documented ESM register API and imports
  * the TS entry in-process.
  */
-const { register } = await import("tsx/esm/api");
+let register;
+try {
+  ({ register } = await import("tsx/esm/api"));
+} catch {
+  // tsx is a devDependency — an --omit=dev install hits this path. Exit 2
+  // (usage class), never exit 1: a broken install is not an operation
+  // failure (srs 4.1.1 exit rows — review round finding).
+  process.stderr.write(
+    "nova: the tsx loader is not installed in this checkout.\n" +
+      "      run: npm install (or npm ci) in the novaflow repo, then retry.\n",
+  );
+  process.exit(2);
+}
 const tsx = register({ namespace: "nova-cli" });
 
 const { main } = await tsx.import("../src/cli/main.ts", import.meta.url);

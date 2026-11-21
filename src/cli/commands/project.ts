@@ -133,12 +133,12 @@ async function resolveProject(
   ident: string,
   workspaceOverride: string | undefined,
 ): Promise<string> {
-  if (ULID_RE.test(ident)) return ident;
   const ctx = await workspaceContext(workspaceOverride);
+  // bare ULIDs verified within the active workspace (cross-scope ids refuse)
   const data = (await daemonRequest("nova_project_list", { workspace_id: ctx.id })) as {
     projects: Array<{ id: string; slug: string }>;
   };
-  const row = data.projects.find((x) => x.slug === ident);
+  const row = data.projects.find((x) => x.slug === ident || x.id === ident);
   if (row === undefined) {
     throw new OpFailureError("not_found", `no project "${ident}" in workspace ${ctx.slug}`);
   }

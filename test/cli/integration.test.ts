@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
-  chmodSync,
+  chmodSync, copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -346,5 +346,79 @@ test("daemon logs: tails the daemon log file (works daemon-down); --json envelop
     }, 8000);
   } finally {
     await forceStopDaemon(h);
+  }
+});
+
+test("--watch on a task in an ARCHIVED workspace refuses fast — never a silent hang (review round)", async () => {
+  const h = makeHome("run-ok");
+  try {
+    const start = runNova(["daemon", "start"], h.env);
+    assert.equal(start.code, 0, start.stderr);
+
+    const wsRoot = join(h.dir, "wsroot");
+    mkdirSync(wsRoot);
+    assert.equal(runNova(["workspace", "create", "alpha", "--path", wsRoot], h.env).code, 0);
+    runNova(["workspace", "switch", "alpha"], h.env);
+
+    const profileSrc = join(h.dir, "dev.json");
+    writeFileSync(profileSrc, JSON.stringify({
+      name: "dev",
+      provider: "anthropic",
+      model: "claude-3-5-sonnet-20241022",
+      thinking_level: "medium",
+      system_prompt_path: "prompts/dev_system.md",
+      tools_allowlist: ["bash", "read"],
+      limits: { max_timeout_sec: 3600, max_cost_usd: 5 },
+    }));
+    mkdirSync(join(wsRoot, "prompts"), { recursive: true });
+    writeFileSync(join(wsRoot, "prompts", "dev_system.md"), "You are a worker agent.\n");
+    assert.equal(runNova(["profile", "create", "--file", profileSrc], h.env).code, 0);
+    assert.equal(
+      runNova(["project", "create", "prj", "--objective", "Ship it."], h.env).code, 0,
+    );
+    assert.equal(
+      runNova(["task", "create", "T1", "--title", "t", "--objective", "o", "--profile", "dev", "--project", "prj"], h.env).code, 0,
+    );
+
+    // pause → enqueue (legitimately queued) → archive → watch must refuse
+    assert.equal(runNova(["daemon", "pause"], h.env).code, 0);
+    assert.equal(runNova(["task", "run", "T1"], h.env).code, 0);
+    assert.equal(runNova(["workspace", "archive", "alpha"], h.env).code, 0);
+
+    const watch = runNova(["task", "status", "T1", "--watch"], h.env, 10_000);
+    assert.equal(watch.code, 1, `stdout=${watch.stdout} stderr=${watch.stderr}`);
+    assert.match(watch.stderr, /never dispatch/);
+  } finally {
+    await forceStopDaemon(h);
+  }
+});
+
+test("--version and -V alias `nova version` (works daemon-down)", async () => {
+  const h = makeHome("run-ok"); // no daemon started
+  try {
+    for (const flag of ["--version", "-V"]) {
+      const res = runNova([flag], h.env);
+      assert.equal(res.code, 0, `${flag}: ${res.stderr}`);
+      assert.match(res.stdout, /\d+\.\d+\.\d+/, flag);
+    }
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test("bin/nova without the tsx loader degrades honestly: exit 2, one-line message", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-nolaunch-"));
+  try {
+    copyFileSync(join(import.meta.dirname, "..", "..", "bin", "nova"), join(dir, "nova"));
+    chmodSync(join(dir, "nova"), 0o755);
+    const res = spawnSync(process.execPath, [join(dir, "nova"), "version"], {
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    assert.equal(res.status, 2, `stdout=${res.stdout} stderr=${res.stderr}`);
+    assert.match(String(res.stderr), /tsx loader is not installed/);
+    assert.doesNotMatch(String(res.stderr), /ERR_MODULE_NOT_FOUND/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

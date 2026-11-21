@@ -89,7 +89,12 @@ export async function main(argv: string[]): Promise<number> {
 
 /** Sub-usage errors thrown as plain errors by noun modules are usage too. */
 async function dispatch(argv: string[]): Promise<number> {
-  const [noun, ...rest] = argv;
+  let [noun, ...rest] = argv;
+  // conventional alias: --version / -V is `nova version` (review finding)
+  if (noun === "--version" || noun === "-V") {
+    noun = "version";
+    rest = [];
+  }
   if (noun === undefined || noun === "" || noun === "help") {
     console.error(USAGE);
     return EXIT_USAGE;

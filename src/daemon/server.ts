@@ -559,7 +559,14 @@ export function buildOpTable(): Map<string, OpHandler> {
       current !== undefined && current.status === "running"
         ? Date.now() - Date.parse(current.started_at)
         : null;
-    return { task, current_run: current ?? null, elapsed_ms: elapsedMs };
+    const ws = deps.db
+      .prepare(
+        `SELECT w.status AS status, w.slug AS slug
+           FROM tasks t JOIN projects p ON p.id = t.project_id
+           JOIN workspaces w ON w.id = p.workspace_id WHERE t.id = ?`,
+      )
+      .get(task.id) as { status: string; slug: string };
+    return { task, current_run: current ?? null, elapsed_ms: elapsedMs, workspace: ws };
   });
 
   ops.set("nova_task_list", (args, { deps }) => {
@@ -912,8 +919,34 @@ export function buildOpTable(): Map<string, OpHandler> {
     }
   });
 
+
+/**
+ * FR-WS-03 AC2: execution is disabled in non-active workspaces. Enqueue and
+ * operator-retry refuse BEFORE any state write (review round finding); the
+ * dispatch candidate query additionally skips non-active workspaces, so a
+ * task queued before archiving never spawns either.
+ */
+function requireActiveWorkspace(db: Db, taskId: string): void {
+  const row = db
+    .prepare(
+      `SELECT w.status AS status, w.slug AS slug
+         FROM tasks t JOIN projects p ON p.id = t.project_id
+         JOIN workspaces w ON w.id = p.workspace_id WHERE t.id = ?`,
+    )
+    .get(taskId) as { status: string; slug: string } | undefined;
+  if (row === undefined) throw new OpError("not_found", `no such task: ${taskId}`);
+  if (row.status !== "active") {
+    throw new OpError(
+      "aborted",
+      `workspace "${row.slug}" is ${row.status} — task execution is disabled (FR-WS-03); ` +
+        "dispatch will never admit this task. Unarchive is not a v1 surface.",
+    );
+  }
+}
+
   ops.set("nova_task_run", async (args, { deps, surface }) => {
     const taskId = reqString(args, "task_id");
+    requireActiveWorkspace(deps.db, taskId);
     const actor = optString(args, "actor", "operator");
     const task = await enqueueTask(deps.db, taskId, actor, {
       ...(deps.enqueueOptions?.piBin !== undefined ? { piBin: deps.enqueueOptions.piBin } : {}),
@@ -927,6 +960,7 @@ export function buildOpTable(): Map<string, OpHandler> {
 
   ops.set("nova_task_retry", (args, { deps, surface }) => {
     const taskId = reqString(args, "task_id");
+    requireActiveWorkspace(deps.db, taskId);
     const decision = deps.retry.operatorRetry(taskId, {
       triggerType: surface,
       actor: optString(args, "actor", "operator"),

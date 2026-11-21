@@ -307,11 +307,6 @@ test("nova_workspace_archive: status archived; dispatch SKIPS non-active workspa
       projectIds[wsId] = (pr["data"] as { project: { id: string } }).project["id"];
     }
 
-    // ARCHIVE ws-b, then enqueue a task in each workspace
-    const arch = await env.client.request({ id: "arch", op: "nova_workspace_archive", args: { slug: "ws-b" } });
-    assert.equal(arch["ok"], true, JSON.stringify(arch));
-    assert.equal((arch["data"] as Record<string, unknown>)["status"], "archived");
-
     const taskIds: string[] = [];
     for (const [i, projectId] of [projectIds[idA]!, projectIds[idB]!].entries()) {
       const t = await env.client.request({
@@ -322,14 +317,43 @@ test("nova_workspace_archive: status archived; dispatch SKIPS non-active workspa
       assert.equal(t["ok"], true, JSON.stringify(t));
       taskIds.push((t["data"] as { task: { id: string } }).task["id"]);
     }
+    // pause the scheduler so both enqueues are deterministically still
+    // QUEUED when the archive lands (otherwise live dispatch races the test)
+    const pause = await env.client.request({ id: "pause", op: "nova_daemon_pause", args: {} });
+    assert.equal(pause["ok"], true, JSON.stringify(pause));
     for (const [i, taskId] of taskIds.entries()) {
       const r = await env.client.request({ id: `r${i}`, op: "nova_task_run", args: { task_id: taskId } });
       assert.equal(r["ok"], true, JSON.stringify(r));
+      assert.equal(taskState(env, taskId), "queued");
     }
 
-    // the ACTIVE workspace's task runs to completion…
+    // NOW archive ws-b — its already-queued task stays queued (dispatch gate)
+    const arch = await env.client.request({ id: "arch", op: "nova_workspace_archive", args: { slug: "ws-b" } });
+    assert.equal(arch["ok"], true, JSON.stringify(arch));
+    assert.equal((arch["data"] as Record<string, unknown>)["status"], "archived");
+
+    // a THIRD task created in the archived workspace refuses at enqueue:
+    // execution is disabled there, so queueing would be a silent dead-end
+    // (review round finding — the CLI --watch hang class)
+    const t2 = await env.client.request({
+      id: "t2",
+      op: "nova_task_create",
+      args: { project_id: projectIds[idB]!, key: "T2", title: "t", objective: "Do the work.", profile_name: "dev" },
+    });
+    assert.equal(t2["ok"], true, JSON.stringify(t2));
+    const t2id = (t2["data"] as { task: { id: string } }).task["id"];
+    const refused = await env.client.request({ id: "r2", op: "nova_task_run", args: { task_id: t2id } });
+    assert.equal(refused["ok"], false, JSON.stringify(refused));
+    assert.equal(refused["error"]["code"], "aborted");
+    assert.match(String(refused["error"]["message"]), /ws-b.*archived/);
+    assert.equal(taskState(env, t2id), "draft"); // untouched — no log row either
+
+    // resume: the ACTIVE workspace's task runs to completion…
+    const resume = await env.client.request({ id: "resume", op: "nova_daemon_resume", args: {} });
+    assert.equal(resume["ok"], true, JSON.stringify(resume));
     await waitFor(() => taskState(env, taskIds[0]!) === "completed", 8000);
-    // …while the ARCHIVED workspace's task stays QUEUED (dispatch skips it)
+    // …while the ARCHIVED workspace's PRE-EXISTING queued task stays QUEUED
+    // (dispatch skips non-active workspaces — the candidate-SQL gate)
     await new Promise((r2) => setTimeout(r2, 300)); // let a dispatch pass fire
     assert.equal(taskState(env, taskIds[1]!), "queued");
 

@@ -105,7 +105,8 @@ async function create(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
 }
 
 async function resolveProjectIdent(ident: string, workspaceId: string): Promise<string> {
-  if (ULID_RE.test(ident)) return ident;
+  // bare ULIDs are verified within the active workspace too — a syntactically
+  // valid id from ANOTHER workspace must not act silently (review finding 6)
   const data = (await daemonRequest("nova_project_list", { workspace_id: workspaceId })) as {
     projects: Array<{ id: string; slug: string }>;
   };
@@ -194,7 +195,16 @@ async function watchTask(taskId: string, json: boolean): Promise<number> {
   for (;;) {
     const data = (await daemonRequest("nova_task_status", { task_id: taskId })) as {
       task: { state: string };
+      workspace?: { status: string; slug: string };
+      current_run?: { error_summary: string | null } | null;
     };
+    // FR-WS-03: a task in a non-active workspace never reaches a terminal
+    // state — poll forever would be a silent hang (review round finding).
+    if (data.workspace !== undefined && data.workspace.status !== "active") {
+      if (json) console.log(JSON.stringify({ task_id: taskId, error: "workspace_not_active", workspace: data.workspace }));
+      else console.error(`workspace ${data.workspace.slug} is ${data.workspace.status} — this task will never dispatch (exit 1)`);
+      return EXIT_OPERATION_FAILED;
+    }
     const state = data.task.state;
     if (state !== lastState) {
       lastState = state;
@@ -206,12 +216,21 @@ async function watchTask(taskId: string, json: boolean): Promise<number> {
       }
     }
     if (TERMINAL_STATES.has(state)) {
+      const failureSummary =
+        data.current_run !== null && data.current_run !== undefined
+          ? data.current_run.error_summary
+          : null;
       if (!json) {
         console.log(
           state === "completed"
             ? "SUCCESS task completed"
             : `task ended in ${state} (exit 1)`,
         );
+        // surface the run's recorded failure detail (preflight/budget
+        // messages live here — review round finding 7)
+        if (state !== "completed" && failureSummary !== null && failureSummary !== "") {
+          console.log(`  detail: ${failureSummary}`);
+        }
       }
       return state === "completed" ? EXIT_OK : EXIT_OPERATION_FAILED;
     }
