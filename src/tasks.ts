@@ -64,6 +64,33 @@ export type CreateTaskInput = {
   priority?: number;
   requiresHumanGate?: boolean;
   contextFiles?: string[];
+  /**
+   * FR-AGT-03 task-level overrides ({timeout_sec, max_cost_usd,
+   * thinking_level}), stored verbatim as tasks.overrides_json. The wire
+   * surface (mcp.md §3.2 / data.md 4.3 shape) validates before calling;
+   * resolveParams re-validates at run time — the defense in depth.
+   */
+  overrides?: Record<string, unknown>;
+  /** data.md 5.1 output_schema_version (DDL default '1.0.0'). */
+  outputSchemaVersion?: string;
+  /**
+   * mcp.md §3.2 target_scopes — the caller resolves each repo_alias to
+   * a project_targets row (task_target_scopes.target_id is the FK);
+   * column defaults apply for the omitted glob/command fields.
+   */
+  targetScopes?: CreateTaskTargetScope[];
+};
+
+export type CreateTaskTargetScope = {
+  /** The resolved project_targets row (repo_alias -> target id). */
+  targetId: string;
+  accessMode: "read_only" | "read_write";
+  /** DDL default when omitted: the catch-all write-scope glob set. */
+  writeScopeGlobs?: string[];
+  /** DDL default when omitted: '[]'. */
+  protectedTestGlobs?: string[];
+  /** DDL default when omitted: '[]'. */
+  verificationCommands?: string[];
 };
 
 const enqueueRows = ROWS.filter(
@@ -101,25 +128,53 @@ function getTaskOrThrow(db: Db, taskId: string): TaskRow {
   return row;
 }
 
-/** Insert a `draft` task row (id via ulid(), data.md 5.1 stored id form). */
+/**
+ * Insert a `draft` task row (id via ulid(), data.md 5.1 stored id form)
+ * with its mcp.md §3.2 optional payload parts — overrides_json,
+ * output_schema_version, and task_target_scopes rows — in ONE
+ * transaction (FR-TSK-01 AC2: atomic persistence; a bad scope never
+ * leaves a half-created task).
+ */
 export function createTask(db: Db, input: CreateTaskInput): TaskRow {
   const id = ulid();
-  db.prepare(
-    `INSERT INTO tasks
-       (id, project_id, key, title, objective, profile_id,
-        priority, requires_human_gate, context_files_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    input.projectId,
-    input.key,
-    input.title,
-    input.objective,
-    input.profileId,
-    input.priority ?? 3, // DDL default
-    input.requiresHumanGate === true ? 1 : 0,
-    JSON.stringify(input.contextFiles ?? []),
-  );
+  const insert = db.transaction((): void => {
+    db.prepare(
+      `INSERT INTO tasks
+         (id, project_id, key, title, objective, profile_id,
+          priority, requires_human_gate, output_schema_version, overrides_json,
+          context_files_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      input.projectId,
+      input.key,
+      input.title,
+      input.objective,
+      input.profileId,
+      input.priority ?? 3, // DDL default
+      input.requiresHumanGate === true ? 1 : 0,
+      input.outputSchemaVersion ?? "1.0.0", // DDL default
+      JSON.stringify(input.overrides ?? {}), // DDL default '{}'
+      JSON.stringify(input.contextFiles ?? []),
+    );
+    for (const scope of input.targetScopes ?? []) {
+      db.prepare(
+        `INSERT INTO task_target_scopes
+           (id, task_id, target_id, access_mode, write_scope_globs_json,
+            protected_test_globs_json, verification_commands_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        ulid(),
+        id,
+        scope.targetId,
+        scope.accessMode,
+        JSON.stringify(scope.writeScopeGlobs ?? ["**/*"]), // DDL default
+        JSON.stringify(scope.protectedTestGlobs ?? []), // DDL default
+        JSON.stringify(scope.verificationCommands ?? []), // DDL default
+      );
+    }
+  });
+  insert();
   return getTaskOrThrow(db, id);
 }
 

@@ -5,7 +5,13 @@ import { readFileSync } from "node:fs";
 import type { Db } from "../store/db.ts";
 import { ulid } from "../store/ids.ts";
 import { applyTransition, InvalidTransitionError } from "../fsm/engine.ts";
-import { createTask, enqueueTask, getTask, listTasks } from "../tasks.ts";
+import {
+  createTask,
+  enqueueTask,
+  getTask,
+  listTasks,
+  type CreateTaskTargetScope,
+} from "../tasks.ts";
 import {
   approveGate,
   confirmFailureGate,
@@ -149,6 +155,112 @@ function optBoolean(args: Record<string, unknown>, key: string): boolean | undef
     throw new OpError("schema_invalid", `args.${key} must be a boolean`);
   }
   return v;
+}
+
+/**
+ * mcp.md §3.2 optional payload parts of nova_task_create, validated
+ * against the data.md 4.3 shapes: overrides
+ * ({timeout_sec?, max_cost_usd?, thinking_level?}, additionalProperties
+ * false), output_schema_version (non-empty string), and target_scopes
+ * (repo_alias + access_mode, optional string-array fields; column
+ * defaults apply when omitted).
+ */
+function optNonEmptyString(args: Record<string, unknown>, key: string): string | undefined {
+  const v = args[key];
+  if (v === undefined) return undefined;
+  if (typeof v !== "string" || v.trim() === "") {
+    throw new OpError("schema_invalid", `args.${key} must be a non-empty string`);
+  }
+  return v;
+}
+
+function parseOverridesArg(args: Record<string, unknown>): Record<string, unknown> | undefined {
+  const v = args["overrides"];
+  if (v === undefined) return undefined;
+  if (v === null || typeof v !== "object" || Array.isArray(v)) {
+    throw new OpError(
+      "schema_invalid",
+      "args.overrides must be a JSON object (timeout_sec, max_cost_usd, thinking_level — FR-AGT-03)",
+    );
+  }
+  const o = v as Record<string, unknown>;
+  for (const key of Object.keys(o)) {
+    if (key !== "timeout_sec" && key !== "max_cost_usd" && key !== "thinking_level") {
+      throw new OpError(
+        "schema_invalid",
+        `args.overrides has an unknown key "${key}" (allowed: timeout_sec, max_cost_usd, thinking_level — FR-AGT-03)`,
+      );
+    }
+  }
+  if ("timeout_sec" in o) {
+    const t = o["timeout_sec"];
+    if (typeof t !== "number" || !Number.isInteger(t) || t < 1) {
+      throw new OpError("schema_invalid", "args.overrides.timeout_sec must be an integer >= 1");
+    }
+  }
+  if ("max_cost_usd" in o) {
+    const m = o["max_cost_usd"];
+    if (typeof m !== "number" || !Number.isFinite(m) || m < 0) {
+      throw new OpError("schema_invalid", "args.overrides.max_cost_usd must be a number >= 0");
+    }
+  }
+  if ("thinking_level" in o) {
+    const t = o["thinking_level"];
+    if (typeof t !== "string" || t.trim() === "") {
+      throw new OpError("schema_invalid", "args.overrides.thinking_level must be a non-empty string");
+    }
+  }
+  return o;
+}
+
+function parseTargetScopesArg(
+  db: Db,
+  projectId: string,
+  args: Record<string, unknown>,
+): CreateTaskTargetScope[] | undefined {
+  const v = args["target_scopes"];
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) {
+    throw new OpError(
+      "schema_invalid",
+      "args.target_scopes must be an array of {repo_alias, access_mode, …} scope objects",
+    );
+  }
+  const out: CreateTaskTargetScope[] = [];
+  for (const item of v) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      throw new OpError(
+        "schema_invalid",
+        "args.target_scopes items must be objects {repo_alias, access_mode, …}",
+      );
+    }
+    const o = item as Record<string, unknown>;
+    const alias = reqString(o, "repo_alias");
+    const accessMode = o["access_mode"];
+    if (accessMode !== "read_only" && accessMode !== "read_write") {
+      throw new OpError(
+        "schema_invalid",
+        'args.target_scopes access_mode must be "read_only" or "read_write"',
+      );
+    }
+    const writeScopeGlobs = optStringArray(o, "write_scope_globs");
+    const protectedTestGlobs = optStringArray(o, "protected_test_globs");
+    const verificationCommands = optStringArray(o, "verification_commands");
+    const target = db
+      .prepare("SELECT id FROM project_targets WHERE project_id = ? AND alias = ?")
+      .get(projectId, alias) as { id: string } | undefined;
+    if (!target) {
+      throw new OpError("not_found", `project has no target with repo_alias "${alias}"`);
+    }
+    out.push({
+      targetId: target.id,
+      accessMode,
+      ...(writeScopeGlobs !== undefined ? { writeScopeGlobs } : {}),
+      ...(protectedTestGlobs !== undefined ? { protectedTestGlobs } : {}),
+      ...(verificationCommands !== undefined ? { verificationCommands } : {}),
+    });
+  }
+  return out;
 }
 
 /* ------------------------------ shared queries ------------------------------ */
@@ -355,6 +467,11 @@ export function buildOpTable(): Map<string, OpHandler> {
     const profileId = resolveProfileByName(deps.db, projectId, reqString(args, "profile_name"));
     const requiresGate = optBoolean(args, "requires_human_gate");
     const contextFiles = optStringArray(args, "context_files");
+    // mcp.md §3.2 optional payload parts (previously dropped silently):
+    // validate the shapes here, persist via the create service
+    const overrides = parseOverridesArg(args);
+    const outputSchemaVersion = optNonEmptyString(args, "output_schema_version");
+    const targetScopes = parseTargetScopesArg(deps.db, projectId, args);
     try {
       const task = createTask(deps.db, {
         projectId,
@@ -364,6 +481,9 @@ export function buildOpTable(): Map<string, OpHandler> {
         profileId,
         ...(requiresGate !== undefined ? { requiresHumanGate: requiresGate } : {}),
         ...(contextFiles !== undefined ? { contextFiles } : {}),
+        ...(overrides !== undefined ? { overrides } : {}),
+        ...(outputSchemaVersion !== undefined ? { outputSchemaVersion } : {}),
+        ...(targetScopes !== undefined ? { targetScopes } : {}),
       });
       return { task };
     } catch (err) {

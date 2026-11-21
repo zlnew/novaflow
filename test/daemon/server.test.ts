@@ -570,6 +570,124 @@ function rlastIdx(rows: Array<Record<string, unknown>>): number {
   return rows.length - 1;
 }
 
+/* --------------------- nova_task_create payload parts (mcp.md \u00a73.2) --------------------- */
+
+test("nova_task_create persists overrides, target_scopes, output_schema_version; malformed payloads refuse with schema_invalid", async () => {
+  const env = await boot();
+  try {
+    // a project target the scopes reference (repo_alias -> project_targets)
+    const targetRoot = join(env.dir, "targetroot");
+    mkdirSync(targetRoot, { recursive: true });
+    const db = new Database(env.dbPath);
+    db.prepare(
+      `INSERT INTO project_targets (id, project_id, alias, target_type, root_path)
+       VALUES (?, ?, 'app', 'directory', ?)`,
+    ).run(ulid(), env.projectId, targetRoot);
+    db.close();
+
+    const base = { project_id: env.projectId, title: "t", objective: "o", profile_name: "dev" };
+
+    // a create with ALL THREE optional payload parts persists everything
+    const full = await env.client.request({
+      id: "c-full",
+      op: "nova_task_create",
+      args: {
+        ...base,
+        key: "FULL",
+        overrides: { timeout_sec: 120, max_cost_usd: 2.5, thinking_level: "high" },
+        output_schema_version: "2.1.0",
+        target_scopes: [{
+          repo_alias: "app",
+          access_mode: "read_write",
+          write_scope_globs: ["src/**"],
+          protected_test_globs: ["test/**"],
+          verification_commands: ["exit 0"],
+        }],
+      },
+    });
+    assert.equal(full["ok"], true, JSON.stringify(full));
+    const fullTask = (full["data"] as { task: { id: string } }).task;
+
+    // a minimal scope: column defaults apply for omitted fields (data.md DDL)
+    const minimal = await env.client.request({
+      id: "c-min",
+      op: "nova_task_create",
+      args: { ...base, key: "MIN", target_scopes: [{ repo_alias: "app", access_mode: "read_only" }] },
+    });
+    assert.equal(minimal["ok"], true, JSON.stringify(minimal));
+    const minimalTask = (minimal["data"] as { task: { id: string } }).task;
+
+    const ro = readConnection(env.dbPath);
+    const taskRow = ro
+      .prepare("SELECT overrides_json, output_schema_version FROM tasks WHERE id = ?")
+      .get(fullTask.id) as { overrides_json: string | null; output_schema_version: string };
+    assert.deepEqual(JSON.parse(taskRow.overrides_json ?? "{}"), {
+      timeout_sec: 120,
+      max_cost_usd: 2.5,
+      thinking_level: "high",
+    });
+    assert.equal(taskRow.output_schema_version, "2.1.0");
+
+    const scopeRow = ro
+      .prepare(
+        `SELECT pt.alias, tts.access_mode, tts.write_scope_globs_json,
+                tts.protected_test_globs_json, tts.verification_commands_json
+           FROM task_target_scopes tts
+           JOIN project_targets pt ON pt.id = tts.target_id
+          WHERE tts.task_id = ?`,
+      )
+      .get(fullTask.id) as Record<string, string>;
+    assert.equal(scopeRow["alias"], "app");
+    assert.equal(scopeRow["access_mode"], "read_write");
+    assert.deepEqual(JSON.parse(scopeRow["write_scope_globs_json"]), ["src/**"]);
+    assert.deepEqual(JSON.parse(scopeRow["protected_test_globs_json"]), ["test/**"]);
+    assert.deepEqual(JSON.parse(scopeRow["verification_commands_json"]), ["exit 0"]);
+
+    const minScope = ro
+      .prepare("SELECT * FROM task_target_scopes WHERE task_id = ?")
+      .get(minimalTask.id) as Record<string, string>;
+    assert.equal(minScope["access_mode"], "read_only");
+    assert.deepEqual(JSON.parse(minScope["write_scope_globs_json"]), ["**/*"]); // DDL default
+    assert.deepEqual(JSON.parse(minScope["protected_test_globs_json"]), []); // DDL default
+    assert.deepEqual(JSON.parse(minScope["verification_commands_json"]), []); // DDL default
+    ro.close();
+
+    // malformed payloads refuse with schema_invalid — nothing persisted
+    const bad: Array<[string, Record<string, unknown>]> = [
+      ["overrides not an object", { ...base, key: "BAD1", overrides: "nope" }],
+      ["overrides unknown key", { ...base, key: "BAD2", overrides: { timeout_sec: 1, bogus: true } }],
+      ["overrides bad type", { ...base, key: "BAD3", overrides: { timeout_sec: 0.5 } }],
+      ["output_schema_version empty", { ...base, key: "BAD4", output_schema_version: "" }],
+      ["target_scopes not array", { ...base, key: "BAD5", target_scopes: "app" }],
+      ["scope missing repo_alias", { ...base, key: "BAD6", target_scopes: [{ access_mode: "read_write" }] }],
+      ["scope bad access_mode", { ...base, key: "BAD7", target_scopes: [{ repo_alias: "app", access_mode: "write" }] }],
+      ["scope bad globs", { ...base, key: "BAD8", target_scopes: [{ repo_alias: "app", access_mode: "read_only", write_scope_globs: "src" }] }],
+      ["scope globs not strings", { ...base, key: "BAD9", target_scopes: [{ repo_alias: "app", access_mode: "read_only", protected_test_globs: [1] }] }],
+    ];
+    for (const [label, args] of bad) {
+      const res = await env.client.request({ id: `bad-${label}`, op: "nova_task_create", args });
+      assert.equal(res["ok"], false, label);
+      assert.equal((res["error"] as Record<string, unknown>)["code"], "schema_invalid", label);
+    }
+    // an unknown repo_alias -> not_found
+    const aliasMissing = await env.client.request({
+      id: "bad-alias",
+      op: "nova_task_create",
+      args: { ...base, key: "BAD10", target_scopes: [{ repo_alias: "nope", access_mode: "read_only" }] },
+    });
+    assert.equal(aliasMissing["ok"], false);
+    assert.equal((aliasMissing["error"] as Record<string, unknown>)["code"], "not_found");
+
+    // only the two valid creates persisted a task
+    const ro2 = readConnection(env.dbPath);
+    const n = (ro2.prepare("SELECT COUNT(*) AS n FROM tasks").get() as { n: number }).n;
+    ro2.close();
+    assert.equal(n, 2);
+  } finally {
+    await shutdown(env);
+  }
+});
+
 /* ------------------------------ retry + kill switch ---------------------------- */
 
 test("nova_task_retry: a crashed task requeues via the operator-retry row", async () => {
