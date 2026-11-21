@@ -32,6 +32,13 @@ import {
  * paths; a preflight failure inside startRun lands on the failed row
  * and the retry evaluator owns it from there).
  *
+ * Start-failure cooldown (spec-silent, documented): a task whose
+ * granted startRun THREW is skipped for a cooldown window (default
+ * 5 s, injectable) before it is re-eligible. Without it, the freed-slot
+ * requestDispatch + the periodic tick re-granted a poison task
+ * ~10,500 attempts/s (live-measured) — unbounded CPU and a log flood.
+ * The cooldown is per-task: other candidates are unaffected.
+ *
  * Pause semantics (documented, FR-TSK-08's scheduler-level ruling): a
  * paused scheduler grants NO new slots; runs already running continue.
  *
@@ -56,6 +63,12 @@ export type DispatchOptions = {
    * retry evaluator's hook for "whenever a task enters failed".
    */
   onRunConcluded?: ((taskId: string, outcome: RunOutcome | { error: string }) => void) | undefined;
+  /**
+   * Per-task start-failure cooldown in ms (spec-silent; default 5000).
+   * A task whose granted startRun threw is skipped for this window
+   * before re-eligibility — the poison-task hot-loop breaker.
+   */
+  startFailureCooldownMs?: number | undefined;
 };
 
 export type RunStartFailure = { taskId: string; error: string };
@@ -98,6 +111,9 @@ export function createDispatcher(db: Db, opts: DispatchOptions) {
    *  single owner of every spawn, so no other writer can hold a slot. */
   const live = new Map<string, LiveRun>();
   const tickMs = opts.tickMs ?? 1000;
+  const startFailureCooldownMs = opts.startFailureCooldownMs ?? 5000;
+  /** taskId → epoch ms until which it is skipped (start-failure cooldown). */
+  const cooldownUntil = new Map<string, number>();
   const tick = setInterval(() => requestDispatch(), tickMs);
   tick.unref?.();
 
@@ -139,6 +155,13 @@ export function createDispatcher(db: Db, opts: DispatchOptions) {
       // then the workspace semaphore — a full workspace holds its surplus
       // in QUEUED (AC2) without blocking other workspaces' FIFO order
       if ((wsCounts.get(c.workspace_id) ?? 0) >= workspaceLimit(c.ws_root)) continue;
+      // start-failure cooldown: a task that just failed to start is
+      // skipped for its window (re-eligible after; the tick re-probes)
+      const cd = cooldownUntil.get(c.id);
+      if (cd !== undefined) {
+        if (Date.now() < cd) continue;
+        cooldownUntil.delete(c.id); // expired: re-eligible
+      }
 
       // ---- slot granted: startRun applies the verbatim queued→running
       // row (START_TRIGGER, one source) and owns the attempt ----
@@ -151,8 +174,11 @@ export function createDispatcher(db: Db, opts: DispatchOptions) {
       ).then(
         (outcome) => outcome,
         (err: unknown) => {
-          // a grant that failed before the transition: logged, never wedged
+          // a grant that failed before the transition: logged, never
+          // wedged — and cooled down so the next tick/freed-slot pass
+          // cannot turn it into a retry hot loop
           warn(`startRun failed for task ${c.id}: ${(err as Error).message}`);
+          cooldownUntil.set(c.id, Date.now() + startFailureCooldownMs);
           return { taskId: c.id, error: (err as Error).message };
         },
       );

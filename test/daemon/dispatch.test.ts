@@ -275,6 +275,66 @@ test("a failing startRun never wedges the loop: the failure is logged, the task 
   }
 });
 
+/* ----------------------- start-failure cooldown (never a hot loop) -------------------- */
+
+test("regression: a poison task's start failures are cooldown-bounded, never a hot loop; other candidates unaffected", async () => {
+  const s = seed();
+  // a dedicated profile for the poison task so deleting it breaks only
+  // that task's start (the profile FK blocks a bogus profile_id outright)
+  const ws = s.workspaces[0]!;
+  s.db
+    .prepare(
+      `INSERT INTO agent_profiles
+         (id, workspace_id, name, provider, model, thinking_level, system_prompt_path,
+          max_timeout_sec, max_cost_usd)
+       VALUES (?, ?, 'poisoned', 'anthropic', ?, 'medium', 'prompts/dev_system.md', 60, 5)`,
+    )
+    .run(ulid(), ws.id, MODEL);
+  const poisonProfile = (
+    s.db.prepare("SELECT id FROM agent_profiles WHERE name = 'poisoned'").get() as { id: string }
+  ).id;
+  const poisonTask = createTask(s.db, {
+    projectId: ws.projectId,
+    key: "POISON-LOOP",
+    title: "POISON-LOOP",
+    objective: "Never starts, ever.",
+    profileId: poisonProfile,
+  });
+  applyTransition(s.db, poisonTask.id, ENQUEUE_TRIGGER, { triggerType: "engine", actor: "test" });
+  s.db.pragma("foreign_keys = OFF");
+  s.db.prepare("DELETE FROM agent_profiles WHERE id = ?").run(poisonProfile);
+  s.db.pragma("foreign_keys = ON");
+  const poison = poisonTask.id;
+  const healthy = hangTask(s, 0, "OK");
+
+  let poisonAttempts = 0;
+  const d = createDispatcher(s.db, {
+    globalConcurrency: 4,
+    runOptions: runOpts(s),
+    tickMs: 1000, // the PRODUCTION tick
+    startFailureCooldownMs: 1200, // injected short window (default 5 s)
+    onRunConcluded: (taskId, outcome) => {
+      if ("error" in outcome && taskId === poison) poisonAttempts++;
+    },
+  });
+  try {
+    await wait(3500);
+    // cooldown-bounded re-eligibility: ~1 attempt per (cooldown + tick)
+    // window — NOT the pre-fix hot loop (~10,500 attempts/s). Bound has
+    // slack for tick/cooldown interleave flake; floor pins non-starvation.
+    assert.ok(
+      poisonAttempts >= 1 && poisonAttempts <= 4,
+      `poison attempts in 3.5 s window: ${poisonAttempts}`,
+    );
+    // the poison task neither wedges the pass nor starves other candidates
+    assert.equal(state(s, healthy), "running");
+    assert.equal(state(s, poison), "queued"); // left for operator abort / retry paths
+  } finally {
+    await d.stop();
+    cleanup(s);
+  }
+});
+
 /* ------------------------------- operator abort (live run) -------------------------- */
 
 test("abortTask: SIGTERM group kill + the running→cancelled row (loop-owned), run row cancelled, reaped", async () => {
