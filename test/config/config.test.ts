@@ -145,6 +145,12 @@ test("duplicate keys are rejected", () => {
   assert.match(err(parseWorkspaceConfig("alerts:\n  ntfy_topic: a\n  ntfy_topic: b\n")), /duplicate/);
 });
 
+test("an unbalanced quote is rejected with a clear error", () => {
+  assert.match(err(parseWorkspaceConfig('alerts:\n  ntfy_topic: "oops\n')), /unbalanced quote/);
+  assert.match(err(parseWorkspaceConfig("alerts:\n  ntfy_topic: 'oops\n")), /unbalanced quote/);
+  assert.match(err(parseWorkspaceConfig('alerts:\n  ntfy_topic: "\n')), /unbalanced quote/);
+});
+
 test("a line without a colon is rejected", () => {
   assert.match(err(parseWorkspaceConfig("just some prose\n")), /line 1/);
 });

@@ -78,7 +78,11 @@ const SECTION_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
 };
 const SCALAR_TOP_KEYS = new Set(["missed_run_policy"]);
 
-/** Strip a matching pair of surrounding quotes, if present. */
+/**
+ * Strip a matching pair of surrounding quotes, if present. Unbalanced
+ * quotes are rejected upstream (parseWorkspaceConfig), so anything that
+ * starts with a quote character here is a closed pair.
+ */
 function unquote(value: string): string {
   if (value.length >= 2) {
     const first = value[0]!;
@@ -121,6 +125,13 @@ export function parseWorkspaceConfig(text: string): ConfigParse {
         i + 1,
         `lists/maps are not supported by the documented subset — "${key}" must be a scalar (number, boolean, or string)`,
       );
+    }
+    // a value that OPENS with a quote but does not close it is an
+    // error, not a literal: `ntfy_topic: "oops` must not silently parse
+    // as the string \"oops
+    const opener = rawValue[0];
+    if ((opener === '"' || opener === "'") && (rawValue.length < 2 || !rawValue.endsWith(opener))) {
+      return fail(i + 1, `unbalanced quote in value ${JSON.stringify(rawValue)} — a quoted scalar must close its quote`);
     }
     const value = unquote(rawValue);
     const where = i + 1;
