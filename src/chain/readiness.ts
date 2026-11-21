@@ -2,6 +2,7 @@ import type { Db } from "../store/db.ts";
 import { enqueueTask } from "../tasks.ts";
 import { isTerminalGateFailure } from "../daemon/retry.ts";
 import { getChainRun, listChainMembers } from "./import.ts";
+import { writeProjectSummary } from "./summary.ts";
 
 /**
  * The chain readiness + terminal-rules evaluator (FR-TSK-07 downstream
@@ -95,9 +96,20 @@ export function createChainEvaluator(db: Db, opts: ChainEvaluatorOptions) {
       return "failed";
     }
     if (members.every((m) => m.state === "completed")) {
-      db.prepare(
-        "UPDATE chain_runs SET state = 'completed', completed_at = ? WHERE id = ? AND state = 'active'",
-      ).run(new Date().toISOString(), chainRunId);
+      const res = db
+        .prepare(
+          "UPDATE chain_runs SET state = 'completed', completed_at = ? WHERE id = ? AND state = 'active'",
+        )
+        .run(new Date().toISOString(), chainRunId);
+      // FR-PRJ-05: the consolidated project report rides the ONE guarded
+      // completed move (the summary module never throws past it; an
+      // aggregation failure is a warn — the chain state stays completed)
+      if (res.changes > 0) {
+        const summary = writeProjectSummary(db, chainRunId);
+        if (!summary.written) {
+          warn(`chain ${chainRunId}: PROJECT_SUMMARY not written — ${summary.reason}`);
+        }
+      }
       return "completed";
     }
     return null;
