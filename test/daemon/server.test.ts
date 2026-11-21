@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -12,9 +13,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extractMatrix } from "../helpers/spec.ts";
+import { ulid } from "../../src/store/ids.ts";
+import { applyTransition } from "../../src/fsm/engine.ts";
+import { createTask, ENQUEUE_TRIGGER } from "../../src/tasks.ts";
+import { START_TRIGGER } from "../../src/runs/triggers.ts";
 import { startDaemon, type DaemonHandle } from "../../src/daemon/lifecycle.ts";
 import { TestClient, waitFor } from "./client.ts";
-import { seedFileStore, readConnection } from "./seed.ts";
+import { seedFileStore, readConnection, MODEL } from "./seed.ts";
 
 /**
  * The v1 wire contract over the real socket: JSONL envelope, the srs
@@ -302,6 +307,102 @@ test("nova_task_run with an unresolvable model → profile_unresolved, zero toke
 });
 
 /* --------------------------------- abort / steer -------------------------------- */
+
+test("regression: nova_task_abort on a running task with no live run (boot-recovered crashed orphan) -> the running-to-cancelled matrix row, run row untouched", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-srv-"));
+  const seeded = seedFileStore(dir);
+  // pre-crash: the task is mid-run with an UNSETTLED orphan run row
+  const db = new Database(seeded.dbPath);
+  const task = createTask(db, {
+    projectId: seeded.projectId,
+    key: "ORPHAN",
+    title: "t",
+    objective: "o",
+    profileId: seeded.profileId,
+  });
+  applyTransition(db, task.id, ENQUEUE_TRIGGER, { triggerType: "engine", actor: "seed" });
+  applyTransition(db, task.id, START_TRIGGER, { triggerType: "engine", actor: "seed" });
+  const runId = task.id.slice(0, 25) + "B";
+  const runDir = join(seeded.wsRoot, ".novaflow", "runs", task.id, runId);
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(
+    join(runDir, "events.raw.jsonl"),
+    JSON.stringify({ type: "message_end", usage: { input: 100, output: 20 } }) + "\n", // no agent_settled
+  );
+  db.prepare(
+    `INSERT INTO task_runs (id, task_id, profile_id, attempt_number, pi_session_id, pi_session_dir,
+       status, preflight_status, model_used, events_log_path)
+     VALUES (?, ?, ?, 1, ?, ?, 'running', 'passed', ?, ?)`,
+  ).run(runId, task.id, seeded.profileId, runId, runDir, MODEL, join(runDir, "events.jsonl"));
+  db.close();
+
+  const handle = await startDaemon({
+    dbPath: seeded.dbPath,
+    socketPath: join(dir, "novaflow.sock"),
+    daemonConfigPath: join(dir, "none-config.yaml"), // defaults
+    probePiBin: "node",
+    probeArgs: [STUB, "ok"],
+    probeTimeoutMs: 3000,
+    runPiBin: "node",
+    runArgs: [STUB, "run-ok", join(dir, "stub.pid")],
+    extensionPath: "/ext/novaflow.ts",
+    pricesPath: join(dir, "no-prices.json"),
+    tickMs: 30,
+  });
+  const client = await TestClient.connect(handle.socketPath);
+  try {
+    // boot recovery marked the orphan crashed — the task stays running
+    // (§8.4 task-state-unchanged) with NO live dispatcher entry
+    const ro = readConnection(seeded.dbPath);
+    assert.equal(
+      (ro.prepare("SELECT state FROM tasks WHERE id = ?").get(task.id) as { state: string }).state,
+      "running",
+    );
+    assert.equal(
+      (ro.prepare("SELECT status FROM task_runs WHERE id = ?").get(runId) as { status: string }).status,
+      "failed",
+    );
+    ro.close();
+
+    // before the fix this was `not_found` ("has no live run") — the task
+    // was permanently wedged; now the FSM row applies
+    const abort = await client.request({
+      id: "ab",
+      op: "nova_task_abort",
+      surface: "human",
+      args: { task_id: task.id },
+    });
+    assert.equal(abort["ok"], true, JSON.stringify(abort));
+    assert.equal((abort["data"] as Record<string, unknown>)["final_state"], "cancelled");
+    assert.equal((abort["data"] as Record<string, unknown>)["live_run"], false);
+
+    // the task moved via the verbatim running→cancelled operator-abort row
+    const ro2 = readConnection(seeded.dbPath);
+    assert.equal(
+      (ro2.prepare("SELECT state FROM tasks WHERE id = ?").get(task.id) as { state: string }).state,
+      "cancelled",
+    );
+    const tr = ro2
+      .prepare("SELECT * FROM state_transition_logs WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1")
+      .get(task.id) as Record<string, unknown>;
+    ro2.close();
+    assert.equal(tr["from_state"], "running");
+    assert.equal(tr["to_state"], "cancelled");
+    assert.equal(tr["trigger_type"], "human");
+
+    // the crashed run row stays crashed — the abort never rewrote history
+    const ro3 = readConnection(seeded.dbPath);
+    const run = ro3.prepare("SELECT * FROM task_runs WHERE id = ?").get(runId) as Record<string, unknown>;
+    ro3.close();
+    assert.equal(run["status"], "failed");
+    assert.match(String(run["error_summary"]), /crashed/);
+  } finally {
+    client.close();
+    await handle.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 
 test("nova_task_abort: on a queued task (scheduler paused) → the queued→cancelled row; on terminal → invalid_transition", async () => {
   const env = await boot();

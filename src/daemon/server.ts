@@ -410,10 +410,14 @@ export function buildOpTable(): Map<string, OpHandler> {
       // the LIVE run: the dispatcher marks + group-kills; the run loop
       // owns the cancelled record and the running→cancelled row
       const res = await deps.dispatcher.abortTask(taskId, { triggerType: surface, actor });
-      if (!res.aborted) {
-        throw new OpError("not_found", `task ${taskId} is running but has no live run to abort`);
+      if (res.aborted) {
+        return { task_id: taskId, final_state: "cancelled", live_run: true };
       }
-      return { task_id: taskId, final_state: "cancelled", live_run: true };
+      // no live dispatcher entry — a boot-recovered crashed orphan
+      // (§8.4 marked the run row crashed and left the task in running).
+      // Fall through to the matrix's running→cancelled operator-abort
+      // row via abortTriggerFor("running") so the task is never wedged:
+      // the crashed run row stays untouched (crashed stays crashed).
     }
 
     const trigger = abortTriggerFor(task.state);
