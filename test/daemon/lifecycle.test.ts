@@ -16,7 +16,7 @@ import { execSync } from "node:child_process";
 import { startDaemon, type DaemonHandle } from "../../src/daemon/lifecycle.ts";
 import { applyTransition } from "../../src/fsm/engine.ts";
 import { createTask, ENQUEUE_TRIGGER } from "../../src/tasks.ts";
-import { START_TRIGGER } from "../../src/runs/triggers.ts";
+import { START_TRIGGER, RUN_FAILED_TRIGGER } from "../../src/runs/triggers.ts";
 import { seedFileStore, readConnection, MODEL } from "./seed.ts";
 import { waitFor } from "./client.ts";
 
@@ -224,6 +224,52 @@ test("second startDaemon on the same socket refuses (a live daemon is never stol
     await assert.rejects(startDaemon(daemonOpts(dir, seeded)), /refusing to steal/);
   } finally {
     await a.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("regression: a refused second boot stops ITS retry evaluator — the bootScan-armed timer never fires on the closed store", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-life-"));
+  const seeded = seedFileStore(dir);
+  // delay_sec: 1 — a failed task with retry budget remaining arms a ~1 s
+  // bootScan timer in EVERY booting process, live or refused
+  const cfgPath = join(dir, "config.yaml");
+  writeFileSync(cfgPath, "concurrency:\n  global: 4\nretry:\n  delay_sec: 1\n");
+  const db = new Database(seeded.dbPath);
+  const task = createTask(db, {
+    projectId: seeded.projectId,
+    key: "FAILED",
+    title: "t",
+    objective: "o",
+    profileId: seeded.profileId,
+  });
+  // draft → queued → running → failed (budget remains)
+  applyTransition(db, task.id, ENQUEUE_TRIGGER, { triggerType: "engine", actor: "seed" });
+  applyTransition(db, task.id, START_TRIGGER, { triggerType: "engine", actor: "seed" });
+  applyTransition(db, task.id, RUN_FAILED_TRIGGER, { triggerType: "engine", actor: "seed" });
+  db.close();
+
+  const a = await startDaemon(daemonOpts(dir, seeded, { daemonConfigPath: cfgPath }));
+  try {
+    // the second process prints the clean refusal — and its bootScan-
+    // armed timer must be stopped WITH it (the live-measured crash:
+    // the timer fired on the closed store → uncaught TypeError, exit 1)
+    await assert.rejects(
+      startDaemon(daemonOpts(dir, seeded, { daemonConfigPath: cfgPath })),
+      /refusing to steal/,
+    );
+    // survive the timer window: before the fix, the refused boot's ~1 s
+    // timer fired here on its closed db handle and killed the process —
+    // reaching these assertions is the regression proof
+    await new Promise((r) => setTimeout(r, 1600));
+    // socket + store untouched: the LIVE daemon still owns both
+    assert.ok(existsSync(join(dir, "novaflow.sock")));
+    const check = new Database(seeded.dbPath);
+    check.prepare("SELECT COUNT(*) AS n FROM tasks").get();
+    check.close();
+    assert.equal(a.status().scheduler.paused, false);
+  } finally {
+    await a.stop().catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }
 });

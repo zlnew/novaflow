@@ -156,6 +156,11 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       },
       actor: "daemon-retry",
     });
+    // the boot-failure catch below stops everything it started — the
+    // evaluator MUST be registered the moment it exists (regression:
+    // an unregistered evaluator left its bootScan-armed timer alive
+    // past a refused boot, firing on the closed store)
+    retryRef = retry;
     const dispatcher = createDispatcher(db, {
       globalConcurrency: daemonConfig.concurrency.global,
       runOptions,
