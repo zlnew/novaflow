@@ -21,6 +21,9 @@ function soleTrigger(state: CanonicalState, target: CanonicalState): string {
 /** validating → completed: the passed-verification row. */
 export const VERIFY_PASSED_TRIGGER: string = soleTrigger("validating", "completed");
 
+/** completed → changes_requested: the review-path re-entry row (the feedback routing rule). */
+export const REVIEW_REENTRY_TRIGGER: string = soleTrigger("completed", "changes_requested");
+
 /** validating → changes_requested: engine verification failed, budget remains. */
 export const VERIFY_FAILED_TRIGGER: string = soleTrigger("validating", "changes_requested");
 

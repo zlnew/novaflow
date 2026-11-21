@@ -11,6 +11,7 @@ import {
   REQUEUE_TRIGGER,
   ESCALATE_CHANGES_TRIGGER,
   ESCALATE_FAILED_TRIGGER,
+  REVIEW_REENTRY_TRIGGER,
 } from "../../src/fsm/triggers.ts";
 
 /**
@@ -24,6 +25,14 @@ function pin(name: string, state: string, target: string, constant: string): voi
   assert.equal(rows.length, 1, `expected exactly one ${state}→${target} row`);
   assert.equal(constant, rows[0]?.trigger, `${name} must be the live spec trigger`);
 }
+
+test("golden: REVIEW_REENTRY_TRIGGER is the verbatim completed→changes_requested row (the review-path re-entry)", () => {
+  pin("REVIEW_REENTRY_TRIGGER", "completed", "changes_requested", REVIEW_REENTRY_TRIGGER);
+  assert.equal(
+    REVIEW_REENTRY_TRIGGER,
+    "named as the target of an emitter's `on_changes_requested` edge (review path, feedback routing rule below)",
+  );
+});
 
 test("golden: VERIFY_PASSED_TRIGGER is the verbatim validating→completed row", () => {
   pin("VERIFY_PASSED_TRIGGER", "validating", "completed", VERIFY_PASSED_TRIGGER);
