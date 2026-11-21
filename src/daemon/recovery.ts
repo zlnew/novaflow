@@ -224,7 +224,10 @@ export function recoverOrphanedRuns(db: Db, opts: RecoveryOptions = {}): Recover
       if (err instanceof InvalidTransitionError) {
         finalizeRunRecord(db, row.id, {
           status: "failed",
-          preflightStatus: "passed",
+          // the same preserve rule as the main crashed path: a row still
+          // 'pending' (crash between row insert and the preflight update)
+          // is finalized 'failed' — preflight never completed
+          preflightStatus: row.preflight_status === "passed" ? "passed" : "failed",
           inputTokens: tally.inputTokens,
           outputTokens: tally.outputTokens,
           costUsd: 0,

@@ -317,6 +317,45 @@ test("an orphan with no events.raw.jsonl at all → crashed (nothing was ever st
   }
 });
 
+test("guard-refusal finalize preserves the orphan's preflight_status (a 'pending' row is finalized 'failed')", () => {
+  const s = seed();
+  try {
+    // the first orphan settles cleanly; a stale second 'running' row for
+    // the SAME task (a crash left two live rows) cannot be reconciled
+    // once the first replay moved the task — the guard refuses it
+    const first = orphan(s, { settled: true, artifact: true });
+
+    const runId2 = ulid();
+    const runDir2 = join(s.wsRoot, ".novaflow", "runs", s.taskId, runId2);
+    mkdirSync(runDir2, { recursive: true });
+    writeFileSync(
+      join(runDir2, "events.raw.jsonl"),
+      streamLines(s.taskId, runId2, true).join("\n") + "\n",
+    );
+    writeFileSync(join(runDir2, "result.json"), validArtifact(s.taskId, runId2));
+    s.db
+      .prepare(
+        `INSERT INTO task_runs
+           (id, task_id, profile_id, attempt_number, pi_session_id, pi_session_dir,
+            status, preflight_status, model_used, events_log_path)
+         VALUES (?, ?, (SELECT id FROM agent_profiles), 2, ?, ?, 'running', 'pending', ?, ?)`,
+      )
+      .run(runId2, s.taskId, runId2, runDir2, MODEL, join(runDir2, "events.jsonl"));
+
+    const report = recoverOrphanedRuns(s.db, { pricesPath: s.pricesPath });
+    assert.deepEqual(report.crashed.map((c) => c.runId), [runId2]);
+    const row = runRow(s, runId2);
+    // the preserve rule mirrors the main crashed path: preflight never
+    // completed, so the finalized row says 'failed' — not 'passed'
+    assert.equal(row.preflight_status, "failed");
+    assert.match(row.error_summary ?? "", /could not reconcile/);
+    // the first orphan's replay is untouched by the guard refusal
+    assert.equal((s.db.prepare("SELECT status FROM task_runs WHERE id = ?").get(first.runId) as { status: string }).status, "succeeded");
+  } finally {
+    cleanup(s);
+  }
+});
+
 test("recovery is idempotent: a second pass finds no orphans", () => {
   const s = seed();
   try {
