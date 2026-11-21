@@ -381,22 +381,53 @@ export type ProtectedCheckResult = {
   protectedFilesUntouched: boolean;
   /** `<alias>/<relative path>` for every modified path outside the write scope. */
   scopeCreepPaths: string[];
+  /**
+   * True when the write-scope check could NOT be evaluated for at
+   * least one target (git status failed on a git_repo target — the
+   * agent may have erased `.git`). The scope check is INCONCLUSIVE:
+   * fail closed — the overall verification verdict must fail even
+   * though protectedFilesUntouched may be true (the digest check
+   * still runs and is still enforced).
+   */
+  scopeCheckInconclusive: boolean;
   /** Human-readable findings (tampered files, git failures, fail-closed reasons). */
   notes: string[];
 };
 
-/** Parse `git status --porcelain` output into modified relative paths. */
+/** Strip a matching pair of surrounding quotes, if present (git still
+ * quotes paths with embedded quotes/control characters even under
+ * core.quotePath=false). */
+function unquoteOne(path: string): string {
+  if (path.length >= 2) {
+    const first = path[0]!;
+    if ((first === '"' || first === "'") && path.endsWith(first)) {
+      return path.slice(1, -1);
+    }
+  }
+  return path;
+}
+
+/**
+ * Parse `git status --porcelain` output into modified relative paths.
+ * Rename entries contribute BOTH their source and destination: the
+ * renamed-away source vanished from its (possibly out-of-scope)
+ * location — a renamed-away out-of-scope file is scope creep too.
+ */
 export function parseGitPorcelain(out: string): string[] {
   const paths: string[] = [];
   for (const line of out.split("\n")) {
     if (line.length < 4) continue;
-    let rest = line.slice(3);
+    const rest = line.slice(3);
     const arrow = rest.indexOf(" -> ");
-    if (arrow >= 0) rest = rest.slice(arrow + 4); // renames contribute the destination
-    if (rest.startsWith('"') && rest.endsWith('"') && rest.length >= 2) {
-      rest = rest.slice(1, -1); // minimally unquoted (documented subset)
+    if (arrow >= 0) {
+      for (const side of [rest.slice(0, arrow), rest.slice(arrow + 4)]) {
+        const unquoted = unquoteOne(side);
+        if (unquoted !== "") paths.push(unquoted);
+      }
+      continue;
     }
-    if (rest !== "") paths.push(rest);
+    const unquoted = unquoteOne(rest);
+    if (unquoted !== "") paths.push(unquoted);
   }
   return paths;
 }
@@ -425,7 +456,7 @@ export async function verifyProtectedAndScope(
   ).n;
   if (scopeCount === 0) {
     // no mapped targets: nothing is protected, nothing can creep
-    return { protectedFilesUntouched: true, scopeCreepPaths: [], notes };
+    return { protectedFilesUntouched: true, scopeCreepPaths: [], scopeCheckInconclusive: false, notes };
   }
 
   const snapshotPath = join(runDir, SNAPSHOT_FILENAME);
@@ -433,6 +464,7 @@ export async function verifyProtectedAndScope(
     return {
       protectedFilesUntouched: false,
       scopeCreepPaths: [],
+      scopeCheckInconclusive: false,
       notes: [
         `${SNAPSHOT_FILENAME} missing from the run dir — failing closed (FR-TSK-11): protected-file integrity cannot be proven without the pre-run snapshot`,
       ],
@@ -445,11 +477,13 @@ export async function verifyProtectedAndScope(
     return {
       protectedFilesUntouched: false,
       scopeCreepPaths: [],
+      scopeCheckInconclusive: false,
       notes: [`${SNAPSHOT_FILENAME} is unreadable — failing closed: ${(err as Error).message}`],
     };
   }
 
   let untouched = true;
+  let scopeInconclusive = false;
   const creep: string[] = [];
 
   for (const t of snapshot.targets) {
@@ -524,9 +558,13 @@ export async function verifyProtectedAndScope(
     if (t.target_type === "git_repo") {
       // --untracked-files=all: agent-created files must be evaluated
       // INDIVIDUALLY against the write-scope globs; git's default would
-      // collapse an untracked directory to a single "dir/" entry
+      // collapse an untracked directory to a single "dir/" entry.
+      // -c core.quotePath=false: non-ASCII paths arrive RAW (no C-style
+      // octal escaping to undo); git still quotes embedded quotes /
+      // control characters, handled by the minimal unquote in
+      // parseGitPorcelain.
       const res = await runGroupedCommand(
-        ["git", "status", "--porcelain", "--untracked-files=all"],
+        ["git", "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all"],
         t.root_path,
         {
           timeoutMs: opts.gitTimeoutMs ?? GIT_STATUS_TIMEOUT_MS,
@@ -534,11 +572,13 @@ export async function verifyProtectedAndScope(
         },
       );
       if (res.spawnError !== null || res.exitCode !== 0 || res.timedOut) {
-        // spec names the git check; when git itself fails the scope
-        // check has no evidence to evaluate (the protected-digest check
-        // above is the hard anti-gaming gate). Record and skip.
+        // FAIL CLOSED (RSK-17): a git_repo target's scope check has no
+        // evidence when git itself fails (the agent can `rm -rf .git`)
+        // — the verdict must fail, not skip. Protected digests above
+        // are unaffected and still enforced.
+        scopeInconclusive = true;
         notes.push(
-          `git status failed for ${t.alias} (exit=${res.exitCode ?? "none"}${res.spawnError !== null ? `, ${res.spawnError}` : ""}) — write-scope check skipped, protected digests still enforced`,
+          `git status failed for ${t.alias} (exit=${res.exitCode ?? "none"}${res.spawnError !== null ? `, ${res.spawnError}` : ""}) — scope check inconclusive, failing closed; protected digests still enforced`,
         );
       } else {
         modified = parseGitPorcelain(res.stdout);
@@ -556,5 +596,10 @@ export async function verifyProtectedAndScope(
     }
   }
 
-  return { protectedFilesUntouched: untouched, scopeCreepPaths: creep, notes };
+  return {
+    protectedFilesUntouched: untouched,
+    scopeCreepPaths: creep,
+    scopeCheckInconclusive: scopeInconclusive,
+    notes,
+  };
 }

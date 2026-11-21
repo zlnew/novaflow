@@ -10,6 +10,7 @@ import { ulid } from "../../src/store/ids.ts";
 import {
   globMatch,
   globMatchAny,
+  parseGitPorcelain,
   verifyProtectedAndScope,
   writeProtectedDigests,
   SNAPSHOT_FILENAME,
@@ -572,7 +573,7 @@ test("a directory target with an out-of-scope NEW file → creep (digest-based d
   }
 });
 
-test("git status failing in a git_repo target → note recorded, protected digests still enforced", async () => {
+test("git status failing in a git_repo target → fails closed: scope inconclusive, digests still enforced", async () => {
   const s = seed();
   // a plain directory typed as git_repo: git status will fail (128)
   const root = mkdtempSync(join(tmpdir(), "novaflow-notrepo-"));
@@ -583,9 +584,109 @@ test("git status failing in a git_repo target → note recorded, protected diges
     addTarget(s, { alias: "app", root, protected: ["tests/**"], write: ["src/**"] });
     writeProtectedDigests(s.db, s.taskId, runDir, ulid());
     const res = await verifyProtectedAndScope(s.db, s.taskId, runDir);
-    assert.equal(res.protectedFilesUntouched, true);
+    assert.equal(res.protectedFilesUntouched, true); // digests still enforced, untouched here
+    assert.equal(res.scopeCheckInconclusive, true); // fail closed: the verdict must fail
     assert.deepEqual(res.scopeCreepPaths, []);
     assert.ok(res.notes.some((n) => n.includes("git status")), JSON.stringify(res.notes));
+    assert.ok(
+      res.notes.some((n) => n.includes("scope check inconclusive")),
+      JSON.stringify(res.notes),
+    );
+  } finally {
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+
+test("the agent deletes .git and writes out of scope → verification fails closed (git baseline gone)", async () => {
+  const s = seed();
+  const root = gitRepo({
+    "tests/protected.test.ts": "test('protected', () => {});\n",
+    "src/app.ts": "export {};\n",
+  });
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "app", root, protected: ["tests/**"], write: ["src/**"] });
+    writeProtectedDigests(s.db, s.taskId, runDir, ulid());
+    // the agent erases the git baseline AND writes an out-of-scope file
+    rmSync(join(root, ".git"), { recursive: true, force: true });
+    mkdirSync(join(root, "notes"), { recursive: true });
+    writeFileSync(join(root, "notes", "extra.txt"), "scope creep\n");
+    const res = await verifyProtectedAndScope(s.db, s.taskId, runDir);
+    // protected digests are still enforced (and untouched here) …
+    assert.equal(res.protectedFilesUntouched, true);
+    // … but a failed git status means the scope check has NO evidence:
+    // fail closed, the overall verification verdict must fail
+    assert.equal(res.scopeCheckInconclusive, true);
+    assert.ok(
+      res.notes.some((n) => n.includes("scope check inconclusive")),
+      JSON.stringify(res.notes),
+    );
+  } finally {
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("parseGitPorcelain: rename entries contribute BOTH the source and the destination", () => {
+  const paths = parseGitPorcelain(
+    "R  old/dir/file.ts -> new/dir/file.ts\n?? untracked.txt\nM  src/app.ts\n",
+  );
+  assert.deepEqual(paths, [
+    "old/dir/file.ts", // the renamed-away SOURCE is a modified path too
+    "new/dir/file.ts",
+    "untracked.txt",
+    "src/app.ts",
+  ]);
+});
+
+test("renaming a protected file away from its out-of-scope location is creep", async () => {
+  const s = seed();
+  const root = gitRepo({
+    "tests/protected.test.ts": "test('protected', () => {});\n",
+    "src/app.ts": "export {};\n",
+  });
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "app", root, protected: ["tests/**"], write: ["src/**"] });
+    writeProtectedDigests(s.db, s.taskId, runDir, ulid());
+    execSync("git mv tests/protected.test.ts src/moved.test.ts", {
+      cwd: root,
+      stdio: "ignore",
+    });
+    const res = await verifyProtectedAndScope(s.db, s.taskId, runDir);
+    // the destination src/moved.test.ts is in scope; the vanished
+    // SOURCE tests/protected.test.ts is out of scope → creep
+    assert.ok(
+      res.scopeCreepPaths.includes("app/tests/protected.test.ts"),
+      JSON.stringify(res.scopeCreepPaths),
+    );
+    assert.ok(
+      !res.scopeCreepPaths.includes("app/src/moved.test.ts"),
+      JSON.stringify(res.scopeCreepPaths),
+    );
+  } finally {
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("non-ASCII modified paths arrive raw (core.quotePath=false) — no unescaping needed", async () => {
+  const s = seed();
+  const root = gitRepo({ "src/app.ts": "export {};\n" });
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "app", root, protected: ["tests/**"], write: ["src/**"] });
+    writeProtectedDigests(s.db, s.taskId, runDir, ulid());
+    mkdirSync(join(root, "notes"), { recursive: true });
+    writeFileSync(join(root, "notes", "über.txt"), "out of scope\n");
+    const res = await verifyProtectedAndScope(s.db, s.taskId, runDir);
+    // the literal UTF-8 path, NOT git's \\303\\274ber.txt default escaping
+    assert.deepEqual(res.scopeCreepPaths, ["app/notes/über.txt"]);
   } finally {
     s.db.close();
     rmSync(root, { recursive: true, force: true });
