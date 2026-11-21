@@ -20,7 +20,8 @@
 import { appendFileSync, writeFileSync } from "node:fs";
 
 const mode: string | undefined = process.argv[2];
-const pidfile: string | undefined = process.argv[3];
+const pidfile: string | undefined =
+  process.argv[3] && !process.argv[3].startsWith("--") ? process.argv[3] : undefined;
 
 if (mode !== "ok" && mode !== "silent" && mode !== "garbage" && mode !== "wrongid") {
   process.stderr.write(`pi-stub: unknown mode ${String(mode)}\n`);

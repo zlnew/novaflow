@@ -99,8 +99,8 @@ function expectObject(obj: Record<string, unknown>, key: string): Record<string,
 /**
  * Validate an unknown value against the §4.2 schema. Rejects unknown keys
  * (the schema declares `additionalProperties: false` at the top level and
- * inside `limits`), wrong types, pattern/minLength violations, non-unique or
- * empty tools_allowlist entries, and out-of-bounds limits — every rejection a
+ * inside `limits`), wrong types, pattern/minLength violations, non-unique
+ * tools_allowlist entries, and out-of-bounds limits — every rejection a
  * ProfileValidationError carrying the offending key.
  */
 export function validateProfile(input: unknown): Profile {

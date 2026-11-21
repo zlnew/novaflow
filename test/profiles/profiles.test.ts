@@ -141,7 +141,7 @@ test("minLength constraints: model, system_prompt_path, role", () => {
   });
 });
 
-test("tools_allowlist: non-string, empty, and duplicate entries are rejected", () => {
+test("tools_allowlist: non-string and duplicate entries are rejected; an empty entry is spec-conformant", () => {
   expectReject("tools_allowlist", (p) => {
     p["tools_allowlist"] = ["read", 7];
   });

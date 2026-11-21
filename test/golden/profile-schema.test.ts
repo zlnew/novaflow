@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { extractProfileSchema } from "../helpers/spec.ts";
-import { PROFILE_REQUIRED_KEYS } from "../../src/profiles.ts";
+import { PROFILE_KNOWN_KEYS, NAME_PATTERN, PROFILE_REQUIRED_KEYS } from "../../src/profiles.ts";
 
 type SchemaProp = {
   type?: string;
@@ -58,4 +58,15 @@ test("validator required keys and constraints equal the live §4.2 schema block"
     schema.properties["limits"]?.properties["max_cost_usd"]?.type,
     "number",
   );
+});
+
+test("golden: the validator's name pattern equals the live spec pattern", () => {
+  const schema = extractProfileSchema();
+  assert.equal(NAME_PATTERN.source, schema.properties["name"].pattern);
+});
+
+test("golden: the validator's known-key set equals the live spec properties (role included)", () => {
+  const schema = extractProfileSchema();
+  const specKeys = new Set(Object.keys(schema.properties));
+  assert.deepEqual([...PROFILE_KNOWN_KEYS].sort(), [...specKeys].sort());
 });
