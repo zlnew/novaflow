@@ -40,8 +40,12 @@ const KNOWN_KEYS: ReadonlySet<string> = new Set([
   "role",
 ]);
 
+/** Exported for golden pinning against the live spec block (data.md 4.2). */
+export const PROFILE_KNOWN_KEYS: ReadonlySet<string> = KNOWN_KEYS;
+
 /** Schema: `"name": { "type": "string", "pattern": "^[a-z0-9-]+$" }`. */
-const NAME_PATTERN = /^[a-z0-9-]+$/;
+/** Exported for golden pinning — the pattern must equal the spec's, live. */
+export const NAME_PATTERN = /^[a-z0-9-]+$/;
 
 /** Typed validation failure carrying the offending key (dotted for limits). */
 export class ProfileValidationError extends Error {
@@ -138,7 +142,8 @@ export function validateProfile(input: unknown): Profile {
   const thinkingLevel = expectString(obj, "thinking_level");
   const systemPromptPath = expectString(obj, "system_prompt_path", 1); // minLength 1
 
-  // tools_allowlist: array of strings, uniqueItems: true, no empty entries.
+  // tools_allowlist: array of strings, uniqueItems: true (the schema pins no
+  // minLength on items — an empty string entry is spec-conformant and passes).
   const allow = obj["tools_allowlist"];
   if (!Array.isArray(allow)) {
     throw new ProfileValidationError(
@@ -152,12 +157,6 @@ export function validateProfile(input: unknown): Profile {
       throw new ProfileValidationError(
         "tools_allowlist",
         `tools_allowlist entries must be strings, got ${typeLabel(entry)}`,
-      );
-    }
-    if (entry === "") {
-      throw new ProfileValidationError(
-        "tools_allowlist",
-        "tools_allowlist must not contain empty entries",
       );
     }
     if (seen.has(entry)) {

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import { openDb } from "../../src/store/db.ts";
 import { existsSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -248,7 +249,7 @@ test("enqueueTask: profile_unresolved leaves the task in draft with no log row",
 });
 
 test("enqueueTask: an invalid stored profile row is rejected before any transition", async (t) => {
-  const { db, projectId, profileId } = seededDb({ toolsAllowlistJson: '[""]' });
+  const { db, projectId, profileId } = seededDb({ toolsAllowlistJson: '[42]' });
   const dir = mkdtempSync(join(tmpdir(), "novaflow-tasks-"));
   try {
     const task = createTask(db, {
@@ -325,6 +326,92 @@ test("enqueueTask: an already-queued task refuses a second enqueue (matrix guard
     );
     assert.equal(getTask(db, task.id)?.state, "queued");
     assert.equal(logCount(db, task.id), 1);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("FK discipline: createTask with a bogus profile id is rejected under openDb's foreign_keys=ON", () => {
+  const db = openDb(":memory:"); // the real boot path, not a bare sqlite handle
+  db.exec(extractDdl());
+  db.prepare(
+    "INSERT INTO workspaces (id, slug, name, root_path) VALUES (?, ?, ?, ?)",
+  ).run(ulid(), "ws", "ws", "/tmp/ws");
+  db.prepare(
+    "INSERT INTO projects (id, workspace_id, slug, name, objective) VALUES (?, ?, ?, ?, ?)",
+  ).run(ulid(), db.prepare("SELECT id FROM workspaces").get()?.["id"], "prj", "prj", "o");
+  assert.throws(
+    () =>
+      createTask(db, {
+        projectId: db.prepare("SELECT id FROM projects").get()?.["id"] as string,
+        key: "TASK-FK",
+        title: "t",
+        objective: "o",
+        profileId: ulid(), // not in agent_profiles
+      }),
+    (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      return /FOREIGN KEY constraint failed/i.test(msg);
+    },
+    "tasks.profile_id FK (ON DELETE RESTRICT) must be enforced",
+  );
+  db.close();
+});
+
+test("enqueueTask: triggerType surfaces are logged (human default, mcp for nova_task_run)", async (t) => {
+  const { db, projectId, profileId } = seededDb();
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-tasks-"));
+  try {
+    for (const [i, triggerType] of [
+      [0, "human"],
+      [1, "mcp"],
+    ] as const) {
+      const task = createTask(db, {
+        projectId,
+        key: `TASK-SURF-${i}`,
+        title: "t",
+        objective: "o",
+        profileId,
+      });
+      await enqueueTask(db, task.id, "operator", {
+        piBin: "node",
+        args: [STUB, "ok"],
+        triggerType,
+      });
+      const log = db
+        .prepare("SELECT trigger_type FROM state_transition_logs WHERE task_id = ?")
+        .get(task.id) as { trigger_type: string };
+      assert.equal(log.trigger_type, triggerType);
+    }
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("enqueueTask: the matrix guard runs BEFORE the catalog probe — a non-draft task is refused without spawning pi", async () => {
+  const { db, projectId, profileId } = seededDb();
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-tasks-"));
+  try {
+    const task = createTask(db, {
+      projectId,
+      key: "TASK-GUARD",
+      title: "t",
+      objective: "o",
+      profileId,
+    });
+    await enqueueTask(db, task.id, "operator", {
+      piBin: "node",
+      args: [STUB, "ok"],
+    }); // draft -> queued
+    // Second enqueue: the FSM refuses first; a nonexistent piBin proves no
+    // subprocess was ever spent (an unspawnable binary would surface as
+    // ProfileUnresolvedError instead of the FSM's InvalidTransitionError).
+    await assert.rejects(
+      enqueueTask(db, task.id, "operator", { piBin: "/nonexistent/pi-binary" }),
+      (err: unknown) => err instanceof InvalidTransitionError,
+    );
   } finally {
     db.close();
     rmSync(dir, { recursive: true, force: true });

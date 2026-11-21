@@ -28,6 +28,13 @@ function clone(): Record<string, unknown> {
   return JSON.parse(JSON.stringify(VALID)) as Record<string, unknown>;
 }
 
+/** Assert the mutated profile passes validation unchanged. */
+function expectValid(mutate: (p: Record<string, unknown>) => void): void {
+  const profile = clone();
+  mutate(profile);
+  assert.doesNotThrow(() => validateProfile(profile));
+}
+
 /** Assert the profile is rejected with a ProfileValidationError carrying `key`. */
 function expectReject(key: string, mutate: (p: Record<string, unknown>) => void): void {
   const profile = clone();
@@ -138,7 +145,9 @@ test("tools_allowlist: non-string, empty, and duplicate entries are rejected", (
   expectReject("tools_allowlist", (p) => {
     p["tools_allowlist"] = ["read", 7];
   });
-  expectReject("tools_allowlist", (p) => {
+  // The schema pins no minLength on items — an empty entry is spec-conformant
+  // (review round: the old rejection was an invented constraint).
+  expectValid((p) => {
     p["tools_allowlist"] = ["read", ""];
   });
   expectReject("tools_allowlist", (p) => {
