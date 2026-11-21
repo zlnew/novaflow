@@ -5,6 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPump } from "../../src/runs/pump.ts";
 
+// Fake-by-construction token, assembled at runtime so secret scanners
+// never see a literal key shape in this file.
+const FAKE_SK = `sk-${"abc123"}XYZ${"definitelyfake"}99`;
+
+
 function dir(): string {
   return mkdtempSync(join(tmpdir(), "novaflow-pump-"));
 }
@@ -76,7 +81,7 @@ test("a non-JSON line is logged verbatim in raw and string-scrubbed in redacted,
     pump.onLine("noise with token " + `sk-${"abc123"}XYZ${"definitelyfake"}99` + " inside");
     assert.equal(
       readFileSync(join(d, "events.raw.jsonl"), "utf8"),
-      "noise with token sk-abc123XYZdefinitelyfake99 inside\n",
+      `noise with token ${FAKE_SK} inside\n`,
     );
     assert.equal(
       readFileSync(join(d, "events.jsonl"), "utf8"),

@@ -7,6 +7,10 @@ import {
   REDACTION_MASK,
 } from "../../src/runs/redact.ts";
 
+// Fake-by-construction token, assembled at runtime so secret scanners
+// never see a literal key shape in this file.
+const FAKE_SK = `sk-${"abc123"}XYZ${"definitelyfake"}99`;
+
 test("redactText scrubs the documented minimal token set", () => {
   // The fixture tokens are assembled at runtime from prefix+body pieces so
   // secret scanners never see a literal key shape in this file. They are
@@ -89,7 +93,7 @@ test("redactLine: a JSON frame with an embedded secret comes out valid JSON, scr
     toolName: "read",
     result: {
       content: [
-        { type: "text", text: "export OPENAI_KEY=sk-abc123XYZdefinitelyfake99" },
+        { type: "text", text: `export OPENAI_KEY=${FAKE_SK}` },
       ],
     },
     isError: false,
@@ -107,7 +111,7 @@ test("redactLine: a JSON frame with an embedded secret comes out valid JSON, scr
 });
 
 test("redactLine: a non-JSON line is string-scrubbed, never dropped", () => {
-  const redacted = redactLine("garbage line with sk-abc123XYZdefinitelyfake99 inside");
+  const redacted = redactLine(`garbage line with ${FAKE_SK} inside`);
   assert.equal(redacted, `garbage line with ${REDACTION_MASK} inside`);
 });
 
