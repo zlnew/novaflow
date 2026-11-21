@@ -637,13 +637,27 @@ test("gate ops over the socket: approve (contract), reject (mcp payload + defaul
       args: { task_id: rejectTask, feedback: "the tests are wrong, fix them" },
     });
     assert.equal(reject["ok"], true, JSON.stringify(reject));
-    assert.equal((reject["data"] as Record<string, unknown>)["final_state"], "changes_requested");
+    // the SELF path (p4b fix): a rejected task with budget retries itself —
+    // the operator's feedback is the delivered artifact
+    assert.equal((reject["data"] as Record<string, unknown>)["final_state"], "queued");
     assert.equal((reject["data"] as Record<string, unknown>)["retry_count"], 1); // incremented on entry
+    assert.match(
+      String((reject["data"] as Record<string, unknown>)["feedback_path"]),
+      /feedback\/gate-reject\.json/,
+    );
     const rtr = transitions(env, rejectTask);
-    const rlast = rtr[rlastIdx(rtr)]!;
-    assert.equal(rlast["trigger_type"], "mcp"); // the surface rule (mcp.md §5)
-    assert.equal(rlast["from_state"], "awaiting_gate");
-    assert.equal(rlast["to_state"], "changes_requested");
+    const rejectRow = rtr.find(
+      (r) => r["from_state"] === "awaiting_gate" && r["to_state"] === "changes_requested",
+    );
+    assert.ok(rejectRow !== undefined, "the reject row exists");
+    assert.equal(rejectRow!["trigger_type"], "mcp"); // the surface rule (mcp.md §5)
+    // the requeued task may already be running again — find the row, don't
+    // assume it is the last one
+    const requeueRow = rtr.find(
+      (r) => r["from_state"] === "changes_requested" && r["to_state"] === "queued",
+    );
+    assert.ok(requeueRow !== undefined, "the self-path requeue row exists");
+    assert.match(String(requeueRow!["reason"]), /feedback artifact delivered to next attempt: .*gate-reject/);
 
     // confirm-failure: the terminal gate outcome
     const failTask = await createTaskVia(env, "TASK-F", { requires_human_gate: true });

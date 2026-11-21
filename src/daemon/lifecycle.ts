@@ -13,7 +13,7 @@ import { createDispatcher, type DispatchStatus } from "./dispatch.ts";
 import { createRetryEvaluator, type RetryEvaluator } from "./retry.ts";
 import { createScheduleEvaluator, type ScheduleEvaluator } from "./schedules.ts";
 import { createChainEvaluator, type ChainEvaluator } from "../chain/readiness.ts";
-import { createRoutingEvaluator, type RoutingEvaluator } from "../chain/routing.ts";
+import { createRoutingEvaluator, driveSelfPathRequeue, type RoutingEvaluator } from "../chain/routing.ts";
 import { bindControlServer, type ControlServer } from "./server.ts";
 import { runVerification } from "../verify/runner.ts";
 import { verifyProtectedAndScope } from "../verify/protected.ts";
@@ -228,6 +228,29 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
           // reaches the retry/escalation evaluator exactly like a run
           // failure (which the dispatch hook already routes)
           if (validation.finalState === "failed") retry.evaluate(taskId);
+          // the SELF path (8.1 routing rule path 1): a task whose own
+          // verification failed retries itself within its budget — the
+          // engine's findings are the feedback artifact (p4b review
+          // finding: this row previously had no caller; changes_requested
+          // dead-ended while the review path requeued fine)
+          if (validation.finalState === "changes_requested") {
+            driveSelfPathRequeue(
+              db,
+              taskId,
+              "engine-verification",
+              JSON.stringify(
+                {
+                  kind: "novaflow-self-verification-feedback",
+                  task_id: taskId,
+                  summary,
+                },
+                null,
+                2,
+              ) + "\n",
+              "daemon-verify",
+            );
+            dispatcher.requestDispatch();
+          }
           // THE p4b REVIEW-ROUTING SEAM (8.1 feedback routing rule): a
           // member that just COMPLETED with a changes_requested artifact
           // routes its on_changes_requested targets FIRST — the re-entry

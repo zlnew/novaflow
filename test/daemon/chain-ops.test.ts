@@ -918,18 +918,46 @@ test("the gate-approved driver: a FAILING engine verification still decides — 
     });
     assert.equal(approve["ok"], true, JSON.stringify(approve));
 
-    // the failed verdict: the self-path entry with the retry budget honored
-    await waitForState(env, g, "changes_requested", 10_000);
+    // the failed verdict: the SELF path now retries itself (the p4b fix —
+    // the requeue row previously had no caller). A GATED task re-enters its
+    // gate on every rerun: approve → verify fails → requeue → rerun → back
+    // to awaiting_gate with the budget honored — the operator approves
+    // again or confirms failure.
+    // wait for the SECOND gate arrival: awaiting_gate again AND the entry
+    // already counted (the first arrival predates the approval)
+    await waitFor(async () => {
+      const ro = readConnection(env.dbPath);
+      const row = ro
+        .prepare("SELECT state, retry_count FROM tasks WHERE id = ?")
+        .get(g) as { state: string; retry_count: number };
+      ro.close();
+      return row.state === "awaiting_gate" && row.retry_count >= 1;
+    }, 30_000);
     const ro2 = readConnection(env.dbPath);
-    const gRow = ro2.prepare("SELECT retry_count FROM tasks WHERE id = ?").get(g) as { retry_count: number };
+    const gRow = ro2
+      .prepare("SELECT retry_count, context_files_json FROM tasks WHERE id = ?")
+      .get(g) as { retry_count: number; context_files_json: string };
     ro2.close();
-    assert.equal(gRow.retry_count, 1, "retry_count increments EXACTLY on the changes_requested entry");
+    assert.equal(gRow.retry_count, 1, "retry_count increments EXACTLY once per changes_requested entry");
+    // discriminating evidence: the self-path requeue row with the delivered
+    // feedback artifact recorded, then the rerun's own gate row
     const tr = transitionsOf(env, g);
+    const requeueRows = tr.filter(
+      (r) => r["from_state"] === "changes_requested" && r["to_state"] === "queued",
+    );
+    assert.equal(requeueRows.length, 1, "the engine-verification feedback drove one self-path requeue");
+    assert.match(
+      String(requeueRows[0]!["reason"]),
+      /feedback artifact delivered to next attempt: .*engine-verification/,
+    );
+    assert.match(gRow.context_files_json, /feedback\/engine-verification\.json/);
+    assert.ok(
+      existsSync(join(env.wsRoot, ".novaflow", "runs", g, "feedback", "engine-verification.json")),
+      "the engine-verification feedback file exists",
+    );
     const last = tr[tr.length - 1]!;
-    assert.equal(last["from_state"], "validating");
-    assert.equal(last["to_state"], "changes_requested");
-    assert.equal(last["trigger_type"], "engine");
-    assert.match(String(last["reason"]), /command "exit 1" failed/);
+    assert.equal(last["from_state"], "running");
+    assert.equal(last["to_state"], "awaiting_gate"); // the RERUN's gate row — the cycle is honest
 
     // a verification failure is NOT a confirmed gate failure: the chain stays active
     assert.equal(String((chainStatusSync(env, chainRunId)["chain"] as Record<string, unknown>)["state"]), "active");

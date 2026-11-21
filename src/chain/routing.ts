@@ -550,3 +550,43 @@ export function createRoutingEvaluator(db: Db, opts: RoutingOptions) {
 }
 
 export type RoutingEvaluator = ReturnType<typeof createRoutingEvaluator>;
+
+/**
+ * The SELF-path requeue driver — the 8.1 feedback routing rule's path 1:
+ * "the task retries itself within its retry budget." Review-round finding
+ * (p4b, worker-flagged): the verbatim `changes_requested → queued` requeue
+ * row had callers ONLY on the review path — a task failing its OWN engine
+ * verification, or gate-rejected with feedback, dead-ended in
+ * `changes_requested` while the matrix promises an automatic retry.
+ *
+ * The caller invokes this ONLY when the entry did NOT escalate (the
+ * budget checks live upstream, in completeValidation/rejectGate via
+ * escalateIfBudgetSpent — one source). The surface's feedback becomes the
+ * task's ONE new context file (the same delivery convention as the review
+ * artifact) and the requeue row records the delivered path.
+ */
+export function driveSelfPathRequeue(
+  db: Db,
+  taskId: string,
+  source: string,
+  content: string,
+  actor: string,
+): string | null {
+  const task = db
+    .prepare("SELECT state FROM tasks WHERE id = ?")
+    .get(taskId) as { state: string } | undefined;
+  if (task === undefined || task.state !== "changes_requested") {
+    // consumed/escalated/foreign state — not ours to drive (the matrix is
+    // the arbiter; the requeue row itself would refuse anyway)
+    return null;
+  }
+  const ws = workspaceOf(db, taskId);
+  if (ws === undefined) return null;
+  const rel = feedbackRelPath(taskId, source);
+  const abs = join(novaflowDir(ws.root), "runs", taskId, "feedback", `${source}.json`);
+  mkdirSync(dirname(abs), { recursive: true });
+  writeFileSync(abs, content);
+  appendContextFile(db, taskId, rel);
+  requeueFromChangesRequested(db, taskId, actor, { feedbackPath: rel });
+  return rel;
+}

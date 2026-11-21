@@ -63,7 +63,7 @@ import {
   ChainValidationError,
 } from "../chain/import.ts";
 import { memberReadiness, type ChainEvaluator } from "../chain/readiness.ts";
-import { deliveredFeedbackPaths, type RoutingEvaluator } from "../chain/routing.ts";
+import { deliveredFeedbackPaths, driveSelfPathRequeue, type RoutingEvaluator } from "../chain/routing.ts";
 import { parseYaml, YamlParseError } from "../chain/yaml.ts";
 
 /**
@@ -1074,7 +1074,35 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
       note: "gate rejection",
     });
     const outcome = rejectGate(deps.db, payload, feedback, surface as GateSurface);
-    return { final_state: outcome.finalState, retry_count: outcome.retryCount };
+    // the SELF path for gate rejections (8.1 routing rule path 1): a
+    // rejected task with remaining budget retries itself — the operator's
+    // feedback is the artifact (p4b review finding: no requeue driver)
+    let feedbackPath: string | null = null;
+    let finalState = outcome.finalState;
+    if (outcome.finalState === "changes_requested") {
+      feedbackPath = driveSelfPathRequeue(
+        deps.db,
+        payload.task_id,
+        "gate-reject",
+        JSON.stringify(
+          {
+            kind: "novaflow-gate-reject-feedback",
+            task_id: payload.task_id,
+            run_id: payload.run_id,
+            rejected_by: payload.approved_by,
+            feedback,
+          },
+          null,
+          2,
+        ) + "\n",
+        payload.approved_by,
+      );
+      if (feedbackPath !== null) {
+        finalState = "queued"; // the requeue row moved it — report the truth
+        deps.dispatcher.requestDispatch();
+      }
+    }
+    return { final_state: finalState, retry_count: outcome.retryCount, feedback_path: feedbackPath };
   });
 
   ops.set("nova_gate_confirm_failure", async (args, { deps, surface }) => {
