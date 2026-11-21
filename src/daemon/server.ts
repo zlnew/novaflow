@@ -1,6 +1,6 @@
 import { connect, createServer, type Socket } from "node:net";
-import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
-import { dirname } from "node:path";
+import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import type { Db } from "../store/db.ts";
 import { ulid } from "../store/ids.ts";
@@ -22,6 +22,29 @@ import {
 } from "../gates.ts";
 import { validateProfile, ProfileValidationError } from "../profiles.ts";
 import { ProfileUnresolvedError } from "../catalog.ts";
+import {
+  createWorkspace,
+  getWorkspace,
+  isWritableDirectory,
+  listWorkspaces,
+  resolveWorkspaceArg,
+  setWorkspaceStatus,
+  deleteWorkspace,
+  WORKSPACE_NAME_PATTERN,
+  type WorkspaceRow,
+} from "../workspaces.ts";
+import {
+  createProject,
+  getProject,
+  listProjectTargets,
+  listProjects,
+  projectTaskCounts,
+  setProjectPhase,
+  MAX_PHASE_LENGTH,
+  PROJECT_NAME_PATTERN,
+  type ProjectTargetInput,
+} from "../projects.ts";
+import { bareId, isUlid } from "../store/ids.ts";
 import { RetryBudgetExhaustedError } from "../validating.ts";
 import { validateArtifact, type TaskHandoffArtifact } from "../runs/artifact.ts";
 import type { DaemonConfig } from "../daemonconfig.ts";
@@ -305,6 +328,97 @@ function parseTargetScopesArg(
 
 /* ------------------------------ shared queries ------------------------------ */
 
+/** Resolve `{workspace_id}` (id form) or throw not_found. */
+function requireWorkspaceById(db: Db, workspaceId: string): WorkspaceRow {
+  const workspace = getWorkspace(db, workspaceId);
+  if (!workspace) throw new OpError("not_found", `no such workspace: ${workspaceId}`);
+  return workspace;
+}
+
+/** Resolve the op arg shape `{workspace_id} | {slug}` or throw not_found. */
+function requireWorkspaceArg(db: Db, args: Record<string, unknown>): WorkspaceRow {
+  const workspace = resolveWorkspaceArg(db, args);
+  if (!workspace) {
+    throw new OpError("not_found", `no such workspace: ${String(args["workspace_id"] ?? args["slug"])}`);
+  }
+  return workspace;
+}
+
+/**
+ * project_targets payload (FR-PRJ-01/03, data.md DDL): closed keys,
+ * alias + root_path + target_type required, DDL-typed optional columns.
+ * A repeated alias in one payload is refused truthfully (UNIQUE(project_id,
+ * alias) would otherwise surface as a misleading message).
+ */
+function parseTargetsArg(args: Record<string, unknown>): ProjectTargetInput[] | undefined {
+  const v = args["targets"];
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) {
+    throw new OpError(
+      "schema_invalid",
+      "args.targets must be an array of {alias, root_path, target_type, ...}",
+    );
+  }
+  const KNOWN_TARGET_KEYS = new Set([
+    "alias", "root_path", "target_type", "base_branch", "branch_prefix", "default_access",
+  ]);
+  const out: ProjectTargetInput[] = [];
+  for (const item of v) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      throw new OpError(
+        "schema_invalid",
+        "args.targets items must be objects {alias, root_path, target_type, ...}",
+      );
+    }
+    const o = item as Record<string, unknown>;
+    for (const k of Object.keys(o)) {
+      if (!KNOWN_TARGET_KEYS.has(k)) {
+        throw new OpError(
+          "schema_invalid",
+          `args.targets items carry an unknown key "${k}" — keys are closed per the DDL`,
+        );
+      }
+    }
+    const alias = reqString(o, "alias");
+    const rootPath = reqString(o, "root_path");
+    const targetType = o["target_type"];
+    if (targetType !== "git_repo" && targetType !== "directory") {
+      throw new OpError(
+        "schema_invalid",
+        'args.targets target_type must be "git_repo" or "directory"',
+      );
+    }
+    const defaultAccess = o["default_access"];
+    if (
+      defaultAccess !== undefined &&
+      defaultAccess !== "read_only" &&
+      defaultAccess !== "read_write"
+    ) {
+      throw new OpError(
+        "schema_invalid",
+        'args.targets default_access must be "read_only" or "read_write"',
+      );
+    }
+    const baseBranch = optNonEmptyString(o, "base_branch");
+    const branchPrefix = optNonEmptyString(o, "branch_prefix");
+    if (out.some((t) => t.alias === alias)) {
+      throw new OpError(
+        "duplicate",
+        `args.targets carries alias "${alias}" twice — one target row per alias`,
+      );
+    }
+    out.push({
+      alias,
+      root_path: rootPath,
+      target_type: targetType,
+      ...(baseBranch !== undefined ? { base_branch: baseBranch } : {}),
+      ...(branchPrefix !== undefined ? { branch_prefix: branchPrefix } : {}),
+      ...(defaultAccess !== undefined ? { default_access: defaultAccess } : {}),
+    });
+  }
+  return out;
+}
+
 type RunRow = {
   id: string;
   task_id: string;
@@ -392,6 +506,52 @@ export function buildOpTable(): Map<string, OpHandler> {
 
   /* ----------------------------- read-only ops ----------------------------- */
 
+  // srs 4.1.1 task-identifier resolution: ULID direct (bare or tsk_
+  // display form), key within the workspace context. The CLI is a thin
+  // client (it never opens the store), so the daemon serves the lookup.
+  ops.set("nova_task_resolve", (args, { deps }) => {
+    const ident = reqString(args, "ident");
+    const bare = isUlid(ident) || (ident.startsWith("tsk_") && isUlid(ident.slice(4)))
+      ? bareId(ident)
+      : null;
+    if (bare !== null) {
+      const task = getTask(deps.db, bare);
+      if (!task) throw new OpError("not_found", `no such task: ${ident}`);
+      return { task };
+    }
+    // the human key: resolved within the workspace context — the CLI's
+    // active-workspace scope (a key may repeat across projects, so an
+    // ambiguous key is a truthful duplicate, never a silent pick)
+    if (args["workspace_id"] === undefined) {
+      throw new OpError(
+        "schema_invalid",
+        "key-form identifiers require workspace_id — no workspace context was given",
+      );
+    }
+    const workspace = requireWorkspaceById(deps.db, reqString(args, "workspace_id"));
+    const rows = deps.db
+      .prepare(
+        `SELECT t.* FROM tasks t JOIN projects p ON p.id = t.project_id
+          WHERE p.workspace_id = ? AND t.key = ?`,
+      )
+      .all(workspace.id, ident) as Array<{ id: string }>;
+    if (rows.length === 0) {
+      throw new OpError(
+        "not_found",
+        `no task with key "${ident}" in workspace "${workspace.slug}"`,
+      );
+    }
+    if (rows.length > 1) {
+      throw new OpError(
+        "duplicate",
+        `key "${ident}" matches ${rows.length} tasks in workspace "${workspace.slug}" — use the ULID id`,
+      );
+    }
+    const task = getTask(deps.db, rows[0]!.id);
+    if (!task) throw new OpError("not_found", `no such task: ${rows[0]!.id}`);
+    return { task };
+  });
+
   ops.set("nova_task_status", (args, { deps }) => {
     const task = requireTask(deps.db, reqString(args, "task_id"));
     const current = latestRun(deps.db, task.id);
@@ -458,8 +618,20 @@ export function buildOpTable(): Map<string, OpHandler> {
     return { run_id: run.id, lines: lines.slice(-tailLines) };
   });
 
-  ops.set("nova_profile_list", (_args, { deps }) => {
-    return { profiles: deps.db.prepare("SELECT * FROM agent_profiles ORDER BY name").all() };
+  ops.set("nova_profile_list", (args, { deps }) => {
+    // workspace filter (p3b, documented): the workspace's own profiles
+    // plus the global defaults — together the resolution universe
+    // (data.md 4.3: workspace-local first, then global).
+    if (args["workspace_id"] === undefined) {
+      return { profiles: deps.db.prepare("SELECT * FROM agent_profiles ORDER BY name").all() };
+    }
+    const workspace = requireWorkspaceById(deps.db, reqString(args, "workspace_id"));
+    const profiles = deps.db
+      .prepare(
+        "SELECT * FROM agent_profiles WHERE workspace_id IS NULL OR workspace_id = ? ORDER BY name",
+      )
+      .all(workspace.id);
+    return { profiles };
   });
 
   ops.set("nova_profile_validate", (args, { deps }) => {
@@ -496,6 +668,209 @@ export function buildOpTable(): Map<string, OpHandler> {
   });
 
   ops.set("nova_daemon_status", (_args, { deps }) => deps.daemonStatus());
+
+  /* --------------- workspace / project / profile setup ops (p3b) -------------- */
+
+  // FR-WS-01: create + register. The op validates (single writer: the
+  // pre-check cannot race a second creator); the service owns every
+  // store + filesystem effect.
+  ops.set("nova_workspace_create", (args, { deps }) => {
+    const name = reqString(args, "name");
+    if (!WORKSPACE_NAME_PATTERN.test(name)) {
+      throw new OpError(
+        "schema_invalid",
+        `workspace name must be lower-case kebab-case (${WORKSPACE_NAME_PATTERN}), got "${name}"`,
+      );
+    }
+    const rootPath = resolve(reqString(args, "root_path"));
+    if (!isWritableDirectory(rootPath)) {
+      throw new OpError(
+        "schema_invalid",
+        `root_path is not an existing writable directory: ${rootPath}`,
+      );
+    }
+    if (deps.db.prepare("SELECT id FROM workspaces WHERE slug = ?").get(name) !== undefined) {
+      throw new OpError("duplicate", `a workspace named "${name}" already exists`);
+    }
+    if (deps.db.prepare("SELECT id FROM workspaces WHERE root_path = ?").get(rootPath) !== undefined) {
+      throw new OpError("duplicate", `root_path is already registered to another workspace: ${rootPath}`);
+    }
+    const workspace = createWorkspace(deps.db, {
+      name,
+      rootPath,
+      defaultBranch: optString(args, "default_branch", "main"),
+    });
+    // FR-WS-01 AC3: reports the unique workspace id (bare ULID, data 5.1)
+    return { id: workspace.id, workspace };
+  });
+
+  ops.set("nova_workspace_list", (_args, { deps }) => {
+    return { workspaces: listWorkspaces(deps.db) };
+  });
+
+  // FR-WS-03 AC2: archive disables execution (dispatch skips non-active
+  // workspaces). Idempotent by design: archiving an archived workspace
+  // is a no-op success (documented). NO switch op exists — the active
+  // workspace marker is CLI-local state (srs 4.1.1 names `nova workspace
+  // switch` a CLI concern; the daemon stays stateless about which
+  // workspace the operator is looking at).
+  ops.set("nova_workspace_archive", (args, { deps }) => {
+    const workspace = requireWorkspaceArg(deps.db, args);
+    setWorkspaceStatus(deps.db, workspace.id, "archived");
+    return { workspace_id: workspace.id, slug: workspace.slug, status: "archived" };
+  });
+
+  // FR-WS-03 AC1: remove the DB entry (cascades per the DDL) and NEVER
+  // touch files. A workspace that still has tasks is refused by the
+  // store's FK RESTRICT — surfaced as `aborted` with the store's message.
+  ops.set("nova_workspace_unregister", (args, { deps }) => {
+    const workspace = requireWorkspaceArg(deps.db, args);
+    deleteWorkspace(deps.db, workspace.id);
+    return { unregistered: workspace.slug, files_untouched: true };
+  });
+
+  // FR-PRJ-01: project + 0..N project_targets in one transaction, plus
+  // the canonical project directory under the workspace root.
+  ops.set("nova_project_create", (args, { deps }) => {
+    const workspace = requireWorkspaceById(deps.db, reqString(args, "workspace_id"));
+    const name = reqString(args, "name");
+    if (!PROJECT_NAME_PATTERN.test(name)) {
+      throw new OpError(
+        "schema_invalid",
+        `project name must be lower-case kebab-case (${PROJECT_NAME_PATTERN}), got "${name}"`,
+      );
+    }
+    const objective = reqString(args, "objective");
+    const targets = parseTargetsArg(args);
+    if (deps.db.prepare("SELECT id FROM projects WHERE workspace_id = ? AND slug = ?").get(workspace.id, name) !== undefined) {
+      throw new OpError("duplicate", `a project named "${name}" already exists in workspace "${workspace.slug}"`);
+    }
+    try {
+      return createProject(deps.db, {
+        workspaceId: workspace.id,
+        name,
+        objective,
+        ...(targets !== undefined ? { targets } : {}),
+        workspaceRoot: workspace.root_path,
+      });
+    } catch (err) {
+      if (err instanceof Error && /UNIQUE constraint failed/i.test(err.message)) {
+        throw new OpError("duplicate", `a project named "${name}" already exists in workspace "${workspace.slug}"`);
+      }
+      throw err;
+    }
+  });
+
+  // workspace-scoped when workspace_id is given; otherwise every
+  // workspace's projects (documented).
+  ops.set("nova_project_list", (args, { deps }) => {
+    const workspaceId =
+      args["workspace_id"] === undefined ? undefined : reqString(args, "workspace_id");
+    if (workspaceId !== undefined) {
+      requireWorkspaceById(deps.db, workspaceId);
+    }
+    return { projects: listProjects(deps.db, workspaceId) };
+  });
+
+  ops.set("nova_project_status", (args, { deps }) => {
+    const projectId = reqString(args, "project_id");
+    const project = getProject(deps.db, projectId);
+    if (!project) throw new OpError("not_found", `no such project: ${projectId}`);
+    return {
+      project,
+      task_counts: projectTaskCounts(deps.db, projectId),
+      targets: listProjectTargets(deps.db, projectId),
+    };
+  });
+
+  // FR-PRJ-02: free-text label, no transition rules; every CHANGE is
+  // audited with the triggering identity (migration 0002's audit surface).
+  ops.set("nova_project_phase_set", (args, { deps }) => {
+    const projectId = reqString(args, "project_id");
+    const phase = reqString(args, "phase");
+    if (phase.length > MAX_PHASE_LENGTH) {
+      throw new OpError(
+        "schema_invalid",
+        `phase label is ${phase.length} characters — the documented bound is ${MAX_PHASE_LENGTH}`,
+      );
+    }
+    const actor = optString(args, "actor", "operator");
+    if (!getProject(deps.db, projectId)) {
+      throw new OpError("not_found", `no such project: ${projectId}`);
+    }
+    const outcome = setProjectPhase(deps.db, projectId, phase, actor);
+    return { project_id: projectId, phase, changed: outcome.changed };
+  });
+
+  // FR-AGT-01: read + structurally validate the profile file (§4.2
+  // validator, zero tokens — the live catalog probe is the enqueue
+  // gate's duty), insert the row, store the canonical file at
+  // <root>/.novaflow/profiles/<name>.json. The source file is read,
+  // never moved. Without workspace_id the profile is GLOBAL (row only —
+  // data 5.2 has no canonical home for global profiles in v1).
+  ops.set("nova_profile_create", (args, { deps }) => {
+    const filePath = reqString(args, "file_path");
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(filePath, "utf8"));
+    } catch (err) {
+      throw new OpError(
+        "schema_invalid",
+        `profile file unreadable or not JSON: ${filePath} (${(err as Error).message})`,
+      );
+    }
+    const profile = validateProfile(raw); // ProfileValidationError -> schema_invalid
+    const workspace =
+      args["workspace_id"] === undefined
+        ? undefined
+        : requireWorkspaceById(deps.db, reqString(args, "workspace_id"));
+    const existing = deps.db
+      .prepare(
+        "SELECT id FROM agent_profiles WHERE name = ? AND workspace_id IS ?",
+      )
+      .get(profile.name, workspace?.id ?? null);
+    if (existing !== undefined) {
+      throw new OpError(
+        "duplicate",
+        `a profile named "${profile.name}" already exists in ${workspace ? `workspace "${workspace.slug}"` : "the global scope"}`,
+      );
+    }
+    let canonicalPath: string | null = null;
+    if (workspace !== undefined) {
+      canonicalPath = join(workspace.root_path, ".novaflow", "profiles", `${profile.name}.json`);
+      writeFileSync(canonicalPath, JSON.stringify(raw, null, 2) + "\n");
+    }
+    const id = ulid();
+    try {
+      deps.db
+        .prepare(
+          `INSERT INTO agent_profiles
+             (id, workspace_id, name, role, provider, model, thinking_level,
+              tools_allowlist_json, system_prompt_path, max_timeout_sec, max_cost_usd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          workspace?.id ?? null,
+          profile.name,
+          profile.role ?? null,
+          profile.provider,
+          profile.model,
+          profile.thinking_level,
+          JSON.stringify(profile.tools_allowlist),
+          profile.system_prompt_path,
+          profile.limits.max_timeout_sec,
+          profile.limits.max_cost_usd,
+        );
+    } catch (err) {
+      if (err instanceof Error && /UNIQUE constraint failed/i.test(err.message)) {
+        throw new OpError("duplicate", `a profile named "${profile.name}" already exists`);
+      }
+      throw err;
+    }
+    const row = deps.db.prepare("SELECT * FROM agent_profiles WHERE id = ?").get(id) as Record<string, unknown>;
+    return { profile: row, canonical_path: canonicalPath };
+  });
 
   /* ------------------------------- mutating ops ------------------------------ */
 

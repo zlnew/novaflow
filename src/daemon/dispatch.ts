@@ -14,6 +14,11 @@ import {
  * startRun's, so the verbatim scheduler-slot trigger has exactly ONE
  * source: src/runs/triggers.ts START_TRIGGER, applied by startRun).
  *
+ * FR-WS-03 AC2: candidate selection only admits tasks in ACTIVE
+ * workspaces — archived (or disabled) workspaces' queued tasks are
+ * skipped and stay QUEUED; archiving is how the operator disables
+ * task execution for a workspace while its logs stay read-only.
+ *
  * Concurrency semaphores: a slot is granted only when the global
  * running count is below `concurrency.global` (daemon config, default 4)
  * AND the task's workspace running count is below `concurrency.workspace`
@@ -150,7 +155,7 @@ export function createDispatcher(db: Db, opts: DispatchOptions) {
            FROM tasks t
            JOIN projects p ON p.id = t.project_id
            JOIN workspaces w ON w.id = p.workspace_id
-          WHERE t.state = 'queued'
+          WHERE t.state = 'queued' AND w.status = 'active'
           ORDER BY t.created_at, t.id`,
       )
       .all() as CandidateRow[];
