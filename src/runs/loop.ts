@@ -8,15 +8,22 @@ import {
   START_TRIGGER,
   REPAIR_TRIGGER,
   RUN_FAILED_TRIGGER,
+  ABORT_TRIGGER,
 } from "./triggers.ts";
-import { planSettleTransition } from "./settle.ts";
+import { finalizeRunRecord, intakeSettledRun } from "./settle-replay.ts";
 import { buildEngineContext, writeEngineContext } from "./context.ts";
 import { writeProtectedDigests } from "../verify/protected.ts";
 import { composePrompt, type ComposedPrompt } from "./prompt.ts";
 import { buildRunArgv, defaultExtensionPath, runDirPath } from "./spawn.ts";
 import { createPump } from "./pump.ts";
 import { redactText } from "./redact.ts";
-import { readArtifactFile } from "./artifact.ts";
+import {
+  checkBudgetCeiling,
+  checkPiBinary,
+  checkRequiredEnvVars,
+  checkTargetScopes,
+  type GlobalBudgets,
+} from "./preflight.ts";
 import {
   costUsd,
   defaultPricesPath,
@@ -44,6 +51,26 @@ import {
 /** SIGTERM grace before the SIGKILL backstop — the spec's only named escalation. */
 export const KILL_GRACE_MS = 3000;
 
+/**
+ * The daemon's handle on one live attempt (the abort/steer ops).
+ * The daemon marks `abortRequested` BEFORE performing the group kill
+ * (SIGTERM → grace → SIGKILL); the loop then classifies the exit as an
+ * operator abort and owns BOTH the run record ('cancelled') and the
+ * running→cancelled matrix row — every write stays on the guarded path,
+ * the op itself performs no state write. While the child is live the
+ * loop installs `steer` so the daemon can forward api.md §3 frames
+ * (e.g. the `steer` command) to the child's stdin; cleared on exit.
+ */
+export type RunControl = {
+  abortRequested: boolean;
+  /** trigger_type recorded on the operator-abort transition (default human). */
+  abortTriggerType?: "human" | "mcp" | undefined;
+  /** actor recorded on the operator-abort transition (default "operator"). */
+  abortActor?: string | undefined;
+  /** Installed by the loop while the child is live; null otherwise. */
+  steer: ((frame: string) => void) | null;
+};
+
 export type RunOptions = {
   /** Pi binary; default "pi". Tests point this at the stub. */
   piBin?: string | undefined;
@@ -60,6 +87,13 @@ export type RunOptions = {
    * tests may inject a shorter window so the escalation is proven fast.
    */
   killGraceMs?: number | undefined;
+  /** The daemon's abort/steer handle on the live attempt (optional). */
+  control?: RunControl | undefined;
+  /**
+   * The daemon config's global budgets (FR-TSK-10 AC4): they apply
+   * when the task's workspace defines none (documented precedence).
+   */
+  globalBudgets?: GlobalBudgets | undefined;
 };
 
 export type TaskRunRecord = {
@@ -106,6 +140,7 @@ type TaskJoinRow = {
   output_schema_version: string;
   overrides_json: string | null;
   context_files_json: string;
+  workspace_id: string;
   workspace_root: string;
 };
 
@@ -218,46 +253,11 @@ function insertRunRow(
   );
 }
 
-function finalizeRun(
-  db: Db,
-  runId: string,
-  fields: {
-    status: string;
-    preflightStatus: "passed" | "failed";
-    inputTokens: number;
-    outputTokens: number;
-    costUsd: number;
-    exitCode: number | null;
-    artifactPath: string | null;
-    errorSummary: string | null;
-    startedWall: number;
-  },
-): void {
-  db.prepare(
-    `UPDATE task_runs
-        SET status = ?, preflight_status = ?, input_tokens = ?, output_tokens = ?,
-            cost_usd = ?, exit_code = ?, artifact_path = ?, error_summary = ?,
-            ended_at = ?, duration_ms = ?
-      WHERE id = ?`,
-  ).run(
-    fields.status,
-    fields.preflightStatus,
-    fields.inputTokens,
-    fields.outputTokens,
-    fields.costUsd,
-    fields.exitCode,
-    fields.artifactPath,
-    fields.errorSummary,
-    new Date().toISOString(),
-    Date.now() - fields.startedWall,
-    runId,
-  );
-}
-
 type RawOutcome =
   | { kind: "spawn-error"; message: string }
   | { kind: "timeout"; code: number | null }
   | { kind: "budget"; code: number | null }
+  | { kind: "abort"; code: number | null }
   | { kind: "crash"; code: number | null }
   | { kind: "settled"; code: number | null };
 
@@ -271,7 +271,7 @@ export async function startRun(
     .prepare(
       `SELECT t.id, t.objective, t.profile_id, t.state, t.requires_human_gate,
               t.output_schema_version, t.overrides_json, t.context_files_json,
-              w.root_path AS workspace_root
+              w.id AS workspace_id, w.root_path AS workspace_root
          FROM tasks t
          JOIN projects p ON p.id = t.project_id
          JOIN workspaces w ON w.id = p.workspace_id
@@ -397,9 +397,29 @@ export async function startRun(
       }
     }
 
+    // ---- DEBT-002 closure (FR-TSK-10): zero-token readiness checks,
+    // all local, all before any spawn (AC5 holds for every failure) ----
+    if (preflightError === null) {
+      preflightError = checkTargetScopes(db, taskId); // AC1 roots + AC2 git
+    }
+    if (preflightError === null) {
+      preflightError = checkPiBinary(opts.piBin ?? "pi"); // AC3 tool dep
+    }
+    if (preflightError === null) {
+      preflightError = checkRequiredEnvVars(); // AC3 env hook (empty set in v1)
+    }
+    if (preflightError === null) {
+      preflightError = checkBudgetCeiling(db, {
+        // AC4 ceiling
+        workspaceId: task.workspace_id,
+        workspaceRoot: task.workspace_root,
+        ...(opts.globalBudgets !== undefined ? { globalBudgets: opts.globalBudgets } : {}),
+      });
+    }
+
     if (preflightError !== null || prompt === null || contextPath === null) {
       const error = preflightError ?? "preflight failed";
-      finalizeRun(db, runId, {
+      finalizeRunRecord(db, runId, {
         status: "failed",
         preflightStatus: "failed",
         inputTokens: 0,
@@ -448,6 +468,14 @@ export async function startRun(
     });
     db.prepare("UPDATE task_runs SET pid = ? WHERE id = ?").run(child.pid ?? null, runId);
 
+    // the daemon's steer op writes LF-framed api.md §3 frames through this
+    // sink while the child is live; cleared on exit
+    if (opts.control !== undefined) {
+      opts.control.steer = (frame: string): void => {
+        child.stdin!.write(frame + "\n");
+      };
+    }
+
     const killGraceMs = opts.killGraceMs ?? KILL_GRACE_MS;
     const pump = createPump(rawPath, redactedPath);
     let killed: "timeout" | "budget" | null = null;
@@ -458,18 +486,23 @@ export async function startRun(
     // before this, so no caller can observe a live child.
     const exited = new Promise<RawOutcome>((resolve) => {
       let done = false;
-      child.once("exit", (code, signal) => {
+      const finish = (outcome: RawOutcome): void => {
         if (done) return;
         done = true;
-        if (killed === "timeout") resolve({ kind: "timeout", code });
-        else if (killed === "budget") resolve({ kind: "budget", code });
-        else if (!pump.settled) resolve({ kind: "crash", code });
-        else resolve({ kind: "settled", code });
+        if (opts.control !== undefined) opts.control.steer = null;
+        resolve(outcome);
+      };
+      child.once("exit", (code) => {
+        if (killed === "timeout") finish({ kind: "timeout", code });
+        else if (killed === "budget") finish({ kind: "budget", code });
+        // the daemon marked the abort before its group kill — operator
+        // intent is terminal and outranks a settle that was not yet intaken
+        else if (opts.control?.abortRequested === true) finish({ kind: "abort", code });
+        else if (!pump.settled) finish({ kind: "crash", code });
+        else finish({ kind: "settled", code });
       });
       child.once("error", (err) => {
-        if (done) return;
-        done = true;
-        resolve({ kind: "spawn-error", message: err.message });
+        finish({ kind: "spawn-error", message: err.message });
       });
     });
 
@@ -618,7 +651,7 @@ export async function startRun(
           ? `spawn failed: ${outcome.message}`
           : `subprocess exited before agent_settled (exit=${outcome.code ?? "null"})` +
             (stderrTail !== "" ? `\nstderr tail: ${stderrTail}` : "");
-      finalizeRun(db, runId, {
+      finalizeRunRecord(db, runId, {
         status: "failed",
         preflightStatus: "passed",
         inputTokens: pump.inputTokens,
@@ -644,7 +677,7 @@ export async function startRun(
       const error = timedOut
         ? `timeout: exceeded max_timeout_sec ${effective.maxTimeoutSec}s (SIGTERM -> SIGKILL)`
         : `budget_exceeded: cost $${breachCost.toFixed(6)} > max_cost_usd $${effective.maxCostUsd} (SIGTERM -> SIGKILL)`;
-      finalizeRun(db, runId, {
+      finalizeRunRecord(db, runId, {
         status: timedOut ? "timed_out" : "failed",
         preflightStatus: "passed",
         inputTokens: pump.inputTokens,
@@ -664,56 +697,54 @@ export async function startRun(
       break;
     }
 
-    // ---- settled (FR-TSK-05): artifact intake ----
-    const artifactPath = join(runDir, "result.json");
-    const artifact = readArtifactFile(artifactPath);
-
-    if (artifact.ok) {
-      // Structurally valid. The engine-owned annotations (engine_verified,
-      // protected_files_untouched, verification_results, role) are NEVER
-      // trusted from the agent — the engine overwrites them after
-      // VALIDATING. That verification is p2c scope; on the validating path
-      // this card records the run and leaves the fields untouched.
-      finalizeRun(db, runId, {
-        status: "succeeded",
+    // ---- operator abort: the daemon marked the run and performed the
+    // group kill (abort_bash -> SIGTERM -> 3 s grace -> SIGKILL); the
+    // loop owns the run record AND the running→cancelled row, so every
+    // write stays on the guarded path ----
+    if (outcome.kind === "abort") {
+      const error = "operator abort (abort_bash -> SIGTERM -> SIGKILL)";
+      finalizeRunRecord(db, runId, {
+        status: "cancelled",
         preflightStatus: "passed",
         inputTokens: pump.inputTokens,
         outputTokens: pump.outputTokens,
         costUsd: cost,
         exitCode: outcome.code,
-        artifactPath,
-        errorSummary: withPricesNote(null),
+        artifactPath: null,
+        errorSummary: withPricesNote(error),
         startedWall,
       });
-      const plan = planSettleTransition(
-        artifact.artifact.status ?? "",
-        task.requires_human_gate === 1,
-      );
-      applyTransition(db, taskId, plan.trigger, {
-        triggerType: "engine",
-        actor,
+      applyTransition(db, taskId, ABORT_TRIGGER, {
+        triggerType: opts.control?.abortTriggerType ?? "human",
+        actor: opts.control?.abortActor ?? "operator",
         runId,
-        reason: `artifact status: ${String(artifact.artifact.status)}`,
+        reason: error,
       });
       break;
     }
 
-    // missing or schema-invalid artifact → FR-TSK-06 repair (max 1)
-    const error =
-      artifact.reason === "missing"
-        ? "result.json missing after agent_settled"
-        : `result.json failed structural validation: ${artifact.errors.join("; ")}`;
-    finalizeRun(db, runId, {
-      status: "failed",
-      preflightStatus: "passed",
+    // ---- settled (FR-TSK-05): artifact intake via the SHARED module
+    // (src/runs/settle-replay.ts) — the daemon's boot crash recovery
+    // (§8.4) feeds the same intake; never a reimplementation ----
+    const intake = intakeSettledRun({
+      db,
+      taskId,
+      runId,
+      requiresHumanGate: task.requires_human_gate === 1,
+      runDir,
+      model: profile.model,
+      priceTable,
+      exitCode: outcome.code,
       inputTokens: pump.inputTokens,
       outputTokens: pump.outputTokens,
-      costUsd: cost,
-      exitCode: outcome.code,
-      artifactPath: null,
-      errorSummary: withPricesNote(error),
       startedWall,
+      pricesNote: withPricesNote,
+      actor,
     });
+    if (intake.ok) break;
+
+    // missing or schema-invalid artifact → FR-TSK-06 repair (max 1)
+    const error = intake.error;
 
     if (attemptKind === "execution") {
       // repair budget remains: running → running, new run with the
