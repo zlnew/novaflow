@@ -11,6 +11,7 @@ import {
 } from "./triggers.ts";
 import { planSettleTransition } from "./settle.ts";
 import { buildEngineContext, writeEngineContext } from "./context.ts";
+import { writeProtectedDigests } from "../verify/protected.ts";
 import { composePrompt, type ComposedPrompt } from "./prompt.ts";
 import { buildRunArgv, defaultExtensionPath, runDirPath } from "./spawn.ts";
 import { createPump } from "./pump.ts";
@@ -383,6 +384,19 @@ export async function startRun(
         preflightError = `engine context: ${(err as Error).message}`;
       }
     }
+    // pre-run protected-digest snapshot (FR-TSK-11, architecture 5.8
+    // Post-Run Verifier): taken at preflight, BEFORE the agent runs, so
+    // the post-run verifier can prove protected-file integrity against
+    // the pre-run state. A scoped target whose root is missing fails
+    // preflight here (zero tokens, full audit trail).
+    if (preflightError === null && contextPath !== null) {
+      try {
+        writeProtectedDigests(db, taskId, runDir, runId);
+      } catch (err) {
+        preflightError = `protected digests: ${(err as Error).message}`;
+      }
+    }
+
     if (preflightError !== null || prompt === null || contextPath === null) {
       const error = preflightError ?? "preflight failed";
       finalizeRun(db, runId, {
@@ -478,7 +492,13 @@ export async function startRun(
       try {
         process.kill(-child.pid, sig);
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+        const code = (err as NodeJS.ErrnoException).code;
+        // The kill backstops run inside timer callbacks — a non-ESRCH
+        // throw here is an uncaught daemon crash (re-judge finding; mirrors
+        // the verify runner's swallow-and-warn).
+        if (code !== "ESRCH") {
+          console.warn(`[novaflow] group kill ${sig} failed (pid ${child.pid}): ${code}`);
+        }
       }
     };
 
