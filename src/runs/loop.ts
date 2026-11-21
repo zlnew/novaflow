@@ -20,7 +20,7 @@ import {
   costUsd,
   defaultPricesPath,
   loadPricesDetailed,
-  PRICES_INERT_NOTE,
+  inertPricesNote,
   type PriceTable,
 } from "./prices.ts";
 
@@ -326,8 +326,8 @@ export async function startRun(
     const withPricesNote = (summary: string | null): string | null =>
       priceLoad.source !== "file" && effective.maxCostUsd > 0
         ? summary === null
-          ? PRICES_INERT_NOTE
-          : summary + "\n" + PRICES_INERT_NOTE
+          ? inertPricesNote(priceLoad.source)
+          : summary + "\n" + inertPricesNote(priceLoad.source)
         : summary;
 
     insertRunRow(db, {
@@ -553,8 +553,12 @@ export async function startRun(
     const stdoutClosed = new Promise<void>((r) => child.stdout!.once("close", () => r()));
 
     const outcome = await exited;
-    if (sigkillTimer !== undefined) clearTimeout(sigkillTimer); // SIGKILL backstop cleared on exit
-    if (settleReapTimer !== undefined) clearTimeout(settleReapTimer);
+    // The GROUP backstops stay armed through their grace windows: process
+    // groups outlive their leader, and a grandchild can ignore SIGTERM —
+    // clearing here (on leader exit) is exactly how a lingering grandchild
+    // escapes architecture 8.4's killpg escalation (re-judge finding).
+    // signalGroup tolerates ESRCH, so a late SIGKILL on a dead group is a
+    // no-op. The run clock stops here; the kill escalations do not.
     clearTimeout(timeoutTimer);
     if (outcome.kind !== "spawn-error") {
       // A grandchild that inherited the pipe fd can keep stdout open

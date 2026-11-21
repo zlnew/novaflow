@@ -20,7 +20,7 @@ import { createTask, ENQUEUE_TRIGGER, getTask } from "../../src/tasks.ts";
 import { composePrompt } from "../../src/runs/prompt.ts";
 import { buildRunArgv } from "../../src/runs/spawn.ts";
 import { startRun, type RunOutcome, type TaskRunRecord } from "../../src/runs/loop.ts";
-import { PRICES_INERT_NOTE } from "../../src/runs/prices.ts";
+import { inertPricesNote } from "../../src/runs/prices.ts";
 
 const STUB = join(import.meta.dirname, "..", "fixtures", "pi-stub.ts");
 const BOUND_MS = 15000;
@@ -542,10 +542,12 @@ test("run-fork-grandchild lingering: a grandchild holding the stdout pipe cannot
     const pidfile = readFileSync(s.pidfile, "utf8");
     assert.match(pidfile, /GRANDCHILD-SIGTERM/);
     await assertReaped(row.pid!);
-    // clean up the deliberately lingering grandchild
+    // The masking cleanup is gone: the grandchild ignores SIGTERM's effect
+    // and lingers 20 s. ONLY the still-armed group SIGKILL backstop can
+    // reap it — this assertion fails if the backstop is cleared on leader
+    // exit (re-judge finding 1).
     const m = pidfile.match(/GRANDCHILD (\d+)/);
     assert.ok(m, pidfile);
-    process.kill(Number(m[1]), "SIGKILL");
     await assertReaped(Number(m[1]));
   } finally {
     s.db.close();
@@ -645,7 +647,7 @@ test("missing prices.json + a budget → the run still succeeds, but records tha
     assert.equal(outcome.finalState, "validating");
     const row = runRow(s, 1);
     assert.equal(row.status, "succeeded");
-    assert.ok(row.error_summary?.includes(PRICES_INERT_NOTE), row.error_summary ?? "");
+    assert.ok(row.error_summary?.includes(inertPricesNote("missing")), row.error_summary ?? "");
     assert.equal(row.cost_usd, 0); // all-zero pricing — pricing never took the run down
   } finally {
     s.db.close();
