@@ -17,23 +17,33 @@ test("openDb creates a WAL database with foreign keys enforced", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("migrate applies migration 0001 and records filename + sha256", () => {
+test("migrate applies every migration in filename order and records filename + sha256", () => {
   const dir = mkdtempSync(join(tmpdir(), "novaflow-"));
   const db = openDb(join(dir, "state.db"));
   const applied = migrate(db);
-  assert.equal(applied, 1);
+  assert.equal(applied, 2); // 0001_init + 0002_project_phase_log
   const rows = db.prepare("SELECT filename, sha256 FROM schema_migrations").all() as Array<{
     filename: string;
     sha256: string;
   }>;
-  assert.equal(rows.length, 1);
+  assert.equal(rows.length, 2);
   assert.equal(rows[0]?.filename, "0001_init.sql");
-  const sql = readFileSync(join(MIGRATIONS_DIR, "0001_init.sql"), "utf8");
-  assert.equal(rows[0]?.sha256, createHash("sha256").update(sql).digest("hex"));
+  assert.equal(rows[1]?.filename, "0002_project_phase_log.sql");
+  for (const row of rows) {
+    const sql = readFileSync(join(MIGRATIONS_DIR, row.filename), "utf8");
+    assert.equal(row.sha256, createHash("sha256").update(sql).digest("hex"));
+  }
+  // 0001's twelve tables plus 0002's project_phase_logs
   const tables = db
     .prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='table'")
     .get()?.["n"];
-  assert.equal(tables, 12);
+  assert.equal(tables, 13);
+  // 0002 is a code-only surface: the spec DDL golden knows nothing of it
+  // (documented divergence — the parent decides whether to amend the spec)
+  const phaseLog = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='project_phase_logs'")
+    .get();
+  assert.ok(phaseLog);
   db.close();
   rmSync(dir, { recursive: true, force: true });
 });
