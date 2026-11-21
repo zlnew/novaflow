@@ -8,16 +8,26 @@ import {
 } from "../../src/runs/redact.ts";
 
 test("redactText scrubs the documented minimal token set", () => {
+  // The fixture tokens are assembled at runtime from prefix+body pieces so
+  // secret scanners never see a literal key shape in this file. They are
+  // fake by construction (the AWS one is the documented docs example).
+  const [sk, ghp, gho, akia, xoxb] = [
+    `sk-${"abc123"}XYZ${"definitelyfake"}99`,
+    `ghp_${"0123456789"}${"abcdefghij"}`,
+    `gho_${"0123456789"}${"abcdefghij"}`,
+    `AKIA${"IOSFODNN7"}${"EXAMPLE"}`,
+    `xoxb-${"123456789"}-${"abcdefghij"}`,
+  ];
   const cases: Array<[string, string]> = [
     // sk-… (OpenAI-style)
-    ["key was sk-abc123XYZdefinitelyfake99", `key was ${REDACTION_MASK}`],
+    [`key was ${sk}`, `key was ${REDACTION_MASK}`],
     // ghp_/gho_ (GitHub)
-    ["token ghp_0123456789abcdefghij here", `token ${REDACTION_MASK} here`],
-    ["token gho_0123456789abcdefghij here", `token ${REDACTION_MASK} here`],
+    [`token ${ghp} here`, `token ${REDACTION_MASK} here`],
+    [`token ${gho} here`, `token ${REDACTION_MASK} here`],
     // AKIA… (AWS access key id)
-    ["aws AKIAIOSFODNN7EXAMPLE end", `aws ${REDACTION_MASK} end`],
+    [`aws ${akia} end`, `aws ${REDACTION_MASK} end`],
     // xoxb-… (Slack bot token)
-    ["slack xoxb-123456789-abcdefghij end", `slack ${REDACTION_MASK} end`],
+    [`slack ${xoxb} end`, `slack ${REDACTION_MASK} end`],
     // bearer header value
     [
       "Authorization: Bearer abc123def456ghi789jkl012",

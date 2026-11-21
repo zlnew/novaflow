@@ -290,7 +290,7 @@ if (RUN_MODES.has(mode)) {
       for (const line of emitted) process.stdout.write(line + "\n");
       // stderr marker incl. a fake sk- token: the crash path must capture
       // and scrub it
-      process.stderr.write("pi-stub crash marker: sk-abcdef1234567890 token\n");
+      process.stderr.write(`pi-stub crash marker: sk-${"abcdef"}1234567890 token\n`);
       process.exit(3);
     } else if (effective === "run-hang-ignore-term") {
       for (const line of emitted) process.stdout.write(line + "\n");

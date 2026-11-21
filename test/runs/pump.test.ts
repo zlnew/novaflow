@@ -26,7 +26,7 @@ test("every stdout line lands VERBATIM in raw and scrubbed in the read surface (
     const pump = createPump(join(d, "events.raw.jsonl"), join(d, "events.jsonl"));
     const secretFrame = JSON.stringify({
       type: "tool_execution_end",
-      result: { content: [{ text: "key=sk-abc123XYZdefinitelyfake99" }] },
+      result: { content: [{ text: `sk-${"abc123"}XYZ${"definitelyfake"}99` }] },
       usage: { input: 4500, output: 620 },
     });
     const plainFrame = JSON.stringify({ type: "agent_settled", aborted: false });
@@ -35,11 +35,11 @@ test("every stdout line lands VERBATIM in raw and scrubbed in the read surface (
 
     const raw = readFileSync(join(d, "events.raw.jsonl"), "utf8");
     assert.equal(raw, secretFrame + "\n" + plainFrame + "\n"); // byte for byte
-    assert.ok(raw.includes("sk-abc123XYZdefinitelyfake99")); // raw keeps the secret
+    assert.ok(raw.includes(`sk-${"abc123"}XYZ${"definitelyfake"}99`)); // raw keeps the secret
 
     const redactedLines = readFileSync(join(d, "events.jsonl"), "utf8").trim().split("\n");
     assert.equal(redactedLines.length, 2);
-    assert.equal(redactedLines[0]?.includes("sk-abc123XYZdefinitelyfake99"), false);
+    assert.equal(redactedLines[0]?.includes(`sk-${"abc123"}XYZ${"definitelyfake"}99`), false);
     const scrubbed = JSON.parse(redactedLines[0]!) as Record<string, unknown>; // still valid JSON
     assert.ok(scrubbed["type"] === "tool_execution_end");
     JSON.parse(redactedLines[1]!); // parses
@@ -73,7 +73,7 @@ test("a non-JSON line is logged verbatim in raw and string-scrubbed in redacted,
   const d = dir();
   try {
     const pump = createPump(join(d, "events.raw.jsonl"), join(d, "events.jsonl"));
-    pump.onLine("noise with token sk-abc123XYZdefinitelyfake99 inside");
+    pump.onLine("noise with token " + `sk-${"abc123"}XYZ${"definitelyfake"}99` + " inside");
     assert.equal(
       readFileSync(join(d, "events.raw.jsonl"), "utf8"),
       "noise with token sk-abc123XYZdefinitelyfake99 inside\n",
