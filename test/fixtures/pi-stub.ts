@@ -25,6 +25,18 @@
  *   run-repair-ok  writes result.json ONLY when the engine-context (read via
  *                  NOVAFLOW_RUN_CONTEXT) says attempt_kind === "repair";
  *                  the first (execution) attempt behaves like run-missing
+ *   run-fork-grandchild  like run-hang, but forks a sleeping grandchild
+ *                  (inheriting this stub's stdout pipe) that records its
+ *                  own SIGTERM to the pidfile as "GRANDCHILD-SIGTERM";
+ *                  STUB_GRANDCHILD_LINGER_MS makes the grandchild linger
+ *                  after taking the signal (default 0 = exit at once)
+ *   run-hang-ignore-term  like run-hang, but its SIGTERM handler only
+ *                  records "SIGTERM-IGNORED" and keeps running — exercises
+ *                  the SIGTERM -> grace -> SIGKILL escalation
+ *   run-settle-linger  writes a valid result.json, emits the full stream
+ *                  incl. agent_settled, then lingers past the run clock
+ *                  (STUB_LINGER_MS, default 5000) without exiting on stdin
+ *                  EOF — a settled run must never be killed by its clock
  *
  * Run modes wait for the engine's `prompt` frame, then write
  * `<session-dir>/stub-receipt.json` recording the prompt message, the
@@ -38,11 +50,14 @@
 
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 
 const GET_STATE_MODES = new Set(["ok", "silent", "garbage", "wrongid"]);
 const RUN_MODES = new Set([
   "run-ok", "run-blocked", "run-missing", "run-invalid",
   "run-hang", "run-overspend", "run-crash", "run-repair-ok",
+  "run-fork-grandchild",
+  "run-hang-ignore-term", "run-settle-linger",
 ]);
 
 const mode: string | undefined = process.argv[2];
@@ -59,6 +74,15 @@ process.on("SIGTERM", () => {
   if (pidfile) appendFileSync(pidfile, "SIGTERM\n");
   process.exit(0);
 });
+
+if (mode === "run-hang-ignore-term") {
+  // ignore SIGTERM: record that it was taken, keep running — only the
+  // engine's SIGKILL backstop can end this stub
+  process.removeAllListeners("SIGTERM");
+  process.on("SIGTERM", () => {
+    if (pidfile) appendFileSync(pidfile, "SIGTERM-IGNORED\n");
+  });
+}
 
 function readStdinLines(onFrame: (frame: Record<string, unknown>) => void): void {
   let buf = "";
@@ -188,7 +212,8 @@ if (RUN_MODES.has(mode)) {
   ];
 
   const emitted: string[] =
-    effective === "run-hang" || effective === "run-crash"
+    effective === "run-hang" || effective === "run-crash" ||
+      effective === "run-fork-grandchild" || effective === "run-hang-ignore-term"
       ? [messageUpdate]
       : effective === "run-overspend"
         ? [messageUpdate, messageEnd({ input: 2_000_000, output: 1_000_000 })]
@@ -197,7 +222,7 @@ if (RUN_MODES.has(mode)) {
   const taskId = sessionDir.split("/").filter(Boolean).slice(-2, -1)[0] ?? "";
 
   function writeResult(): void {
-    if (effective === "run-ok" || effective === "run-blocked") {
+    if (effective === "run-ok" || effective === "run-blocked" || effective === "run-settle-linger") {
       const artifact = {
         schema_version: "1.0.0",
         task_id: taskId,
@@ -257,6 +282,50 @@ if (RUN_MODES.has(mode)) {
     } else if (effective === "run-crash") {
       for (const line of emitted) process.stdout.write(line + "\n");
       process.exit(3);
+    } else if (effective === "run-hang-ignore-term") {
+      for (const line of emitted) process.stdout.write(line + "\n");
+      // SIGTERM is ignored (handler above); holds for the SIGKILL backstop
+    } else if (effective === "run-fork-grandchild") {
+      for (const line of emitted) process.stdout.write(line + "\n");
+      // fork a sleeping grandchild INHERITING this stub's stdout pipe and
+      // process group: the engine's group kill must reach it, and while it
+      // lives the harness's stdout pipe stays open
+      if (pidfile) {
+        const grandchild = spawn(
+          process.execPath,
+          [
+            "-e",
+            [
+              "const fs = require('node:fs');",
+              "process.on('SIGTERM', () => {",
+              "  fs.appendFileSync(process.env.STUB_PIDFILE, 'GRANDCHILD-SIGTERM' + String.fromCharCode(10));",
+              "  const ms = Number(process.env.STUB_GRANDCHILD_LINGER_MS || 0);",
+              "  if (ms > 0) setTimeout(() => process.exit(0), ms);",
+              "  else process.exit(0);",
+              "});",
+              "setInterval(() => {}, 60000);",
+            ].join(""),
+          ],
+          {
+            stdio: ["ignore", "inherit", "inherit"],
+            env: {
+              ...process.env,
+              STUB_PIDFILE: pidfile,
+              STUB_GRANDCHILD_LINGER_MS: process.env["STUB_GRANDCHILD_LINGER_MS"] ?? "0",
+            },
+          },
+        );
+        appendFileSync(pidfile, `GRANDCHILD ${grandchild.pid}\n`);
+      }
+      // never settles; holds until the engine kills the group
+    } else if (effective === "run-settle-linger") {
+      // valid result.json on disk before the settle signal, like run-ok…
+      writeResult();
+      for (const line of emitted) process.stdout.write(line + "\n");
+      // …then linger past the run clock without exiting on stdin EOF
+      process.stdin.removeAllListeners("end");
+      const ms = Number(process.env["STUB_LINGER_MS"] ?? 5000);
+      setTimeout(() => process.exit(0), ms);
     }
   });
 }

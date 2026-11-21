@@ -53,6 +53,11 @@ export type RunOptions = {
   extensionPath?: string | undefined;
   /** Price table path; default ~/.novaflow/prices.json (data.md 4.4). */
   pricesPath?: string | undefined;
+  /**
+   * SIGTERM -> SIGKILL grace window. The spec pins 3 s (KILL_GRACE_MS);
+   * tests may inject a shorter window so the escalation is proven fast.
+   */
+  killGraceMs?: number | undefined;
 };
 
 export type TaskRunRecord = {
@@ -414,8 +419,12 @@ export async function startRun(
         systemPromptFile,
       }),
     ];
+    // detached: the child leads its own process group (architecture 8.4
+    // killpg) so a budget/timeout kill reaches pi's grandchildren (bash
+    // tools etc.).
     const child = spawn(opts.piBin ?? "pi", argv, {
       stdio: ["pipe", "pipe", "ignore"],
+      detached: true,
       env: {
         ...process.env,
         NOVAFLOW_RUN_CONTEXT: contextPath,
@@ -424,9 +433,11 @@ export async function startRun(
     });
     db.prepare("UPDATE task_runs SET pid = ? WHERE id = ?").run(child.pid ?? null, runId);
 
+    const killGraceMs = opts.killGraceMs ?? KILL_GRACE_MS;
     const pump = createPump(rawPath, redactedPath);
     let killed: "timeout" | "budget" | null = null;
     let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
+    let settleReapTimer: ReturnType<typeof setTimeout> | undefined;
 
     // Resolves when the child is fully gone — startRun never settles
     // before this, so no caller can observe a live child.
@@ -450,16 +461,35 @@ export async function startRun(
     // budget breach cost, filled in when the kill is issued
     let breachCost = 0;
 
-    const killChild = (): void => {
-      if (sigkillTimer !== undefined || child.exitCode !== null) return;
-      child.kill("SIGTERM");
-      sigkillTimer = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
+    // architecture 8.4: killpg() — signal the child's whole process
+    // group. ESRCH (group already gone) is fine on both signals.
+    const signalGroup = (sig: "SIGTERM" | "SIGKILL"): void => {
+      if (child.pid === undefined || child.pid === null) return;
+      try {
+        process.kill(-child.pid, sig);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+      }
     };
 
-    // the run clock: max_timeout_sec, profile baseline or task override
+    /**
+     * Classified kill (timeout/budget): SIGTERM the group, arm the
+     * SIGKILL backstop, and CLEAR the run clock — a budget kill must
+     * never be overwritten by the clock firing during its grace, and a
+     * second classification must never overwrite the first.
+     */
+    const killChild = (reason: "timeout" | "budget"): void => {
+      if (killed !== null || child.exitCode !== null) return;
+      killed = reason;
+      clearTimeout(timeoutTimer);
+      signalGroup("SIGTERM");
+      sigkillTimer = setTimeout(() => signalGroup("SIGKILL"), killGraceMs);
+    };
+
+    // the run clock: max_timeout_sec, profile baseline or task override.
+    // No-op when a kill is already classified (guard inside killChild).
     const timeoutTimer = setTimeout(() => {
-      killed = "timeout";
-      killChild();
+      killChild("timeout");
     }, effective.maxTimeoutSec * 1000);
 
     let buf = "";
@@ -477,13 +507,26 @@ export async function startRun(
         // vs the price table, checked on every usage-bearing frame
         const cost = costUsd(priceTable, profile.model, pump.inputTokens, pump.outputTokens);
         if (killed === null && cost > effective.maxCostUsd) {
-          killed = "budget";
           breachCost = cost;
-          killChild();
+          killChild("budget");
         }
         if (pump.settled && killed === null) {
           // graceful stream close on the completion signal (FR-TSK-05)
           child.stdin!.end();
+          // A settled run is never killed by the run clock: intake takes
+          // precedence over a lingering process. Disarm the clock and
+          // arm an UNCLASSIFIED reap instead — killed stays null, so the
+          // exit still resolves "settled" and the artifact is intaken;
+          // the group reap ends a process that refuses to die on stdin
+          // EOF.
+          clearTimeout(timeoutTimer);
+          if (settleReapTimer === undefined) {
+            settleReapTimer = setTimeout(() => {
+              if (child.exitCode !== null) return;
+              signalGroup("SIGTERM");
+              sigkillTimer = setTimeout(() => signalGroup("SIGKILL"), killGraceMs);
+            }, killGraceMs);
+          }
         }
       }
     });
@@ -501,14 +544,32 @@ export async function startRun(
 
     const outcome = await exited;
     if (sigkillTimer !== undefined) clearTimeout(sigkillTimer); // SIGKILL backstop cleared on exit
+    if (settleReapTimer !== undefined) clearTimeout(settleReapTimer);
     clearTimeout(timeoutTimer);
-    if (outcome.kind !== "spawn-error") await stdoutClosed;
+    if (outcome.kind !== "spawn-error") {
+      // A grandchild that inherited the pipe fd can keep stdout open
+      // forever — bound the wait and continue without the close event;
+      // the pump already holds every buffered byte.
+      let stdoutFallback: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        stdoutClosed,
+        new Promise<void>((resolve) => {
+          stdoutFallback = setTimeout(() => resolve(), killGraceMs);
+          stdoutFallback.unref?.();
+        }),
+      ]);
+      if (stdoutFallback !== undefined) clearTimeout(stdoutFallback);
+    }
     pump.flushPartial(buf); // a trailing partial line still belongs in the raw file
 
     const cost = costUsd(priceTable, profile.model, pump.inputTokens, pump.outputTokens);
 
     if (outcome.kind === "spawn-error" || outcome.kind === "crash") {
       // crash path: run failed with exit_code; same matrix row either way
+      // 8.4 Subprocess Crashes: capture stderr and record the failure
+      // state — one engine frame in events.jsonl (the REDACTED read
+      // surface only, never the raw file), the scrubbed tail (last ~2 KB)
+      // in the run's error_summary.
       const error =
         outcome.kind === "spawn-error"
           ? `spawn failed: ${outcome.message}`

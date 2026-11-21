@@ -455,6 +455,105 @@ test("run-overspend: budget breach → killed, run failed with budget_exceeded, 
   }
 });
 
+/* --------------------------- group kill & escalation -------------------------------- */
+
+test("run-fork-grandchild: a timeout kill signals the whole process group — the grandchild takes the SIGTERM too (killpg, architecture 8.4)", async (t) => {
+  const s = seed({ overrides: JSON.stringify({ timeout_sec: 1 }) });
+  try {
+    const outcome = await withBound(t.signal, BOUND_MS, run(s, "run-fork-grandchild"));
+    assert.equal(outcome.finalState, "failed");
+    const row = runRow(s, 1);
+    assert.equal(row.status, "timed_out");
+    const pidfile = readFileSync(s.pidfile, "utf8");
+    assert.match(pidfile, /SIGTERM/); // the direct child took it
+    assert.match(pidfile, /GRANDCHILD-SIGTERM/); // and so did the forked grandchild
+    // the grandchild was reaped too (group kill, no orphan)
+    const m = pidfile.match(/GRANDCHILD (\d+)/);
+    assert.ok(m, pidfile);
+    await assertReaped(Number(m[1]));
+    await assertReaped(row.pid!);
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+    rmSync(join(s.pidfile, ".."), { recursive: true, force: true });
+  }
+});
+
+test("run-settle-linger: a settled run is never killed by the run clock — intake wins, process reaped", async (t) => {
+  const s = seed({ overrides: JSON.stringify({ timeout_sec: 1 }) });
+  try {
+    const outcome = await withBound(t.signal, BOUND_MS, run(s, "run-settle-linger"));
+    assert.equal(outcome.finalState, "validating");
+    const row = runRow(s, 1);
+    assert.equal(row.status, "succeeded");
+    assert.ok(existsSync(row.artifact_path!));
+    assert.doesNotMatch(row.error_summary ?? "", /timeout/);
+    // the lingering process was still reaped by the time startRun resolved
+    await assertReaped(row.pid!);
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+    rmSync(join(s.pidfile, ".."), { recursive: true, force: true });
+  }
+});
+
+test("run-hang-ignore-term: SIGTERM taken and ignored → the grace backstop escalates to group SIGKILL", async (t) => {
+  const s = seed({ overrides: JSON.stringify({ timeout_sec: 1 }) });
+  try {
+    const started = Date.now();
+    const outcome = await withBound(
+      t.signal,
+      BOUND_MS,
+      run(s, "run-hang-ignore-term", { killGraceMs: 500 }),
+    );
+    const elapsed = Date.now() - started;
+    assert.equal(outcome.finalState, "failed");
+    const row = runRow(s, 1);
+    assert.equal(row.status, "timed_out");
+    // the stub records taking (and ignoring) the SIGTERM…
+    assert.match(readFileSync(s.pidfile, "utf8"), /SIGTERM-IGNORED/);
+    // …and only the SIGKILL backstop ended it, fast
+    assert.ok(elapsed < 4000, `escalation must be prompt, took ${elapsed} ms`);
+    await assertReaped(row.pid!);
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+    rmSync(join(s.pidfile, ".."), { recursive: true, force: true });
+  }
+});
+
+test("run-fork-grandchild lingering: a grandchild holding the stdout pipe cannot hang finalization", async (t) => {
+  const s = seed({ overrides: JSON.stringify({ timeout_sec: 1 }) });
+  try {
+    // the grandchild takes the group SIGTERM but lingers 20 s holding the
+    // inherited stdout pipe — the run must still finalize without the
+    // stdout close event
+    const outcome = await withBound(
+      t.signal,
+      BOUND_MS,
+      run(s, "run-fork-grandchild", {
+        killGraceMs: 500,
+        env: { STUB_GRANDCHILD_LINGER_MS: "20000" },
+      }),
+    );
+    assert.equal(outcome.finalState, "failed");
+    const row = runRow(s, 1);
+    assert.equal(row.status, "timed_out");
+    const pidfile = readFileSync(s.pidfile, "utf8");
+    assert.match(pidfile, /GRANDCHILD-SIGTERM/);
+    await assertReaped(row.pid!);
+    // clean up the deliberately lingering grandchild
+    const m = pidfile.match(/GRANDCHILD (\d+)/);
+    assert.ok(m, pidfile);
+    process.kill(Number(m[1]), "SIGKILL");
+    await assertReaped(Number(m[1]));
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+    rmSync(join(s.pidfile, ".."), { recursive: true, force: true });
+  }
+});
+
 /* -------------------------------------- crash --------------------------------------- */
 
 test("run-crash: nonzero exit before settle → run failed with exit_code, task failed", async (t) => {
