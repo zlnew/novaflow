@@ -210,7 +210,7 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
           const validation = completeValidation(
             db,
             taskId,
-            passed ? { passed } : { passed, summary },
+            passed ? { passed, summary } : { passed, summary },
             "daemon-verify",
             ...(opts.notifyOptions !== undefined ? [{ notifyOptions: opts.notifyOptions }] : []),
           );

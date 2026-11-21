@@ -253,6 +253,20 @@ function parseTargetScopesArg(
       );
     }
     const o = item as Record<string, unknown>;
+    // data.md 4.3: scope items are closed (additionalProperties false) —
+    // a typo'd field is refused, not silently dropped (re-judge finding 2).
+    const KNOWN_SCOPE_KEYS = new Set([
+      "repo_alias", "access_mode", "write_scope_globs",
+      "protected_test_globs", "verification_commands",
+    ]);
+    for (const k of Object.keys(o)) {
+      if (!KNOWN_SCOPE_KEYS.has(k)) {
+        throw new OpError(
+          "schema_invalid",
+          `args.target_scopes items carry an unknown key "${k}" — keys are closed per the scope schema`,
+        );
+      }
+    }
     const alias = reqString(o, "repo_alias");
     const accessMode = o["access_mode"];
     if (accessMode !== "read_only" && accessMode !== "read_write") {
@@ -269,6 +283,14 @@ function parseTargetScopesArg(
       .get(projectId, alias) as { id: string } | undefined;
     if (!target) {
       throw new OpError("not_found", `project has no target with repo_alias "${alias}"`);
+    }
+    if (out.some((s) => s.targetId === target.id)) {
+      // UNIQUE(task_id, target_id) inside the transaction would report a
+      // misleading "task key already exists" — refuse truthfully here first.
+      throw new OpError(
+        "duplicate",
+        `args.target_scopes carries repo_alias "${alias}" twice — one scope row per target`,
+      );
     }
     out.push({
       targetId: target.id,

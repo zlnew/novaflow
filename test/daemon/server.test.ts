@@ -383,7 +383,8 @@ test("auto-verification wiring: a settled run is verified, annotated, and comple
     assert.equal(last["from_state"], "validating");
     assert.equal(last["to_state"], "completed");
     assert.equal(last["trigger_type"], "engine");
-    assert.match(String(last["reason"]), /engine verification passed/);
+    // the built summary now reaches the audit log (re-judge polish 3)
+    assert.match(String(last["reason"]), /engine verification passed \(1 command\)/);
   } finally {
     await shutdown(env);
   }
@@ -746,12 +747,26 @@ test("nova_task_create persists overrides, target_scopes, output_schema_version;
       ["scope bad access_mode", { ...base, key: "BAD7", target_scopes: [{ repo_alias: "app", access_mode: "write" }] }],
       ["scope bad globs", { ...base, key: "BAD8", target_scopes: [{ repo_alias: "app", access_mode: "read_only", write_scope_globs: "src" }] }],
       ["scope globs not strings", { ...base, key: "BAD9", target_scopes: [{ repo_alias: "app", access_mode: "read_only", protected_test_globs: [1] }] }],
+      ["scope unknown key", { ...base, key: "BAD11", target_scopes: [{ repo_alias: "app", access_mode: "read_only", write_scope_glob: ["src"] }] }],
     ];
     for (const [label, args] of bad) {
       const res = await env.client.request({ id: `bad-${label}`, op: "nova_task_create", args });
       assert.equal(res["ok"], false, label);
       assert.equal((res["error"] as Record<string, unknown>)["code"], "schema_invalid", label);
     }
+    // duplicate repo_alias in one array -> truthful duplicate, nothing persisted
+    const dupAlias = await env.client.request({
+      id: "bad-dup-alias",
+      op: "nova_task_create",
+      args: { ...base, key: "BAD12", target_scopes: [
+        { repo_alias: "app", access_mode: "read_only" },
+        { repo_alias: "app", access_mode: "read_write" },
+      ] },
+    });
+    assert.equal(dupAlias["ok"], false);
+    assert.equal((dupAlias["error"] as Record<string, unknown>)["code"], "duplicate");
+    assert.match(String((dupAlias["error"] as Record<string, unknown>)["message"]), /twice/);
+
     // an unknown repo_alias -> not_found
     const aliasMissing = await env.client.request({
       id: "bad-alias",

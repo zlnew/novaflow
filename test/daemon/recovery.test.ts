@@ -366,11 +366,6 @@ test("guard-refusal finalize preserves the orphan's preflight_status (a 'pending
   }
 });
 
-test("suite cleanup: zero temp dirs leaked (before/after delta 0)", () => {
-  // every seed() in this suite cleans its wsRoot AND its prices dir —
-  // the leak this pins was ~6 novaflow-recp- dirs per run
-  assert.deepEqual(recTempDirs().filter((d) => !recTempDirsBefore.includes(d)), []);
-});
 
 test("recovery is idempotent: a second pass finds no orphans", () => {
   const s = seed();
@@ -384,4 +379,10 @@ test("recovery is idempotent: a second pass finds no orphans", () => {
   } finally {
     cleanup(s);
   }
+});
+
+test("suite cleanup: zero temp dirs leaked (before/after delta 0)", () => {
+  // every seed() in this suite cleans its wsRoot AND its prices dir —
+  // the leak this pins was ~6 novaflow-recp- dirs per run
+  assert.deepEqual(recTempDirs().filter((d) => !recTempDirsBefore.includes(d)), []);
 });
