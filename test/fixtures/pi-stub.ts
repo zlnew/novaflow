@@ -3,12 +3,14 @@
  * Stub pi binary for the get_state catalog-handshake tests
  * (novaflow-v1/architecture 8.1 catalog validation mechanism).
  *
- * Usage: node test/fixtures/pi-stub.ts <ok|silent|garbage> [pidfile]
+ * Usage: node test/fixtures/pi-stub.ts <ok|silent|garbage|wrongid> [pidfile]
  *
  * Reads one JSONL frame from stdin; on a get_state command:
- *   - ok      writes a valid response frame (api.md §4 shape) to stdout
- *   - silent  never responds (exercises the 5 s timeout path)
- *   - garbage writes a non-JSON line (exercises the parse-failure path)
+ *   - ok       writes a valid response frame (api.md §4 shape) to stdout
+ *   - silent   never responds (exercises the 5 s timeout path)
+ *   - garbage  writes a non-JSON line (exercises the parse-failure path)
+ *   - wrongid  writes a success response frame whose echoed id is bogus
+ *              (exercises the command-id correlation path)
  *
  * The stub exits on stdin EOF. When a pidfile path is given it records its
  * pid on start and appends "SIGTERM" when it takes a SIGTERM, so tests can
@@ -20,7 +22,7 @@ import { appendFileSync, writeFileSync } from "node:fs";
 const mode: string | undefined = process.argv[2];
 const pidfile: string | undefined = process.argv[3];
 
-if (mode !== "ok" && mode !== "silent" && mode !== "garbage") {
+if (mode !== "ok" && mode !== "silent" && mode !== "garbage" && mode !== "wrongid") {
   process.stderr.write(`pi-stub: unknown mode ${String(mode)}\n`);
   process.exit(2);
 }
@@ -61,6 +63,17 @@ process.stdin.on("data", (chunk: string) => {
       );
     } else if (mode === "garbage") {
       process.stdout.write("this is not json\n");
+    } else if (mode === "wrongid") {
+      // a response frame whose echoed id does not match the sent command
+      process.stdout.write(
+        JSON.stringify({
+          type: "response",
+          command: "get_state",
+          id: "cmd_bogus",
+          success: true,
+          data: {},
+        }) + "\n",
+      );
     }
     // silent: never respond
   }

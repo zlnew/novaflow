@@ -142,6 +142,27 @@ test("garbage: a non-JSON stdout line → profile_unresolved", async (t) => {
   }
 });
 
+test("a response frame with a mismatched echoed id → profile_unresolved (correlation)", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-catalog-"));
+  try {
+    const pidfile = join(dir, "stub.pid");
+    const result = await withBound(
+      t.signal,
+      BOUND_MS,
+      probeCatalog(IDENTITY, {
+        piBin: "node",
+        args: [STUB, "wrongid", pidfile],
+        timeoutMs: 5000,
+      }),
+    );
+    unresolved(result);
+    assert.match(result.reason, /id mismatch/);
+    await assertReaped(readPid(pidfile));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a non-response frame on stdout → profile_unresolved", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "novaflow-catalog-"));
   try {

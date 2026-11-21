@@ -150,13 +150,21 @@ export function probeCatalog(
           fail(`non-JSON line from pi stdout: ${JSON.stringify(line.slice(0, 120))}`);
           return;
         }
-        const f = frame as { type?: unknown; success?: unknown; data?: unknown };
+        const f = frame as { type?: unknown; success?: unknown; id?: unknown; data?: unknown };
         if (f.type !== "response") {
           fail(`frame is not a response frame (type=${JSON.stringify(f.type)})`);
           return;
         }
         if (f.success !== true) {
           fail(`error frame from pi (success=${JSON.stringify(f.success)})`);
+          return;
+        }
+        // Error frames carry no echoed id (api.md: only response frames echo
+        // it) — correlate only on the success path.
+        if (f.id !== commandId) {
+          fail(
+            `response frame id mismatch: sent ${JSON.stringify(commandId)}, got ${JSON.stringify(f.id)}`,
+          );
           return;
         }
         teardown({ ok: true, data: f.data });
