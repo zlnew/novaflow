@@ -27,8 +27,13 @@ export function defaultPricesPath(): string {
   return join(homedir(), ".novaflow", "prices.json");
 }
 
-/** One-line finalization note when the cost breaker is running inert. */
-export const PRICES_INERT_NOTE = "prices.json missing — cost budget enforcement inert";
+/** One-line finalization note when the cost breaker is running inert —
+ *  derived from the actual failure source so an operator with a CORRUPT
+ *  prices.json is not told the file is missing (re-judge finding 2). */
+export function inertPricesNote(source: PricesSource): string {
+  const why = source === "missing" ? "missing" : "unparseable";
+  return `prices.json ${why} — cost budget enforcement inert`;
+}
 
 export type PricesSource = "file" | "missing" | "invalid";
 
