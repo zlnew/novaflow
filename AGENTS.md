@@ -5,7 +5,7 @@ Contract for this repo. Short on purpose. Anything that can rot belongs in a com
 ## Commands
 
 ```bash
-# run everything (19 tests, spec-pinned golden suite)
+# run everything (spec-pinned golden suite)
 npm test
 # typecheck (tsc --noEmit; no emit step in v1 — runtime is tsx)
 npm run typecheck

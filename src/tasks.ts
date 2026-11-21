@@ -1,6 +1,6 @@
 import type { Db } from "./store/db.ts";
 import { ulid } from "./store/ids.ts";
-import { applyTransition } from "./fsm/engine.ts";
+import { applyTransition, canTransition, InvalidTransitionError } from "./fsm/engine.ts";
 import { ROWS } from "./fsm/matrix.ts";
 import { ProfileValidationError, validateProfile } from "./profiles.ts";
 import {
@@ -84,6 +84,9 @@ export type EnqueueOptions = {
   args?: string[] | undefined;
   /** Response-frame deadline for the catalog probe. */
   timeoutMs?: number | undefined;
+  /** Surface issuing the enqueue: `human` (CLI) or `mcp` (nova_task_run) —
+   *  the two surfaces the 8.1 trigger names. Logged per the DDL CHECK. */
+  triggerType?: "human" | "mcp" | undefined;
 };
 
 export function getTask(db: Db, taskId: string): TaskRow | undefined {
@@ -151,6 +154,12 @@ export async function enqueueTask(
   const task = getTask(db, taskId);
   if (!task) throw new Error(`no such task: ${taskId}`);
 
+  // Matrix guard first: never spend a catalog probe on a task the FSM will
+  // refuse anyway (review round finding — draft is the only legal source).
+  if (!canTransition(task.state, ENQUEUE_TRIGGER)) {
+    throw new InvalidTransitionError(task.state, ENQUEUE_TRIGGER);
+  }
+
   const profileRow = db
     .prepare("SELECT * FROM agent_profiles WHERE id = ?")
     .get(task.profile_id) as ProfileRow | undefined;
@@ -201,6 +210,9 @@ export async function enqueueTask(
     throw new ProfileUnresolvedError(probe.reason);
   }
 
-  applyTransition(db, taskId, ENQUEUE_TRIGGER, { triggerType: "human", actor });
+  applyTransition(db, taskId, ENQUEUE_TRIGGER, {
+    triggerType: opts.triggerType ?? "human",
+    actor,
+  });
   return getTaskOrThrow(db, taskId);
 }
