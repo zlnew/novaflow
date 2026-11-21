@@ -27,6 +27,22 @@ export function extractDdl(): string {
   return m[1].trimEnd() + "\n";
 }
 
+/** The §4.1 TaskHandoffArtifact JSON Schema block, parsed live from data.md. */
+export function extractResultSchema(): Record<string, unknown> {
+  const text = specFile("data.md");
+  const start = text.indexOf(
+    "### 4.1 Task Handoff Artifact Schema (result.json)",
+  );
+  if (start < 0) {
+    throw new Error("result schema section (§4.1) not found in data.md");
+  }
+  const m = text.slice(start).match(/```json\n([\s\S]*?)```/);
+  if (!m || !m[1]) {
+    throw new Error("no ```json block found in data.md §4.1");
+  }
+  return JSON.parse(m[1]) as Record<string, unknown>;
+}
+
 /** The §4.2 profile.json JSON Schema block, parsed live from data.md. */
 export function extractProfileSchema(): Record<string, unknown> {
   const text = specFile("data.md");
