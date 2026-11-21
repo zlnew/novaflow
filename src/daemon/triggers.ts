@@ -1,5 +1,6 @@
 import { ROWS, type CanonicalState, type MatrixRow } from "../fsm/matrix.ts";
 import { ESCALATE_FAILED_TRIGGER } from "../fsm/triggers.ts";
+import { ABORT_TRIGGER } from "../runs/triggers.ts";
 
 /**
  * The daemon's verbatim 8.1 trigger constants (novaflow-v1/architecture
@@ -69,8 +70,11 @@ export const OPERATOR_RETRY_TRIGGER: string = soleTriggerWhere(
  */
 export const FAILED_ESCALATION_TRIGGER: string = ESCALATE_FAILED_TRIGGER;
 
-/** running → cancelled: the operator-abort row (SIGTERM → SIGKILL). */
-export const RUNNING_ABORT_TRIGGER: string = soleTrigger("running", "cancelled");
+/**
+ * running → cancelled: the operator-abort row — the SAME constant the run
+ * loop applies on an abort-classified exit (src/runs/triggers.ts, one source).
+ */
+export const RUNNING_ABORT_TRIGGER: string = ABORT_TRIGGER;
 
 const ABORTABLE_STATES: readonly CanonicalState[] = [
   "queued",

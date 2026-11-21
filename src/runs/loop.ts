@@ -8,6 +8,7 @@ import {
   START_TRIGGER,
   REPAIR_TRIGGER,
   RUN_FAILED_TRIGGER,
+  ABORT_TRIGGER,
 } from "./triggers.ts";
 import { finalizeRunRecord, intakeSettledRun } from "./settle-replay.ts";
 import { buildEngineContext, writeEngineContext } from "./context.ts";
@@ -43,6 +44,26 @@ import {
 /** SIGTERM grace before the SIGKILL backstop — the spec's only named escalation. */
 export const KILL_GRACE_MS = 3000;
 
+/**
+ * The daemon's handle on one live attempt (the abort/steer ops).
+ * The daemon marks `abortRequested` BEFORE performing the group kill
+ * (SIGTERM → grace → SIGKILL); the loop then classifies the exit as an
+ * operator abort and owns BOTH the run record ('cancelled') and the
+ * running→cancelled matrix row — every write stays on the guarded path,
+ * the op itself performs no state write. While the child is live the
+ * loop installs `steer` so the daemon can forward api.md §3 frames
+ * (e.g. the `steer` command) to the child's stdin; cleared on exit.
+ */
+export type RunControl = {
+  abortRequested: boolean;
+  /** trigger_type recorded on the operator-abort transition (default human). */
+  abortTriggerType?: "human" | "mcp" | undefined;
+  /** actor recorded on the operator-abort transition (default "operator"). */
+  abortActor?: string | undefined;
+  /** Installed by the loop while the child is live; null otherwise. */
+  steer: ((frame: string) => void) | null;
+};
+
 export type RunOptions = {
   /** Pi binary; default "pi". Tests point this at the stub. */
   piBin?: string | undefined;
@@ -59,6 +80,8 @@ export type RunOptions = {
    * tests may inject a shorter window so the escalation is proven fast.
    */
   killGraceMs?: number | undefined;
+  /** The daemon's abort/steer handle on the live attempt (optional). */
+  control?: RunControl | undefined;
 };
 
 export type TaskRunRecord = {
@@ -221,6 +244,7 @@ type RawOutcome =
   | { kind: "spawn-error"; message: string }
   | { kind: "timeout"; code: number | null }
   | { kind: "budget"; code: number | null }
+  | { kind: "abort"; code: number | null }
   | { kind: "crash"; code: number | null }
   | { kind: "settled"; code: number | null };
 
@@ -411,6 +435,14 @@ export async function startRun(
     });
     db.prepare("UPDATE task_runs SET pid = ? WHERE id = ?").run(child.pid ?? null, runId);
 
+    // the daemon's steer op writes LF-framed api.md §3 frames through this
+    // sink while the child is live; cleared on exit
+    if (opts.control !== undefined) {
+      opts.control.steer = (frame: string): void => {
+        child.stdin!.write(frame + "\n");
+      };
+    }
+
     const killGraceMs = opts.killGraceMs ?? KILL_GRACE_MS;
     const pump = createPump(rawPath, redactedPath);
     let killed: "timeout" | "budget" | null = null;
@@ -421,18 +453,23 @@ export async function startRun(
     // before this, so no caller can observe a live child.
     const exited = new Promise<RawOutcome>((resolve) => {
       let done = false;
-      child.once("exit", (code, signal) => {
+      const finish = (outcome: RawOutcome): void => {
         if (done) return;
         done = true;
-        if (killed === "timeout") resolve({ kind: "timeout", code });
-        else if (killed === "budget") resolve({ kind: "budget", code });
-        else if (!pump.settled) resolve({ kind: "crash", code });
-        else resolve({ kind: "settled", code });
+        if (opts.control !== undefined) opts.control.steer = null;
+        resolve(outcome);
+      };
+      child.once("exit", (code) => {
+        if (killed === "timeout") finish({ kind: "timeout", code });
+        else if (killed === "budget") finish({ kind: "budget", code });
+        // the daemon marked the abort before its group kill — operator
+        // intent is terminal and outranks a settle that was not yet intaken
+        else if (opts.control?.abortRequested === true) finish({ kind: "abort", code });
+        else if (!pump.settled) finish({ kind: "crash", code });
+        else finish({ kind: "settled", code });
       });
       child.once("error", (err) => {
-        if (done) return;
-        done = true;
-        resolve({ kind: "spawn-error", message: err.message });
+        finish({ kind: "spawn-error", message: err.message });
       });
     });
 
@@ -621,6 +658,32 @@ export async function startRun(
       applyTransition(db, taskId, RUN_FAILED_TRIGGER, {
         triggerType: timedOut ? "timeout" : "engine",
         actor,
+        runId,
+        reason: error,
+      });
+      break;
+    }
+
+    // ---- operator abort: the daemon marked the run and performed the
+    // group kill (abort_bash -> SIGTERM -> 3 s grace -> SIGKILL); the
+    // loop owns the run record AND the running→cancelled row, so every
+    // write stays on the guarded path ----
+    if (outcome.kind === "abort") {
+      const error = "operator abort (abort_bash -> SIGTERM -> SIGKILL)";
+      finalizeRunRecord(db, runId, {
+        status: "cancelled",
+        preflightStatus: "passed",
+        inputTokens: pump.inputTokens,
+        outputTokens: pump.outputTokens,
+        costUsd: cost,
+        exitCode: outcome.code,
+        artifactPath: null,
+        errorSummary: withPricesNote(error),
+        startedWall,
+      });
+      applyTransition(db, taskId, ABORT_TRIGGER, {
+        triggerType: opts.control?.abortTriggerType ?? "human",
+        actor: opts.control?.abortActor ?? "operator",
         runId,
         reason: error,
       });

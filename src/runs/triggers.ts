@@ -30,3 +30,6 @@ export const REPAIR_TRIGGER: string = soleTrigger("running", "running");
 
 /** running → failed: subprocess error, invalid JSON, budget or timeout kill. */
 export const RUN_FAILED_TRIGGER: string = soleTrigger("running", "failed");
+
+/** running → cancelled: the operator-abort row (abort_bash -> SIGTERM -> SIGKILL). */
+export const ABORT_TRIGGER: string = soleTrigger("running", "cancelled");
