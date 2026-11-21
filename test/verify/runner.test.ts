@@ -127,6 +127,34 @@ test("collectScopeCommands: union across scopes, first-seen order, each command 
   }
 });
 
+test("malformed verification_commands_json → FAILED command-set verdict, never a throw", async (t) => {
+  const s = seed();
+  try {
+    const targetId = ulid();
+    s.db
+      .prepare(
+        "INSERT INTO project_targets (id, project_id, alias, target_type, root_path) VALUES (?, ?, 'app', 'git_repo', '/repo/app')",
+      )
+      .run(targetId, s.projectId);
+    s.db
+      .prepare(
+        `INSERT INTO task_target_scopes
+           (id, task_id, target_id, verification_commands_json,
+            protected_test_globs_json, write_scope_globs_json)
+         VALUES (?, ?, ?, '{oops', '[]', '["**/*"]')`,
+      )
+      .run(ulid(), s.taskId, targetId);
+    // previously this rejected out of runVerification; it must resolve
+    const out = await withBound(t.signal, BOUND_MS, runVerification(s.db, s.taskId));
+    assert.equal(out.passed, false);
+    assert.deepEqual(out.results, []);
+    assert.match(out.collectionError ?? "", /JSON|verification_commands_json/);
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+  }
+});
+
 /* --------------------------------- verdict rules --------------------------------- */
 
 test("exit 0, no marker → exit-code-only pass", async (t) => {
@@ -234,7 +262,7 @@ test("no configured verification commands → vacuous pass with empty results", 
   const s = seed();
   try {
     const out = await withBound(t.signal, BOUND_MS, runVerification(s.db, s.taskId));
-    const vacuous: VerifyOutcome = { passed: true, results: [] };
+    const vacuous: VerifyOutcome = { passed: true, collectionError: null, results: [] };
     assert.deepEqual(out, vacuous);
   } finally {
     s.db.close();

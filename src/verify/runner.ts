@@ -260,6 +260,13 @@ export type CommandResult = {
 export type VerifyOutcome = {
   /** ALL commands passed. No commands configured → vacuous pass. */
   passed: boolean;
+  /**
+   * Non-null when the command set itself could not be collected
+   * (malformed `verification_commands_json` in a task_target_scopes
+   * row): a FAILED verdict with no per-command results — collecting
+   * the command set is part of verification and must never throw.
+   */
+  collectionError: string | null;
   results: CommandResult[];
 };
 
@@ -302,11 +309,18 @@ export async function runVerification(
   taskId: string,
   opts: VerifyOptions = {},
 ): Promise<VerifyOutcome> {
-  const commands = collectScopeCommands(db, taskId);
+  let commands: ScopeCommand[];
+  try {
+    commands = collectScopeCommands(db, taskId);
+  } catch (err) {
+    // a malformed command-set definition is a FAILED verdict — the
+    // verifier's "never throws" contract starts at collection
+    return { passed: false, collectionError: (err as Error).message, results: [] };
+  }
   const results: CommandResult[] = [];
   for (const c of commands) {
     const res = await runGroupedCommand(["/bin/sh", "-c", c.command], c.rootPath, opts);
     results.push(judge(c.command, c.rootPath, res));
   }
-  return { passed: results.every((r) => r.passed), results };
+  return { passed: results.every((r) => r.passed), collectionError: null, results };
 }
