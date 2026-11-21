@@ -27,19 +27,33 @@ export function defaultPricesPath(): string {
   return join(homedir(), ".novaflow", "prices.json");
 }
 
+/** One-line finalization note when the cost breaker is running inert. */
+export const PRICES_INERT_NOTE = "prices.json missing — cost budget enforcement inert";
+
+export type PricesSource = "file" | "missing" | "invalid";
+
+export type PricesLoad = {
+  table: PriceTable;
+  /** "file": a parseable prices.json; "missing"/"invalid": enforcement inert. */
+  source: PricesSource;
+};
+
 /**
- * Load the price table. Missing or unparseable → `{}` (all-zero
- * pricing), never a crash.
+ * Load the price table plus whether it actually came from a usable
+ * file — a missing or unparseable table silently disables the
+ * max_cost_usd breaker, and the run record must say so (never a crash).
  */
-export function loadPrices(path: string = defaultPricesPath()): PriceTable {
-  if (!existsSync(path)) return {};
+export function loadPricesDetailed(path: string = defaultPricesPath()): PricesLoad {
+  if (!existsSync(path)) return { table: {}, source: "missing" };
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    return {};
+    return { table: {}, source: "invalid" };
   }
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { table: {}, source: "invalid" };
+  }
   const out: PriceTable = {};
   for (const [model, entry] of Object.entries(raw as Record<string, unknown>)) {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
@@ -49,7 +63,15 @@ export function loadPrices(path: string = defaultPricesPath()): PriceTable {
     if (e["input"] < 0 || e["output"] < 0) continue;
     out[model] = { input: e["input"], output: e["output"] };
   }
-  return out;
+  return { table: out, source: "file" };
+}
+
+/**
+ * Load the price table. Missing or unparseable → `{}` (all-zero
+ * pricing), never a crash.
+ */
+export function loadPrices(path: string = defaultPricesPath()): PriceTable {
+  return loadPricesDetailed(path).table;
 }
 
 /**

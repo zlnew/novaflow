@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import {
   loadPrices,
+  loadPricesDetailed,
   costUsd,
   defaultPricesPath,
   type PriceTable,
@@ -51,6 +52,20 @@ test("an unparseable prices.json is also all-zero pricing, never a crash", () =>
     const p = join(dir, "prices.json");
     writeFileSync(p, "{not json");
     assert.deepEqual(loadPrices(p), {});
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadPricesDetailed reports whether the price table source was usable", () => {
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-prices-"));
+  try {
+    const good = pricesFixture(dir, { "m": { input: 1, output: 2 } });
+    assert.deepEqual(loadPricesDetailed(good), { table: { "m": { input: 1, output: 2 } }, source: "file" });
+    assert.equal(loadPricesDetailed(join(dir, "missing.json")).source, "missing");
+    const bad = join(dir, "bad.json");
+    writeFileSync(bad, "{not json");
+    assert.deepEqual(loadPricesDetailed(bad), { table: {}, source: "invalid" });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -15,7 +15,13 @@ import { composePrompt, type ComposedPrompt } from "./prompt.ts";
 import { buildRunArgv, defaultExtensionPath, runDirPath } from "./spawn.ts";
 import { createPump } from "./pump.ts";
 import { readArtifactFile } from "./artifact.ts";
-import { costUsd, defaultPricesPath, loadPrices, type PriceTable } from "./prices.ts";
+import {
+  costUsd,
+  defaultPricesPath,
+  loadPricesDetailed,
+  PRICES_INERT_NOTE,
+  type PriceTable,
+} from "./prices.ts";
 
 /**
  * startRun — the daemon's call after a concurrency slot is granted
@@ -277,7 +283,8 @@ export async function startRun(
     throw new InvalidTransitionError(task.state, START_TRIGGER);
   }
 
-  const priceTable: PriceTable = loadPrices(opts.pricesPath ?? defaultPricesPath());
+  const priceLoad = loadPricesDetailed(opts.pricesPath ?? defaultPricesPath());
+  const priceTable: PriceTable = priceLoad.table;
   const extensionPath = opts.extensionPath ?? defaultExtensionPath();
 
   // queued → running: the verbatim 8.1 scheduler-slot row.
@@ -306,6 +313,16 @@ export async function startRun(
           maxCostUsd: profile.max_cost_usd,
           thinkingLevel: profile.thinking_level,
         };
+
+    // A missing/unparseable prices.json silently disables the
+    // max_cost_usd breaker (never-crash rule) - when the task HAS a
+    // budget, the run record must say so instead of staying silent.
+    const withPricesNote = (summary: string | null): string | null =>
+      priceLoad.source !== "file" && effective.maxCostUsd > 0
+        ? summary === null
+          ? PRICES_INERT_NOTE
+          : summary + "\n" + PRICES_INERT_NOTE
+        : summary;
 
     insertRunRow(db, {
       id: runId,
@@ -370,7 +387,7 @@ export async function startRun(
         costUsd: 0,
         exitCode: null,
         artifactPath: null,
-        errorSummary: `preflight failure: ${error}`,
+        errorSummary: withPricesNote(`preflight failure: ${error}`),
         startedWall,
       });
       applyTransition(db, taskId, RUN_FAILED_TRIGGER, {
@@ -504,7 +521,7 @@ export async function startRun(
         costUsd: cost,
         exitCode: outcome.kind === "spawn-error" ? null : outcome.code,
         artifactPath: null,
-        errorSummary: error,
+        errorSummary: withPricesNote(error),
         startedWall,
       });
       applyTransition(db, taskId, RUN_FAILED_TRIGGER, {
@@ -530,7 +547,7 @@ export async function startRun(
         costUsd: cost,
         exitCode: outcome.code,
         artifactPath: null,
-        errorSummary: error,
+        errorSummary: withPricesNote(error),
         startedWall,
       });
       applyTransition(db, taskId, RUN_FAILED_TRIGGER, {
@@ -560,7 +577,7 @@ export async function startRun(
         costUsd: cost,
         exitCode: outcome.code,
         artifactPath,
-        errorSummary: null,
+        errorSummary: withPricesNote(null),
         startedWall,
       });
       const plan = planSettleTransition(
@@ -589,7 +606,7 @@ export async function startRun(
       costUsd: cost,
       exitCode: outcome.code,
       artifactPath: null,
-      errorSummary: error,
+      errorSummary: withPricesNote(error),
       startedWall,
     });
 

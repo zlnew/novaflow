@@ -20,6 +20,7 @@ import { createTask, ENQUEUE_TRIGGER, getTask } from "../../src/tasks.ts";
 import { composePrompt } from "../../src/runs/prompt.ts";
 import { buildRunArgv } from "../../src/runs/spawn.ts";
 import { startRun, type RunOutcome, type TaskRunRecord } from "../../src/runs/loop.ts";
+import { PRICES_INERT_NOTE } from "../../src/runs/prices.ts";
 
 const STUB = join(import.meta.dirname, "..", "fixtures", "pi-stub.ts");
 const BOUND_MS = 15000;
@@ -492,6 +493,45 @@ test("unspawnable pi binary → run failed, exit_code null, task failed", async 
     assert.equal(row.status, "failed");
     assert.equal(row.exit_code, null);
     assert.match(row.error_summary ?? "", /spawn failed/);
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+    rmSync(join(s.pidfile, ".."), { recursive: true, force: true });
+  }
+});
+
+/* --------------------------------- prices absence ----------------------------------- */
+
+test("missing prices.json + a budget → the run still succeeds, but records that cost enforcement is inert", async (t) => {
+  const s = seed();
+  try {
+    const outcome = await withBound(
+      t.signal,
+      BOUND_MS,
+      run(s, "run-ok", { pricesPath: join(s.pidfile, "..", "no-such-prices.json") }),
+    );
+    assert.equal(outcome.finalState, "validating");
+    const row = runRow(s, 1);
+    assert.equal(row.status, "succeeded");
+    assert.ok(row.error_summary?.includes(PRICES_INERT_NOTE), row.error_summary ?? "");
+    assert.equal(row.cost_usd, 0); // all-zero pricing — pricing never took the run down
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+    rmSync(join(s.pidfile, ".."), { recursive: true, force: true });
+  }
+});
+
+test("a priced run with prices.json present → no inert note, error_summary stays null", async (t) => {
+  const s = seed();
+  try {
+    const outcome = await withBound(t.signal, BOUND_MS, run(s, "run-ok"));
+    assert.equal(outcome.finalState, "validating");
+    const row = runRow(s, 1);
+    assert.equal(row.status, "succeeded");
+    assert.equal(row.error_summary, null);
+    // and the cost math is live (4500/1M × $3 + 620/1M × $15)
+    assert.ok(Math.abs(row.cost_usd - 0.0228) < 1e-9);
   } finally {
     s.db.close();
     rmSync(s.wsRoot, { recursive: true, force: true });
