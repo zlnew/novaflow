@@ -112,12 +112,7 @@ export function createRetryEvaluator(db: Db, opts: RetryOptions) {
    * operator's terminal decision, never resurrected.
    */
   function lastFailedEntryFrom(taskId: string): string | null {
-    const row = db
-      .prepare(
-        "SELECT from_state FROM state_transition_logs WHERE task_id = ? AND to_state = 'failed' ORDER BY created_at DESC, id DESC LIMIT 1",
-      )
-      .get(taskId) as { from_state: string } | undefined;
-    return row?.from_state ?? null;
+    return lastFailedEntryFromDb(db, taskId);
   }
 
   function clearTimer(taskId: string): void {
@@ -237,7 +232,7 @@ export function createRetryEvaluator(db: Db, opts: RetryOptions) {
     return { kind: "requeued", finalState: "queued" };
   }
 
-  /** Clear an armed timer when another surface moved the task. */
+/** Clear an armed timer when another surface moved the task. */
   function clearFor(taskId: string): void {
     clearTimer(taskId);
   }
@@ -256,6 +251,34 @@ export function createRetryEvaluator(db: Db, opts: RetryOptions) {
   }
 
   return { evaluate, operatorRetry, clearFor, bootScan, stop };
+}
+
+/**
+ * The last failed-entry's source state, standalone (the query behind the
+ * terminal-gate discriminator - shared by the retry evaluator above and
+ * the chain terminal rules via isTerminalGateFailure; one query, one rule).
+ */
+function lastFailedEntryFromDb(db: Db, taskId: string): string | null {
+  const row = db
+    .prepare(
+      "SELECT from_state FROM state_transition_logs WHERE task_id = ? AND to_state = 'failed' ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .get(taskId) as { from_state: string } | undefined;
+  return row?.from_state ?? null;
+}
+
+/**
+ * The TERMINAL-GATE DISCRIMINATOR (exported - the chain terminal rules'
+ * one source): true when the task's most recent entry into failed came
+ * from awaiting_gate - the matrix's ONLY awaiting_gate->failed row is the
+ * verbatim "operator confirms failure (terminal gate outcome)" row. The
+ * chain run rules (data.md chain_runs lifecycle) fail a chain exactly
+ * when a member is CONFIRMED failed this way; every other failed entry
+ * (validating->failed, running->failed) still has its retry/escalation
+ * path ahead and does NOT fail the chain.
+ */
+export function isTerminalGateFailure(db: Db, taskId: string): boolean {
+  return lastFailedEntryFromDb(db, taskId) === "awaiting_gate";
 }
 
 export type RetryEvaluator = ReturnType<typeof createRetryEvaluator>;
