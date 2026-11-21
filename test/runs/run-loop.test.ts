@@ -611,7 +611,7 @@ test("run-crash-stderr: the crash path captures stderr into error_summary and ev
   }
 });
 
-test("unspawnable pi binary → run failed, exit_code null, task failed", async (t) => {
+test("unspawnable pi binary → AC3 preflight failure (DEBT-002), exit_code null, task failed, zero spawns", async (t) => {
   const s = seed();
   try {
     const outcome = await withBound(
@@ -626,7 +626,11 @@ test("unspawnable pi binary → run failed, exit_code null, task failed", async 
     const row = runRow(s, 1);
     assert.equal(row.status, "failed");
     assert.equal(row.exit_code, null);
-    assert.match(row.error_summary ?? "", /spawn failed/);
+    // FR-TSK-10 AC3 (DEBT-002): an unresolvable pi binary is now caught
+    // at PREFLIGHT — zero tokens, never a spawn attempt
+    assert.equal(row.preflight_status, "failed");
+    assert.match(row.error_summary ?? "", /pi binary "\/no\/such\/pi-binary" is not executable/);
+    assert.equal(existsSync(s.pidfile), false);
   } finally {
     s.db.close();
     rmSync(s.wsRoot, { recursive: true, force: true });

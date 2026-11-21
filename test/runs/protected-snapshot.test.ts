@@ -189,6 +189,14 @@ test("a scoped git_repo target with >20k files inside node_modules/ passes prefl
   mkdirSync(join(tgtRoot, "tests"), { recursive: true });
   writeFileSync(join(tgtRoot, "tests", "p.test.ts"), "test('p', () => {});\n");
   writeFileSync(join(tgtRoot, "readme.md"), "# readme\n");
+  // a real, CLEAN git repo (FR-TSK-10 AC2 checks `git status --porcelain`
+  // at preflight): node_modules is gitignored, so the base stays clean
+  // while the digest walk still prunes it by name.
+  writeFileSync(join(tgtRoot, ".gitignore"), "node_modules/\n");
+  execSync(
+    `git init -q && git config user.email t@example.com && git config user.name t && git add -A && git commit -q -m init`,
+    { cwd: tgtRoot, stdio: "ignore" },
+  );
   // a fat node_modules: 21 000 files, beyond the walk's safety bound —
   // digest-invariant, pruned from every walk
   execSync(`bash -c "mkdir -p node_modules && touch node_modules/f{1..21000}"`, {
@@ -211,6 +219,7 @@ test("a scoped git_repo target with >20k files inside node_modules/ passes prefl
       targets: Array<{ files: Record<string, string> }>;
     };
     assert.deepEqual(Object.keys(snap.targets[0]?.files ?? {}).sort(), [
+      ".gitignore", // the fixture's clean-base marker (AC2)
       "readme.md",
       "tests/p.test.ts",
     ]);

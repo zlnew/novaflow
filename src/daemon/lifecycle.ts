@@ -136,6 +136,9 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       ...(opts.extensionPath !== undefined ? { extensionPath: opts.extensionPath } : {}),
       ...(opts.pricesPath !== undefined ? { pricesPath: opts.pricesPath } : {}),
       ...(opts.killGraceMs !== undefined ? { killGraceMs: opts.killGraceMs } : {}),
+      // FR-TSK-10 AC4: the daemon's global budgets apply when a
+      // workspace defines none (documented precedence)
+      globalBudgets: daemonConfig.budgets,
     };
 
     const startedAt = Date.now();

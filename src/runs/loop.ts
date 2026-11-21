@@ -18,6 +18,13 @@ import { buildRunArgv, defaultExtensionPath, runDirPath } from "./spawn.ts";
 import { createPump } from "./pump.ts";
 import { redactText } from "./redact.ts";
 import {
+  checkBudgetCeiling,
+  checkPiBinary,
+  checkRequiredEnvVars,
+  checkTargetScopes,
+  type GlobalBudgets,
+} from "./preflight.ts";
+import {
   costUsd,
   defaultPricesPath,
   loadPricesDetailed,
@@ -82,6 +89,11 @@ export type RunOptions = {
   killGraceMs?: number | undefined;
   /** The daemon's abort/steer handle on the live attempt (optional). */
   control?: RunControl | undefined;
+  /**
+   * The daemon config's global budgets (FR-TSK-10 AC4): they apply
+   * when the task's workspace defines none (documented precedence).
+   */
+  globalBudgets?: GlobalBudgets | undefined;
 };
 
 export type TaskRunRecord = {
@@ -128,6 +140,7 @@ type TaskJoinRow = {
   output_schema_version: string;
   overrides_json: string | null;
   context_files_json: string;
+  workspace_id: string;
   workspace_root: string;
 };
 
@@ -258,7 +271,7 @@ export async function startRun(
     .prepare(
       `SELECT t.id, t.objective, t.profile_id, t.state, t.requires_human_gate,
               t.output_schema_version, t.overrides_json, t.context_files_json,
-              w.root_path AS workspace_root
+              w.id AS workspace_id, w.root_path AS workspace_root
          FROM tasks t
          JOIN projects p ON p.id = t.project_id
          JOIN workspaces w ON w.id = p.workspace_id
@@ -382,6 +395,26 @@ export async function startRun(
       } catch (err) {
         preflightError = `protected digests: ${(err as Error).message}`;
       }
+    }
+
+    // ---- DEBT-002 closure (FR-TSK-10): zero-token readiness checks,
+    // all local, all before any spawn (AC5 holds for every failure) ----
+    if (preflightError === null) {
+      preflightError = checkTargetScopes(db, taskId); // AC1 roots + AC2 git
+    }
+    if (preflightError === null) {
+      preflightError = checkPiBinary(opts.piBin ?? "pi"); // AC3 tool dep
+    }
+    if (preflightError === null) {
+      preflightError = checkRequiredEnvVars(); // AC3 env hook (empty set in v1)
+    }
+    if (preflightError === null) {
+      preflightError = checkBudgetCeiling(db, {
+        // AC4 ceiling
+        workspaceId: task.workspace_id,
+        workspaceRoot: task.workspace_root,
+        ...(opts.globalBudgets !== undefined ? { globalBudgets: opts.globalBudgets } : {}),
+      });
     }
 
     if (preflightError !== null || prompt === null || contextPath === null) {
