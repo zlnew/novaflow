@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startDaemon, type DaemonHandle } from "../../src/daemon/lifecycle.ts";
@@ -620,5 +620,320 @@ test("boot sweep across a real daemon restart: a completion that happened while 
     }
   } finally {
     rmSync(env.dir, { recursive: true, force: true });
+  }
+});
+
+/* -------------------- p4b: feedback routing over the wire -------------------- */
+
+test("review path end to end: a reviewer-shaped emitter re-enters its completed target, delivers the validated artifact, and the chain finishes", async () => {
+  const env = await boot({ runMode: "run-review" });
+  try {
+    const res = await importVia(env, {
+      version: "1.0.0",
+      project_slug: "prj",
+      tasks: [
+        { key: "R", title: "Reviewer", objective: "The objective of task R.", profile_name: "dev" },
+        { key: "W", title: "Worker", objective: "The objective of task W.", profile_name: "dev" },
+      ],
+      edges: [{ source_key: "R", target_key: "W", edge_type: "on_changes_requested" }],
+    });
+    const data = res["data"] as Record<string, unknown>;
+    const tasks = data["tasks"] as Record<string, Record<string, unknown>>;
+    const r = String(tasks["R"]!["id"]);
+    const w = String(tasks["W"]!["id"]);
+    const chainRunId = String(data["chain_run_id"]);
+
+    // the worker completed earlier (DAG ordering) — test-side rows
+    const rw = new Database(env.dbPath);
+    applyTransition(rw, w, ENQUEUE_TRIGGER, { triggerType: "human", actor: "seed" });
+    applyTransition(rw, w, START_TRIGGER, { triggerType: "engine", actor: "seed" });
+    applyTransition(rw, w, VALIDATING_TRIGGER, { triggerType: "engine", actor: "seed" });
+    applyTransition(rw, w, VERIFY_PASSED_TRIGGER, { triggerType: "engine", actor: "seed" });
+    rw.close();
+
+    // the reviewer runs: settles with a changes_requested artifact →
+    // validating → engine verification → completed → review routing.
+    // The durable evidence is the re-entry row — the queued state itself
+    // races the target's fast re-run (the loop can complete in < 500 ms).
+    await env.client.request({ id: "run", op: "nova_task_run", args: { task_id: r, actor: "maul" } });
+    await waitFor(() => {
+      const logs = transitionsOf(env, w);
+      return logs.some((t) => t["to_state"] === "changes_requested" && t["actor"] === "chain-engine");
+    }, 10_000);
+
+    // the re-entry: the verbatim completed→changes_requested row + requeue
+    const logs = transitionsOf(env, w);
+    const entry = logs.find((t) => t["to_state"] === "changes_requested");
+    assert.equal(entry?.["from_state"], "completed");
+    assert.equal(entry?.["trigger_type"], "engine");
+    assert.equal(entry?.["actor"], "chain-engine");
+    const requeue = logs.find((t) => t["from_state"] === "changes_requested" && t["to_state"] === "queued");
+    assert.match(String(requeue?.["reason"]), /\.novaflow\/runs\/.+\/feedback\/.+\.json/);
+
+    // the delivered artifact is the emitter's VALIDATED result.json
+    const rel = `.novaflow/runs/${w}/feedback/${r}.json`;
+    const delivered = JSON.parse(readFileSync(join(env.wsRoot, rel), "utf8")) as Record<string, unknown>;
+    assert.equal(delivered["status"], "changes_requested");
+    assert.equal(delivered["engine_verified"], true);
+    const ro = readConnection(env.dbPath);
+    const wRow = ro.prepare("SELECT context_files_json, retry_count FROM tasks WHERE id = ?").get(w) as {
+      context_files_json: string;
+      retry_count: number;
+    };
+    ro.close();
+    assert.deepEqual(JSON.parse(wRow.context_files_json), [rel], "FR-TSK-04: the delivered path is recorded on the target's context");
+    assert.equal(wRow.retry_count, 1, "retry_count incremented EXACTLY on the re-entry");
+
+    // the target re-runs with the feedback injected (the one sanctioned
+    // upstream handoff beyond its configured context), and the chain
+    // finishes — W's re-run + the terminal move land before the receipt
+    // is read (the stub writes it when the prompt arrives)
+    await waitFor(() => {
+      const status = chainStatusSync(env, chainRunId);
+      return String((status["chain"] as Record<string, unknown>)["state"]) === "completed";
+    }, 15_000);
+    const ro2 = readConnection(env.dbPath);
+    const rerun = ro2
+      .prepare("SELECT pi_session_dir FROM task_runs WHERE task_id = ? ORDER BY attempt_number DESC LIMIT 1")
+      .get(w) as { pi_session_dir: string };
+    ro2.close();
+    const receipt = JSON.parse(
+      readFileSync(join(rerun.pi_session_dir, "stub-receipt.json"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.match(
+      String(receipt["prompt"]),
+      new RegExp(`--- ${rel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ---`),
+      "the feedback file entered the re-run's prompt as an input context file",
+    );
+    assert.match(String(receipt["prompt"]), /The auth handler does not refresh tokens\./);
+
+    // the consolidated project report is written
+    const summary = join(env.wsRoot, ".novaflow", "projects", "prj", "PROJECT_SUMMARY.md");
+    assert.ok(existsSync(summary), "FR-PRJ-05: the report rides the chain's completed move");
+    const summaryText = readFileSync(summary, "utf8");
+    assert.match(summaryText, /## R — Reviewer/);
+    assert.match(summaryText, /## W — Worker/);
+
+    // the status surface shows the delivered feedback (derived, no new state)
+    const status = await env.client.request({
+      id: "cs",
+      op: "nova_chain_status",
+      args: { chain_run_id: chainRunId },
+    });
+    const members = (status["data"] as Record<string, unknown>)["members"] as Array<Record<string, unknown>>;
+    assert.deepEqual(members.find((m) => m["id"] === w)!["feedback"], [rel]);
+    assert.deepEqual(members.find((m) => m["id"] === r)!["feedback"], []);
+  } finally {
+    await shutdown(env);
+  }
+});
+
+test("failure path over the wire: confirm-failure enqueues the on_failure fallback with synthesized context; the chain records failed while routing continues", async () => {
+  const env = await boot();
+  try {
+    const res = await importVia(env, {
+      version: "1.0.0",
+      project_slug: "prj",
+      tasks: [
+        {
+          key: "F",
+          title: "Flaky",
+          objective: "The objective of task F.",
+          profile_name: "dev",
+          requires_human_gate: true,
+        },
+        { key: "T", title: "Fallback", objective: "The objective of task T.", profile_name: "dev" },
+      ],
+      edges: [{ source_key: "F", target_key: "T", edge_type: "on_failure" }],
+    });
+    const data = res["data"] as Record<string, unknown>;
+    const tasks = data["tasks"] as Record<string, Record<string, unknown>>;
+    const f = String(tasks["F"]!["id"]);
+    const t = String(tasks["T"]!["id"]);
+    const chainRunId = String(data["chain_run_id"]);
+
+    // F runs, settles, and lands at the gate
+    await env.client.request({ id: "run", op: "nova_task_run", args: { task_id: f, actor: "maul" } });
+    await waitForState(env, f, "awaiting_gate");
+    const confirm = await env.client.request({
+      id: "confirm",
+      op: "nova_gate_confirm_failure",
+      args: { task_id: f, approved_by: "maul", note: "not salvageable" },
+    });
+    assert.equal(confirm["ok"], true, JSON.stringify(confirm));
+    assert.deepEqual(
+      (confirm["data"] as Record<string, unknown>)["fallback_enqueued"],
+      [t],
+      "the fallback ride is reported by the op",
+    );
+
+    // the fallback enqueued via the guarded row (engine / chain-engine) —
+    // the enqueue is synchronous with the confirm response; the queued
+    // state itself races the target's fast re-run
+    const entry = transitionsOf(env, t).find((tr) => tr["to_state"] === "queued");
+    assert.equal(entry?.["from_state"], "draft");
+    assert.equal(entry?.["trigger_type"], "engine");
+    assert.equal(entry?.["actor"], "chain-engine");
+
+    // the synthesized failure context: the member's result.json + error summary
+    const rel = `.novaflow/runs/${t}/feedback/${f}.json`;
+    const fb = JSON.parse(readFileSync(join(env.wsRoot, rel), "utf8")) as Record<string, unknown>;
+    assert.equal(fb["kind"], "novaflow-failure-feedback");
+    assert.equal(fb["failed_task_id"], f);
+    assert.equal((fb["result"] as Record<string, unknown>)["status"], "completed");
+    const ro = readConnection(env.dbPath);
+    const tCtx = ro.prepare("SELECT context_files_json FROM tasks WHERE id = ?").get(t) as {
+      context_files_json: string;
+    };
+    ro.close();
+    assert.deepEqual(JSON.parse(tCtx.context_files_json), [rel]);
+
+    // the chain-failed rule fired too (unordered — both happen)
+    const statusNow = chainStatusSync(env, chainRunId);
+    assert.equal(String((statusNow["chain"] as Record<string, unknown>)["state"]), "failed");
+
+    // nothing halts members on chain state: the fallback runs to completion
+    await waitForState(env, t, "completed", 15_000);
+  } finally {
+    await shutdown(env);
+  }
+});
+
+test("the gate-approved verification driver (p4a residual): approving the gate runs the SAME pipeline — member completes, chain finishes, report written", async () => {
+  const env = await boot();
+  try {
+    const res = await importVia(env, {
+      version: "1.0.0",
+      project_slug: "prj",
+      tasks: [
+        {
+          key: "A",
+          title: "Gated",
+          objective: "The objective of task A.",
+          profile_name: "dev",
+          requires_human_gate: true,
+        },
+        { key: "B", title: "Follow-up", objective: "The objective of task B.", profile_name: "dev" },
+      ],
+      edges: [{ source_key: "A", target_key: "B", edge_type: "depends_on" }],
+    });
+    const data = res["data"] as Record<string, unknown>;
+    const tasks = data["tasks"] as Record<string, Record<string, unknown>>;
+    const a = String(tasks["A"]!["id"]);
+    const b = String(tasks["B"]!["id"]);
+    const chainRunId = String(data["chain_run_id"]);
+
+    // A runs, settles at the gate (requires_human_gate)
+    await env.client.request({ id: "run", op: "nova_task_run", args: { task_id: a, actor: "maul" } });
+    await waitForState(env, a, "awaiting_gate");
+    const ro = readConnection(env.dbPath);
+    const liveRun = ro
+      .prepare("SELECT id FROM task_runs WHERE task_id = ? ORDER BY attempt_number DESC LIMIT 1")
+      .get(a) as { id: string };
+    ro.close();
+
+    // the approval moves awaiting_gate→validating AND drives the engine
+    // verification (before p4b the task dead-ended in validating)
+    const approve = await env.client.request({
+      id: "approve",
+      op: "nova_gate_approve",
+      args: { task_id: a, run_id: liveRun.id, approved_by: "maul", note: "looks right" },
+    });
+    assert.equal(approve["ok"], true, JSON.stringify(approve));
+    assert.equal((approve["data"] as Record<string, unknown>)["final_state"], "validating");
+
+    // the SAME pipeline the settle seam uses decides the verdict
+    await waitForState(env, a, "completed", 10_000);
+    const tr = transitionsOf(env, a);
+    const last = tr[tr.length - 1]!;
+    assert.equal(last["from_state"], "validating");
+    assert.equal(last["to_state"], "completed");
+    assert.equal(last["trigger_type"], "engine");
+    assert.match(String(last["reason"]), /engine verification passed/);
+
+    // readiness rides the same seam: B runs and the chain completes
+    await waitForState(env, b, "completed", 15_000);
+    await waitFor(() => {
+      const status = chainStatusSync(env, chainRunId);
+      return String((status["chain"] as Record<string, unknown>)["state"]) === "completed";
+    }, 10_000);
+    const summary = join(env.wsRoot, ".novaflow", "projects", "prj", "PROJECT_SUMMARY.md");
+    assert.ok(existsSync(summary));
+    assert.match(readFileSync(summary, "utf8"), /## A — Gated/);
+  } finally {
+    await shutdown(env);
+  }
+});
+
+test("the gate-approved driver: a FAILING engine verification still decides — changes_requested with retry_count++ (approving never bypasses verification)", async () => {
+  const env = await boot();
+  try {
+    // a directory target whose verification command FAILS
+    const targetRoot = join(env.dir, "targetroot");
+    mkdirSync(targetRoot, { recursive: true });
+    writeFileSync(join(targetRoot, "note.txt"), "clean tree\n");
+    const rw = new Database(env.dbPath);
+    rw.prepare(
+      `INSERT INTO project_targets (id, project_id, alias, target_type, root_path)
+       VALUES (?, ?, 'app', 'directory', ?)`,
+    ).run(ulid(), env.projectId, targetRoot);
+    rw.close();
+
+    const res = await importVia(env, {
+      version: "1.0.0",
+      project_slug: "prj",
+      tasks: [
+        {
+          key: "G",
+          title: "Gated flaky",
+          objective: "The objective of task G.",
+          profile_name: "dev",
+          requires_human_gate: true,
+          target_scopes: [
+            { repo_alias: "app", access_mode: "read_write", verification_commands: ["exit 1"] },
+          ],
+        },
+      ],
+      edges: [],
+    });
+    const data = res["data"] as Record<string, unknown>;
+    const tasks = data["tasks"] as Record<string, Record<string, unknown>>;
+    const g = String(tasks["G"]!["id"]);
+    const chainRunId = String(data["chain_run_id"]);
+
+    await env.client.request({ id: "run", op: "nova_task_run", args: { task_id: g, actor: "maul" } });
+    await waitForState(env, g, "awaiting_gate");
+    const ro = readConnection(env.dbPath);
+    const liveRun = ro
+      .prepare("SELECT id FROM task_runs WHERE task_id = ? ORDER BY attempt_number DESC LIMIT 1")
+      .get(g) as { id: string };
+    ro.close();
+
+    // the operator approved the GATE — the ENGINE still verifies
+    // (FR-TSK-12: verification overrides self-reports of success)
+    const approve = await env.client.request({
+      id: "approve",
+      op: "nova_gate_approve",
+      args: { task_id: g, run_id: liveRun.id, approved_by: "maul", note: "looks right" },
+    });
+    assert.equal(approve["ok"], true, JSON.stringify(approve));
+
+    // the failed verdict: the self-path entry with the retry budget honored
+    await waitForState(env, g, "changes_requested", 10_000);
+    const ro2 = readConnection(env.dbPath);
+    const gRow = ro2.prepare("SELECT retry_count FROM tasks WHERE id = ?").get(g) as { retry_count: number };
+    ro2.close();
+    assert.equal(gRow.retry_count, 1, "retry_count increments EXACTLY on the changes_requested entry");
+    const tr = transitionsOf(env, g);
+    const last = tr[tr.length - 1]!;
+    assert.equal(last["from_state"], "validating");
+    assert.equal(last["to_state"], "changes_requested");
+    assert.equal(last["trigger_type"], "engine");
+    assert.match(String(last["reason"]), /command "exit 1" failed/);
+
+    // a verification failure is NOT a confirmed gate failure: the chain stays active
+    assert.equal(String((chainStatusSync(env, chainRunId)["chain"] as Record<string, unknown>)["state"]), "active");
+  } finally {
+    await shutdown(env);
   }
 });

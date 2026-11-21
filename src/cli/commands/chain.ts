@@ -106,7 +106,14 @@ async function status(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
       started_at: string;
       completed_at: string | null;
     };
-    members: Array<{ id: string; key: string; state: string; ready: boolean; root: boolean }>;
+    members: Array<{
+      id: string;
+      key: string;
+      state: string;
+      ready: boolean;
+      root: boolean;
+      feedback?: string[];
+    }>;
     paused: boolean;
   };
   if (opts.json) {
@@ -125,12 +132,20 @@ async function status(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
   console.log(
     renderTable(
       // roots render as "root": the engine never auto-enqueues them — the
-      // operator starts a chain by running its roots (review round finding)
-      data.members.map((m) => ({ ...m, ready: m.root ? "root" : m.ready ? "yes" : "no" })),
+      // operator starts a chain by running its roots (review round finding).
+      // FEEDBACK (p4b, additive): the count of delivered feedback context
+      // files (a review artifact or a synthesized failure context) —
+      // derived from the task's recorded context, never new state.
+      data.members.map((m) => ({
+        ...m,
+        ready: m.root ? "root" : m.ready ? "yes" : "no",
+        feedback: m.feedback !== undefined && m.feedback.length > 0 ? String(m.feedback.length) : "—",
+      })),
       [
         { key: "key", header: "KEY" },
         { key: "state", header: "STATE" },
         { key: "ready", header: "READY" },
+        { key: "feedback", header: "FEEDBACK" },
         { key: "id", header: "ID" },
       ],
     ),

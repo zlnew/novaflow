@@ -610,10 +610,21 @@ test("gate ops over the socket: approve (contract), reject (mcp payload + defaul
     });
     assert.equal(approve["ok"], true, JSON.stringify(approve));
     assert.equal((approve["data"] as Record<string, unknown>)["final_state"], "validating");
+    // the approval row (p4b: the engine's verification verdict now
+    // FOLLOWS the approval async, so the approval is no longer the last
+    // row — pin it by its matrix row instead of by position)
     const tr = transitions(env, gateTask);
-    const last = tr[tr.length - 1]!;
-    assert.equal(last["trigger_type"], "human");
-    assert.match(String(last["reason"]), /gate approved by maul: ship it/);
+    const approval = tr.find((t) => t["from_state"] === "awaiting_gate" && t["to_state"] === "validating")!;
+    assert.equal(approval["trigger_type"], "human");
+    assert.match(String(approval["reason"]), /gate approved by maul: ship it/);
+    // the p4b gate-approved verification driver: the ENGINE decides the
+    // validating→terminal verdict (FR-TSK-12 — approval is not bypass)
+    await waitForState(env, gateTask, "completed", 8000);
+    const verdict = transitions(env, gateTask);
+    const vlast = verdict[verdict.length - 1]!;
+    assert.equal(vlast["from_state"], "validating");
+    assert.equal(vlast["to_state"], "completed");
+    assert.equal(vlast["trigger_type"], "engine");
 
     // a second gate task: reject via the mcp payload shape {task_id, feedback}
     const rejectTask = await createTaskVia(env, "TASK-R", { requires_human_gate: true });
