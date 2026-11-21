@@ -9,14 +9,13 @@ import {
   REPAIR_TRIGGER,
   RUN_FAILED_TRIGGER,
 } from "./triggers.ts";
-import { planSettleTransition } from "./settle.ts";
+import { finalizeRunRecord, intakeSettledRun } from "./settle-replay.ts";
 import { buildEngineContext, writeEngineContext } from "./context.ts";
 import { writeProtectedDigests } from "../verify/protected.ts";
 import { composePrompt, type ComposedPrompt } from "./prompt.ts";
 import { buildRunArgv, defaultExtensionPath, runDirPath } from "./spawn.ts";
 import { createPump } from "./pump.ts";
 import { redactText } from "./redact.ts";
-import { readArtifactFile } from "./artifact.ts";
 import {
   costUsd,
   defaultPricesPath,
@@ -218,42 +217,6 @@ function insertRunRow(
   );
 }
 
-function finalizeRun(
-  db: Db,
-  runId: string,
-  fields: {
-    status: string;
-    preflightStatus: "passed" | "failed";
-    inputTokens: number;
-    outputTokens: number;
-    costUsd: number;
-    exitCode: number | null;
-    artifactPath: string | null;
-    errorSummary: string | null;
-    startedWall: number;
-  },
-): void {
-  db.prepare(
-    `UPDATE task_runs
-        SET status = ?, preflight_status = ?, input_tokens = ?, output_tokens = ?,
-            cost_usd = ?, exit_code = ?, artifact_path = ?, error_summary = ?,
-            ended_at = ?, duration_ms = ?
-      WHERE id = ?`,
-  ).run(
-    fields.status,
-    fields.preflightStatus,
-    fields.inputTokens,
-    fields.outputTokens,
-    fields.costUsd,
-    fields.exitCode,
-    fields.artifactPath,
-    fields.errorSummary,
-    new Date().toISOString(),
-    Date.now() - fields.startedWall,
-    runId,
-  );
-}
-
 type RawOutcome =
   | { kind: "spawn-error"; message: string }
   | { kind: "timeout"; code: number | null }
@@ -399,7 +362,7 @@ export async function startRun(
 
     if (preflightError !== null || prompt === null || contextPath === null) {
       const error = preflightError ?? "preflight failed";
-      finalizeRun(db, runId, {
+      finalizeRunRecord(db, runId, {
         status: "failed",
         preflightStatus: "failed",
         inputTokens: 0,
@@ -618,7 +581,7 @@ export async function startRun(
           ? `spawn failed: ${outcome.message}`
           : `subprocess exited before agent_settled (exit=${outcome.code ?? "null"})` +
             (stderrTail !== "" ? `\nstderr tail: ${stderrTail}` : "");
-      finalizeRun(db, runId, {
+      finalizeRunRecord(db, runId, {
         status: "failed",
         preflightStatus: "passed",
         inputTokens: pump.inputTokens,
@@ -644,7 +607,7 @@ export async function startRun(
       const error = timedOut
         ? `timeout: exceeded max_timeout_sec ${effective.maxTimeoutSec}s (SIGTERM -> SIGKILL)`
         : `budget_exceeded: cost $${breachCost.toFixed(6)} > max_cost_usd $${effective.maxCostUsd} (SIGTERM -> SIGKILL)`;
-      finalizeRun(db, runId, {
+      finalizeRunRecord(db, runId, {
         status: timedOut ? "timed_out" : "failed",
         preflightStatus: "passed",
         inputTokens: pump.inputTokens,
@@ -664,56 +627,28 @@ export async function startRun(
       break;
     }
 
-    // ---- settled (FR-TSK-05): artifact intake ----
-    const artifactPath = join(runDir, "result.json");
-    const artifact = readArtifactFile(artifactPath);
-
-    if (artifact.ok) {
-      // Structurally valid. The engine-owned annotations (engine_verified,
-      // protected_files_untouched, verification_results, role) are NEVER
-      // trusted from the agent — the engine overwrites them after
-      // VALIDATING. That verification is p2c scope; on the validating path
-      // this card records the run and leaves the fields untouched.
-      finalizeRun(db, runId, {
-        status: "succeeded",
-        preflightStatus: "passed",
-        inputTokens: pump.inputTokens,
-        outputTokens: pump.outputTokens,
-        costUsd: cost,
-        exitCode: outcome.code,
-        artifactPath,
-        errorSummary: withPricesNote(null),
-        startedWall,
-      });
-      const plan = planSettleTransition(
-        artifact.artifact.status ?? "",
-        task.requires_human_gate === 1,
-      );
-      applyTransition(db, taskId, plan.trigger, {
-        triggerType: "engine",
-        actor,
-        runId,
-        reason: `artifact status: ${String(artifact.artifact.status)}`,
-      });
-      break;
-    }
-
-    // missing or schema-invalid artifact → FR-TSK-06 repair (max 1)
-    const error =
-      artifact.reason === "missing"
-        ? "result.json missing after agent_settled"
-        : `result.json failed structural validation: ${artifact.errors.join("; ")}`;
-    finalizeRun(db, runId, {
-      status: "failed",
-      preflightStatus: "passed",
+    // ---- settled (FR-TSK-05): artifact intake via the SHARED module
+    // (src/runs/settle-replay.ts) — the daemon's boot crash recovery
+    // (§8.4) feeds the same intake; never a reimplementation ----
+    const intake = intakeSettledRun({
+      db,
+      taskId,
+      runId,
+      requiresHumanGate: task.requires_human_gate === 1,
+      runDir,
+      model: profile.model,
+      priceTable,
+      exitCode: outcome.code,
       inputTokens: pump.inputTokens,
       outputTokens: pump.outputTokens,
-      costUsd: cost,
-      exitCode: outcome.code,
-      artifactPath: null,
-      errorSummary: withPricesNote(error),
       startedWall,
+      pricesNote: withPricesNote,
+      actor,
     });
+    if (intake.ok) break;
+
+    // missing or schema-invalid artifact → FR-TSK-06 repair (max 1)
+    const error = intake.error;
 
     if (attemptKind === "execution") {
       // repair budget remains: running → running, new run with the
