@@ -365,3 +365,50 @@ test("annotateRunVerification: passing commands + untouched protected files → 
     rmSync(join(s.artifactPath, ".."), { recursive: true, force: true });
   }
 });
+
+test("an inconclusive scope check fails closed: engine_verification_passed stays 0 even with passing commands (re-judge finding 1)", () => {
+  const s = seed({
+    schema_version: "1.0.0",
+    task_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    status: "completed",
+    summary: "Implemented the objective per the task spec.",
+    assumptions_made: [],
+    open_questions: [],
+    artifacts_modified: [],
+    feedback_items: [],
+    next_recommended_action: "proceed_to_next",
+    engine_verified: true,
+  });
+  try {
+    const verify: VerifyOutcome = {
+      passed: true,
+      results: [
+        {
+          command: "npm test",
+          cwd: "/repo",
+          exitCode: 0,
+          exitCodeForArtifact: 0,
+          timedOut: false,
+          spawnError: null,
+          marker: { tests: 3, pass: 3, fail: 0 },
+          passed: true,
+          stdoutTail: "[novaflow-verify] tests=3 pass=3 fail=0",
+          stderrTail: "",
+        },
+      ],
+    };
+    const protectedCheck: ProtectedCheckResult = {
+      protectedFilesUntouched: true,
+      scopeCreepPaths: [],
+      scopeCheckInconclusive: true, // git status failed — fail closed
+      notes: ["git status failed — scope check inconclusive, failing closed"],
+    };
+    const res = annotateRunVerification(s.db, s.runId, verify, protectedCheck);
+    assert.deepEqual(res, { engineVerificationPassed: false });
+    assert.equal(runColumn(s, "engine_verification_passed"), 0);
+  } finally {
+    s.db.close();
+    rmSync(join(s.artifactPath, ".."), { recursive: true, force: true });
+  }
+});

@@ -134,7 +134,11 @@ export function annotateRunVerification(
   );
 
   return annotateRunArtifact(db, runId, {
-    engineVerified: verify.passed && protectedCheck.scopeCreepPaths.length === 0,
+    engineVerified:
+      verify.passed &&
+      protectedCheck.scopeCreepPaths.length === 0 &&
+      !protectedCheck.scopeCheckInconclusive,
+  
     protectedFilesUntouched: protectedCheck.protectedFilesUntouched,
     verificationResults,
     role,

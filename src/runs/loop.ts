@@ -492,7 +492,13 @@ export async function startRun(
       try {
         process.kill(-child.pid, sig);
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+        const code = (err as NodeJS.ErrnoException).code;
+        // The kill backstops run inside timer callbacks — a non-ESRCH
+        // throw here is an uncaught daemon crash (re-judge finding; mirrors
+        // the verify runner's swallow-and-warn).
+        if (code !== "ESRCH") {
+          console.warn(`[novaflow] group kill ${sig} failed (pid ${child.pid}): ${code}`);
+        }
       }
     };
 
