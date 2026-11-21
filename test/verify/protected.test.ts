@@ -206,6 +206,88 @@ test("writeProtectedDigests snapshots the protected set (SHA-256) into protected
   }
 });
 
+test("a glob with an empty segment is a hard preflight failure naming the glob", () => {
+  // `tests/**/` (trailing slash) splits to an EMPTY segment that can
+  // never match — protection silently off. Fail closed, zero tokens.
+  const bad: Array<[string, "protected" | "write"]> = [
+    ["tests/**/", "protected"],
+    ["/tests/**", "protected"],
+    ["tests//**", "protected"],
+    ["", "protected"],
+    ["tests/**/", "write"],
+  ];
+  for (const [glob, which] of bad) {
+    const s = seed();
+    const root = gitRepo({ "tests/p.test.ts": "test('p', () => {});\n" });
+    const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+    try {
+      addTarget(
+        s,
+        which === "protected"
+          ? { alias: "app", root, protected: [glob], write: ["src/**"] }
+          : { alias: "app", root, protected: ["tests/**"], write: [glob] },
+      );
+      assert.throws(
+        () => writeProtectedDigests(s.db, s.taskId, runDir, ulid()),
+        (err: unknown) => {
+          const msg = (err as Error).message;
+          return msg.includes(JSON.stringify(glob)) && msg.includes(which === "protected" ? "protected_test_globs" : "write_scope_globs");
+        },
+        `glob ${JSON.stringify(glob)} (${which}) must be rejected with the glob named`,
+      );
+    } finally {
+      s.db.close();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(runDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("`tests/**` (no trailing slash) remains a legal, matching glob", () => {
+  const s = seed();
+  const root = gitRepo({ "tests/p.test.ts": "test('p', () => {});\n" });
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "app", root, protected: ["tests/**"], write: ["src/**"] });
+    const path = writeProtectedDigests(s.db, s.taskId, runDir, ulid());
+    const snap = JSON.parse(readFileSync(path, "utf8")) as {
+      targets: Array<{ files: Record<string, string> }>;
+    };
+    assert.deepEqual(Object.keys(snap.targets[0]?.files ?? {}), ["tests/p.test.ts"]);
+  } finally {
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("an invalid glob that somehow reached the snapshot fails closed at verification", async () => {
+  const s = seed();
+  const root = gitRepo({ "tests/p.test.ts": "test('p', () => {});\n" });
+  const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));
+  try {
+    addTarget(s, { alias: "app", root, protected: ["tests/**"], write: ["src/**"] });
+    writeProtectedDigests(s.db, s.taskId, runDir, ulid());
+    // tamper the snapshot's protected glob to the under-matching spelling
+    const snapPath = join(runDir, SNAPSHOT_FILENAME);
+    const snap = JSON.parse(readFileSync(snapPath, "utf8")) as {
+      targets: Array<{ protected_globs: string[] }>;
+    };
+    snap.targets[0]!.protected_globs = ["tests/**/"];
+    writeFileSync(snapPath, JSON.stringify(snap, null, 2) + "\n");
+    const res = await verifyProtectedAndScope(s.db, s.taskId, runDir);
+    assert.equal(res.protectedFilesUntouched, false); // fail closed, not silent
+    assert.ok(
+      res.notes.some((n) => n.includes("tests/**/")),
+      JSON.stringify(res.notes),
+    );
+  } finally {
+    s.db.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
 test("writeProtectedDigests refuses a scoped target whose root is missing (preflight honesty)", () => {
   const s = seed();
   const runDir = mkdtempSync(join(tmpdir(), "novaflow-run-"));

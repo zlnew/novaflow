@@ -139,6 +139,18 @@ export function globMatchAny(patterns: readonly string[], relPath: string): bool
   return patterns.some((p) => globMatch(p, relPath));
 }
 
+/**
+ * A glob with an EMPTY segment — from a leading or trailing slash,
+ * or a doubled slash inside (as in a trailing slash after `tests/**`)
+ * — can never match a walked path, so
+ * it silently disables whatever it was supposed to protect. It is a
+ * hard preflight failure at snapshot time (fail closed, zero tokens)
+ * and a fail-closed finding if one somehow reaches verification.
+ */
+function globHasEmptySegment(pattern: string): boolean {
+  return pattern === "" || pattern.split("/").some((seg) => seg === "");
+}
+
 /* ---------------------------------- tree walking ---------------------------------- */
 
 /**
@@ -336,6 +348,18 @@ export function writeProtectedDigests(db: Db, taskId: string, runDir: string, ru
     if (!existsSync(t.root_path) || !statSync(t.root_path).isDirectory()) {
       throw new Error(`target root missing or not a directory: ${t.root_path} (alias ${t.alias})`);
     }
+    for (const [column, globs] of [
+      ["protected_test_globs_json", t.protected_globs],
+      ["write_scope_globs_json", t.write_scope_globs],
+    ] as Array<[string, string[]]>) {
+      for (const g of globs) {
+        if (globHasEmptySegment(g)) {
+          throw new Error(
+            `invalid glob ${JSON.stringify(g)} in ${column} of target ${t.alias}: empty segment (leading/trailing/double slash) — it can never match, so it silently disables protection; failing closed`,
+          );
+        }
+      }
+    }
     const fullTree = t.target_type === "directory";
     const files: Record<string, string> = {};
     // walk only what the protected globs can reach: literal-prefixed
@@ -491,6 +515,25 @@ export async function verifyProtectedAndScope(
       untouched = false;
       notes.push(`target root vanished between preflight and verification: ${t.root_path}`);
       continue;
+    }
+
+    // a glob that reached the snapshot with an empty segment matches
+    // nothing — it cannot protect or scope anything: fail closed
+    for (const g of t.protected_globs) {
+      if (globHasEmptySegment(g)) {
+        untouched = false;
+        notes.push(
+          `invalid glob ${JSON.stringify(g)} in protected_test_globs of ${t.alias} (snapshot): empty segment — matches nothing; failing closed`,
+        );
+      }
+    }
+    for (const g of t.write_scope_globs) {
+      if (globHasEmptySegment(g)) {
+        scopeInconclusive = true;
+        notes.push(
+          `invalid glob ${JSON.stringify(g)} in write_scope_globs of ${t.alias} (snapshot): empty segment — scope check inconclusive; failing closed`,
+        );
+      }
     }
 
     // current digests over the sets we can compare
