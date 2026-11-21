@@ -47,6 +47,10 @@ import {
 import { bareId, isUlid } from "../store/ids.ts";
 import { RetryBudgetExhaustedError } from "../validating.ts";
 import { validateArtifact, type TaskHandoffArtifact } from "../runs/artifact.ts";
+import { parseCron, nextRun } from "../sched/cron.ts";
+import { parseIsoRunAt, canonicalTimestamp } from "../sched/iso.ts";
+import { nextOccurrenceAt, type ScheduleRow } from "./schedules.ts";
+import { loadWorkspaceConfig, DEFAULT_MISSED_RUN_POLICY } from "../config.ts";
 import type { DaemonConfig } from "../daemonconfig.ts";
 import type { Dispatcher } from "./dispatch.ts";
 import type { RetryEvaluator } from "./retry.ts";
@@ -1051,6 +1055,197 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
     });
     const outcome = confirmFailureGate(deps.db, payload, surface as GateSurface);
     return { final_state: outcome.finalState, retry_count: outcome.retryCount };
+  });
+
+  /* ------------------------ schedule ops (FR-SCH-01/03) ----------------------- */
+
+  /**
+   * `nova schedule attach` (srs 4.1.1; FR-SCH-01): attach ONE schedule
+   * — a 5-field cron or a single ISO-8601 instant — to a TASK (the
+   * DDL's target_type CHECK is ('task') only; project-level
+   * scheduling is deferred). Documented rulings:
+   *   - exactly one of cron_expr | run_at (the DDL CHECK, enforced at
+   *     the wire — both/neither is schema_invalid naming the rule);
+   *   - the task must exist (a dangling target_id is a DDL tolerance
+   *     the evaluator survives, never an attach feature — not_found)
+   *     and its workspace must be ACTIVE (the SAME requireActiveWorkspace
+   *     gate as run/retry — FR-WS-03);
+   *   - missed_policy defaults from the workspace config's
+   *     missed_run_policy (data 4.4); an explicit value wins; a broken
+   *     config file falls back to the documented default 'skip' (the
+   *     never-crash rule — the loader's error is surfaced elsewhere);
+   *   - timezone is UTC-ONLY in v1 (spec-silent column; documented
+   *     limitation: the evaluator does all math in UTC) — any other
+   *     value is refused with schema_invalid;
+   *   - next_run_at is computed and stored at attach; a run_at already
+   *     past fires at the next evaluation pass (its designated time
+   *     has arrived), a cron that can never match a calendar date is
+   *     refused (a dead schedule is not a schedule);
+   *   - multiple schedules per task are schema-legal (no UNIQUE) —
+   *     each fires independently.
+   */
+  ops.set("nova_schedule_attach", (args, { deps }) => {
+    const taskId = reqString(args, "task_id");
+    const hasCron = args["cron_expr"] !== undefined;
+    const hasRunAt = args["run_at"] !== undefined;
+    if (hasCron === hasRunAt) {
+      throw new OpError(
+        "schema_invalid",
+        `exactly one of cron_expr or run_at is required (the schedules DDL CHECK is cron_expr XOR run_at) — got ${hasCron ? "both" : "neither"}`,
+      );
+    }
+    let cronExpr: string | null = null;
+    let runAt: string | null = null;
+    let nextRunAt: string;
+    if (hasCron) {
+      const expr = reqString(args, "cron_expr");
+      const parsed = parseCron(expr);
+      if (!parsed.ok) throw new OpError("schema_invalid", parsed.error);
+      const next = nextRun(expr, Date.now());
+      if (next === null) {
+        throw new OpError(
+          "schema_invalid",
+          `cron expression "${expr}" never matches a calendar date — refusing to attach a schedule that can never fire`,
+        );
+      }
+      cronExpr = expr;
+      nextRunAt = canonicalTimestamp(next);
+    } else {
+      const iso = reqString(args, "run_at");
+      const parsed = parseIsoRunAt(iso);
+      if (!parsed.ok) throw new OpError("schema_invalid", parsed.error);
+      runAt = canonicalTimestamp(parsed.ms);
+      nextRunAt = runAt; // the one-shot's only moment, even if already past
+    }
+    if (args["timezone"] !== undefined && args["timezone"] !== "UTC") {
+      throw new OpError(
+        "schema_invalid",
+        `timezone must be "UTC" in v1 — schedules are evaluated in UTC only (got ${JSON.stringify(args["timezone"])})`,
+      );
+    }
+    // the task must exist AND live in an ACTIVE workspace (the run/retry gate)
+    requireActiveWorkspace(deps.db, taskId);
+    const scope = deps.db
+      .prepare(
+        `SELECT p.workspace_id AS ws_id, w.root_path AS ws_root
+           FROM tasks t JOIN projects p ON p.id = t.project_id
+           JOIN workspaces w ON w.id = p.workspace_id WHERE t.id = ?`,
+      )
+      .get(taskId) as { ws_id: string; ws_root: string };
+    let missedPolicy: "skip" | "run_immediately";
+    if (args["missed_policy"] !== undefined) {
+      if (args["missed_policy"] !== "skip" && args["missed_policy"] !== "run_immediately") {
+        throw new OpError(
+          "schema_invalid",
+          `args.missed_policy must be "skip" or "run_immediately" (got ${JSON.stringify(args["missed_policy"])})`,
+        );
+      }
+      missedPolicy = args["missed_policy"];
+    } else {
+      // the workspace config's missed_run_policy is the default
+      // (data 4.4); a broken file falls back to the documented default
+      const load = loadWorkspaceConfig(scope.ws_root);
+      missedPolicy = load.ok ? load.config.missedRunPolicy : DEFAULT_MISSED_RUN_POLICY;
+    }
+    const enabledArg = optBoolean(args, "enabled");
+    const enabled = enabledArg === undefined ? 1 : enabledArg ? 1 : 0;
+    const id = ulid();
+    deps.db
+      .prepare(
+        `INSERT INTO schedules
+           (id, workspace_id, target_type, target_id, cron_expr, run_at, timezone,
+            missed_policy, enabled, last_run_at, next_run_at)
+         VALUES (?, ?, 'task', ?, ?, ?, 'UTC', ?, ?, NULL, ?)`,
+      )
+      .run(id, scope.ws_id, taskId, cronExpr, runAt, missedPolicy, enabled, nextRunAt);
+    const schedule = deps.db
+      .prepare(
+        "SELECT id, workspace_id, target_type, target_id AS task_id, cron_expr, run_at, timezone, missed_policy, enabled, last_run_at, next_run_at FROM schedules WHERE id = ?",
+      )
+      .get(id);
+    // FR-SCH-01: the id is the report surface (bare ULID, data 5.1)
+    return { id, schedule };
+  });
+
+  /**
+   * `nova schedule list` (srs 4.1.1): schedule rows with the computed
+   * fields. Filters: workspace_id (validated) and task_id (validated —
+   * the CLI's --task); with neither, every workspace's schedules.
+   */
+  ops.set("nova_schedule_list", (args, { deps }) => {
+    const workspaceId =
+      args["workspace_id"] === undefined ? undefined : reqString(args, "workspace_id");
+    const taskId = args["task_id"] === undefined ? undefined : reqString(args, "task_id");
+    if (workspaceId !== undefined) requireWorkspaceById(deps.db, workspaceId);
+    if (taskId !== undefined) requireTask(deps.db, taskId);
+    // wire shape (documented): target_id is projected as task_id
+    const COLUMNS =
+      "id, workspace_id, target_type, target_id AS task_id, cron_expr, run_at, timezone, missed_policy, enabled, last_run_at, next_run_at";
+    const schedules =
+      taskId !== undefined
+        ? deps.db.prepare(`SELECT ${COLUMNS} FROM schedules WHERE target_id = ? ORDER BY id`).all(taskId)
+        : workspaceId !== undefined
+          ? deps.db.prepare(`SELECT ${COLUMNS} FROM schedules WHERE workspace_id = ? ORDER BY id`).all(workspaceId)
+          : deps.db.prepare(`SELECT ${COLUMNS} FROM schedules ORDER BY id`).all();
+    return { schedules };
+  });
+
+  /**
+   * `nova schedule pause` (srs 4.1.1; FR-TSK-08's scheduler-level pause
+   * applies to schedules the same way): enabled=0. Documented ruling —
+   * next_run_at is KEPT (not nulled): the evaluator only considers
+   * enabled=1 rows (the partial index idx_schedules_next_run WHERE
+   * enabled=1 mirrors exactly this), and a paused schedule does not
+   * accumulate missed runs — resume recomputes from now. Idempotent.
+   */
+  ops.set("nova_schedule_pause", (args, { deps }) => {
+    const id = reqString(args, "schedule_id");
+    const row = deps.db
+      .prepare("SELECT * FROM schedules WHERE id = ?")
+      .get(id) as ScheduleRow | undefined;
+    if (!row) throw new OpError("not_found", `no such schedule: ${id}`);
+    deps.db.prepare("UPDATE schedules SET enabled = 0 WHERE id = ?").run(id);
+    const schedule = deps.db
+      .prepare(
+        "SELECT id, workspace_id, target_type, target_id AS task_id, cron_expr, run_at, timezone, missed_policy, enabled, last_run_at, next_run_at FROM schedules WHERE id = ?",
+      )
+      .get(id);
+    return { schedule_id: id, schedule };
+  });
+
+  /**
+   * `nova schedule resume` (srs 4.1.1): enabled=1 + next_run_at
+   * recomputed from NOW (documented ruling: a paused schedule does
+   * not accumulate missed runs — a cron fires its next occurrence
+   * after resume; a one-shot's only moment counts only while it is
+   * still ahead, so a resumed expired one-shot stays expired). The
+   * recomputed next run is part of the response (the CLI states it).
+   */
+  ops.set("nova_schedule_resume", (args, { deps }) => {
+    const id = reqString(args, "schedule_id");
+    const row = deps.db
+      .prepare("SELECT * FROM schedules WHERE id = ?")
+      .get(id) as ScheduleRow | undefined;
+    if (!row) throw new OpError("not_found", `no such schedule: ${id}`);
+    const now = Date.now();
+    const next = nextOccurrenceAt(row, now);
+    if (row.cron_expr !== null && next === null) {
+      // a cron validated at attach cannot go dead, but never store a
+      // live row that can never fire — refuse truthfully instead
+      throw new OpError(
+        "schema_invalid",
+        `cron "${row.cron_expr}" matches no future date — refusing to resume a dead schedule`,
+      );
+    }
+    deps.db
+      .prepare("UPDATE schedules SET enabled = 1, next_run_at = ? WHERE id = ?")
+      .run(next === null ? null : canonicalTimestamp(next), id);
+    const schedule = deps.db
+      .prepare(
+        "SELECT id, workspace_id, target_type, target_id AS task_id, cron_expr, run_at, timezone, missed_policy, enabled, last_run_at, next_run_at FROM schedules WHERE id = ?",
+      )
+      .get(id);
+    return { schedule_id: id, schedule };
   });
 
   ops.set("nova_daemon_pause", (_args, { deps }) => {
