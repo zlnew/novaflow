@@ -62,6 +62,23 @@ export function getChainRun(db: Db, chainRunId: string): ChainRunRow | undefined
     | undefined;
 }
 
+/**
+ * The chain abort's guarded terminal move (mcp.md nova_chain_abort row:
+ * chain run state `aborted`): `active -> aborted` ONLY - the WHERE
+ * clause is the guard, so a terminal chain never moves again and a
+ * raced second abort is a no-op. Returns whether the move applied.
+ * Param-validated single-row update - the chain module owns every
+ * chain_runs write (the daemon's write-discipline rule).
+ */
+export function setChainRunAborted(db: Db, chainRunId: string): boolean {
+  const res = db
+    .prepare(
+      "UPDATE chain_runs SET state = 'aborted', completed_at = ? WHERE id = ? AND state = 'active'",
+    )
+    .run(new Date().toISOString(), chainRunId);
+  return res.changes > 0;
+}
+
 export type ChainMemberRow = TaskRow;
 
 /** The chain's member tasks in ULID creation order. */

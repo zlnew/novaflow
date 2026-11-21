@@ -12,6 +12,7 @@ import { recoverOrphanedRuns, type RecoveryReport } from "./recovery.ts";
 import { createDispatcher, type DispatchStatus } from "./dispatch.ts";
 import { createRetryEvaluator, type RetryEvaluator } from "./retry.ts";
 import { createScheduleEvaluator, type ScheduleEvaluator } from "./schedules.ts";
+import { createChainEvaluator, type ChainEvaluator } from "../chain/readiness.ts";
 import { bindControlServer, type ControlServer } from "./server.ts";
 import { runVerification } from "../verify/runner.ts";
 import { verifyProtectedAndScope } from "../verify/protected.ts";
@@ -226,6 +227,24 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
           // reaches the retry/escalation evaluator exactly like a run
           // failure (which the dispatch hook already routes)
           if (validation.finalState === "failed") retry.evaluate(taskId);
+          // THE p4a CHAIN SEAM (the single natural evaluation point):
+          // the ONLY place the engine turns a settled/gate-approved
+          // validating task into a terminal outcome is completeValidation
+          // above — so the chain evaluator rides exactly here. A
+          // completed member propagates readiness downstream; a failed
+          // verdict hits the terminal rules (the discriminator will not
+          // confirm it — that failure came from validating). Non-chain
+          // tasks are a no-op inside evaluateForTask.
+          //
+          // The gate-approve→validating→completed path: a gate-APPROVED
+          // validating task is left to the operator/scheduler surfaces by
+          // the engine's existing documented scope (this seam's own doc,
+          // above) — the chain rides the SAME seam, so whatever surface
+          // drives that validation to a verdict lands here too. The gate
+          // surface's terminal FAILURE (awaiting_gate→failed, the chain-
+          // failed rule) is wired at the nova_gate_confirm_failure op,
+          // which owns that matrix row.
+          await chains.evaluateForTask(taskId);
         } catch (err) {
           // never-crash: a guard refusal (the task moved meanwhile —
           // operator abort, gate op) or a store closing mid-verification
@@ -256,6 +275,26 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
     });
     schedulesRef = schedules; // at creation, for the boot-failure catch
 
+    // The chain pause set (FR-TSK-08: scheduler-level — the chain_runs
+    // DDL has no paused value, the row stays 'active'): in-memory daemon
+    // state, consulted by the readiness evaluator (propagation
+    // withholds), the dispatcher (queued members are never admitted),
+    // and the chain status surface. A daemon restart unpauses (the
+    // same lifecycle as the daemon-level pause — documented).
+    const pausedChains = new Set<string>();
+
+    // The chain readiness/terminal evaluator (FR-TSK-07; 8.1 chain run
+    // ownership): every propagation rides enqueueTask's guarded row
+    // (trigger_type 'engine', actor 'chain-engine'), the boot-failure
+    // catch has nothing to stop (no timers — evaluation is event-driven).
+    const chains: ChainEvaluator = createChainEvaluator(db, {
+      enqueueOptions,
+      onEnqueued: (taskId: string) => {
+        dispatcherRef?.requestDispatch();
+      },
+      isPaused: (chainRunId: string) => pausedChains.has(chainRunId),
+    });
+
     const dispatcher = createDispatcher(db, {
       globalConcurrency: daemonConfig.concurrency.global,
       runOptions,
@@ -263,6 +302,7 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
       scheduleTick: () => {
         void schedules.evaluate();
       },
+      isChainPaused: (chainRunId: string | null) => chainRunId !== null && pausedChains.has(chainRunId),
       onRunConcluded: (taskId: string, outcome) => {
         if ("finalState" in outcome && outcome.finalState === "failed") {
           retry.evaluate(taskId);
@@ -276,9 +316,13 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
     dispatcherRef = dispatcher;
     // FR-SCH-03 AC2 first: missed-run recovery applies each schedule's
     // policy (skip | run_immediately) BEFORE any tick can fire a
-    // missed schedule unreviewed; then the retry boot scan.
+    // missed schedule unreviewed; then the retry boot scan; then the
+    // chain boot sweep (FR-TSK-07: a completion that happened while the
+    // daemon was down still propagates exactly once, and a
+    // terminal-implied chain moves at boot).
     await schedules.bootScan();
     retry.bootScan(); // spent budgets escalate; elapsed delays requeue
+    await chains.bootScan();
 
     const daemonStatus = (): DaemonStatus => {
       const spend = globalSpend(db);
@@ -322,6 +366,8 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
         db,
         dispatcher,
         retry,
+        chains,
+        pausedChains,
         daemonConfig,
         daemonStatus,
         requestStop: () => {

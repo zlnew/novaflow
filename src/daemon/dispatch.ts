@@ -91,6 +91,15 @@ export type DispatchOptions = {
    * it freezes new spawns.
    */
   scheduleTick?: (() => void) | undefined;
+  /**
+   * Chain pause gate (FR-TSK-08 — scheduler-level, in-memory): a
+   * paused chain's QUEUED members are skipped by candidate admission
+   * and stay QUEUED (the same discipline the archived-workspace gate
+   * uses; the flag is daemon memory by the FR-TSK-08 ruling, so it
+   * filters here rather than in the SQL). Null chain_run_id (single
+   * tasks) is never paused.
+   */
+  isChainPaused?: ((chainRunId: string | null) => boolean) | undefined;
 };
 
 export type RunStartFailure = { taskId: string; error: string };
@@ -116,6 +125,7 @@ type CandidateRow = {
   created_at: string;
   workspace_id: string;
   ws_root: string;
+  chain_run_id: string | null;
 };
 
 function warn(message: string): void {
@@ -162,7 +172,7 @@ export function createDispatcher(db: Db, opts: DispatchOptions) {
     if (paused || stopped) return;
     const candidates = db
       .prepare(
-        `SELECT t.id, t.created_at, p.workspace_id, w.root_path AS ws_root
+        `SELECT t.id, t.created_at, p.workspace_id, w.root_path AS ws_root, t.chain_run_id
            FROM tasks t
            JOIN projects p ON p.id = t.project_id
            JOIN workspaces w ON w.id = p.workspace_id
@@ -187,6 +197,9 @@ export function createDispatcher(db: Db, opts: DispatchOptions) {
         if (Date.now() < cd) continue;
         cooldownUntil.delete(c.id); // expired: re-eligible
       }
+      // chain pause gate (FR-TSK-08): a paused chain's members stay
+      // QUEUED — skipped like an archived workspace's, never dropped
+      if (opts.isChainPaused?.(c.chain_run_id) === true) continue;
 
       // ---- slot granted: startRun applies the verbatim queued→running
       // row (START_TRIGGER, one source) and owns the attempt ----
