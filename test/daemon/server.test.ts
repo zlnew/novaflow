@@ -684,6 +684,52 @@ function rlastIdx(rows: Array<Record<string, unknown>>): number {
 
 /* --------------------- nova_task_create payload parts (mcp.md \u00a73.2) --------------------- */
 
+test("profile name resolution prefers the workspace-scoped row over a stale global (real-use finding)", async () => {
+  const env = await boot();
+  try {
+    const db = new Database(env.dbPath);
+    // a GLOBAL row created first (lower rowid — the old query picked it on
+    // rowid order) with a prompt path that does not resolve in this
+    // workspace, and the workspace-scoped row created second with the
+    // working path
+    // a UNIQUE name so the seed's own 'dev' never enters the query
+    db.prepare(
+      `INSERT INTO agent_profiles (id, name, provider, model, thinking_level, tools_allowlist_json,
+                                   system_prompt_path, max_timeout_sec, max_cost_usd)
+       VALUES (?, 'ghost', 'omniroute', 'm/global-model', 'medium', '[]',
+               'prompts/global-does-not-resolve.md', 3600, 5)`,
+    ).run(ulid());
+    const wsScopedId = ulid();
+    const wsId = (
+      db.prepare("SELECT workspace_id FROM projects WHERE id = ?").get(env.projectId) as { workspace_id: string }
+    ).workspace_id;
+    db.prepare(
+      `INSERT INTO agent_profiles (id, name, workspace_id, provider, model, thinking_level, tools_allowlist_json,
+                                   system_prompt_path, max_timeout_sec, max_cost_usd)
+       VALUES (?, 'ghost', ?, 'omniroute', 'm/ws-model', 'medium', '[]',
+               'prompts/ws.md', 3600, 5)`,
+    ).run(wsScopedId, wsId);
+    db.close();
+
+    const created = await env.client.request({
+      id: "c-shadow",
+      op: "nova_task_create",
+      args: { project_id: env.projectId, key: "SHADOW", title: "t", objective: "o", profile_name: "ghost" },
+    });
+    assert.equal(created["ok"], true);
+    const taskId = ((created["data"] as Record<string, unknown>)["task"] as { id: string }).id;
+    const db2 = new Database(env.dbPath, { readonly: true });
+    try {
+      const pinned = db2.prepare("SELECT profile_id FROM tasks WHERE id = ?").get(taskId) as { profile_id: string };
+      assert.equal(pinned.profile_id, wsScopedId, "the workspace-scoped profile wins, not the stale global row");
+    } finally {
+      db2.close();
+    }
+  } finally {
+    await shutdown(env);
+  }
+});
+
 test("nova_task_create persists overrides, target_scopes, output_schema_version; malformed payloads refuse with schema_invalid", async () => {
   const env = await boot();
   try {
