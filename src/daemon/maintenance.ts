@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { basename, dirname } from "node:path";
 import type { Db } from "../store/db.ts";
@@ -62,10 +62,14 @@ type RunDirRow = { run_dir: string; task_id: string; run_id: string };
 
 /**
  * Every run directory the store can prove exists: the recorded
- * `pi_session_dir` of each run row, plus (defensively) the canonical
- * `<root>/.novaflow/runs/<task>/<run>` derivation for rows that lack one.
- * Only paths that resolve INSIDE a registered workspace's runs tree are
- * admitted — a corrupted row can never steer the allowlist elsewhere.
+ * `pi_session_dir` of each run row. Only paths whose REALPATH (symlinks
+ * dereferenced) sits inside the runs tree's own realpath are admitted —
+ * resolve() alone is lexical and lets a symlinked run dir steer the
+ * delete outside the tree (judge-proven). Rows without a recorded dir,
+ * and orphan run dirs with no row, are simply not scanned: nothing
+ * deletes them today, and they are absent from the report (a future
+ * sweep may list them — this module stays a deleter of recorded runs
+ * only).
  */
 function runDirs(db: Db): { dirs: RunDirRow[]; rejected: SkippedFile[] } {
   const rows = db
@@ -84,12 +88,34 @@ function runDirs(db: Db): { dirs: RunDirRow[]; rejected: SkippedFile[] } {
     if (row.run_dir === null || row.run_dir === "") continue; // nothing to scan
     const runsRoot = resolve(row.ws_root, ".novaflow", "runs");
     const dir = resolve(row.run_dir);
-    // containment: the recorded dir must sit inside THIS workspace's runs tree
+    // containment: the recorded dir must sit inside THIS workspace's
+    // runs tree — lexically AND by realpath (a symlinked run dir is a
+    // delete-escape otherwise, judge B finding 1)
     if (!dir.startsWith(runsRoot + "/")) {
       rejected.push({
         path: dir,
         age_days: null,
         reason: "recorded run dir is outside the workspace's .novaflow/runs tree — refused by the path allowlist",
+      });
+      continue;
+    }
+    let realDir: string;
+    try {
+      const realRoot = realpathSync(runsRoot);
+      realDir = realpathSync(dir);
+      if (!realDir.startsWith(realRoot + "/")) {
+        rejected.push({
+          path: dir,
+          age_days: null,
+          reason: "recorded run dir is a symlink pointing outside the workspace's runs tree — refused by the path allowlist",
+        });
+        continue;
+      }
+    } catch {
+      rejected.push({
+        path: dir,
+        age_days: null,
+        reason: "recorded run dir does not exist (or its realpath is unavailable) — refused by the path allowlist",
       });
       continue;
     }

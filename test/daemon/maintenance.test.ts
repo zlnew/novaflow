@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import {
   existsSync,
+  symlinkSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -113,10 +114,10 @@ test("nova_daemon_backup: the daemon writes a consistent copy of ITS store (defa
     } finally {
       copy.close();
     }
-    // the copy is created with the store's own 0644 default (SQLite opens
-    // the destination itself) — the daemon's directory carries the privacy
-    // (0600 socket, operator home); pinned so a change is visible
-    assert.equal(statSync(dest).mode & 0o777, 0o644);
+    // the copy is FORCED to 0600 (judge B finding 3: a state store backup
+    // is operator-private; the 0644-by-umask default was the false posture
+    // the source doc claimed against)
+    assert.equal(statSync(dest).mode & 0o777, 0o600);
     // the live store is untouched and still serving
     assert.equal(countWorkspaces(env.dbPath), before);
     ok(await env.client.request({ id: "s1", op: "nova_daemon_status", args: {} }));
@@ -289,6 +290,86 @@ test("nova_daemon_prune (default 30 days): purges ONLY stale run-dir events.raw.
     // nothing was "skipped" here except by retention/allowlist — the report is explicit
     const skipped = data["skipped"] as Array<Record<string, unknown>>;
     assert.ok(skipped.some((s) => s["path"] === fresh.raw && s["reason"] === "within retention"));
+  } finally {
+    await shutdown(env);
+  }
+});
+
+test("nova_daemon_prune containment: a run row OUTSIDE the runs tree is refused, nothing deleted (judge A finding 2)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-prune-out-"));
+  const env = await boot(dir);
+  try {
+    const outside = join(dir, "outside-home");
+    mkdirSync(outside, { recursive: true });
+    const victim = join(outside, "events.raw.jsonl");
+    writeFileSync(victim, "{}\n");
+    const taskId = ulid();
+    const runId = ulid();
+    // a corrupted row: pi_session_dir outside the workspace runs tree
+    const db = new Database(env.dbPath);
+    db.prepare(
+      `INSERT INTO tasks (id, project_id, key, title, objective, profile_id)
+       VALUES (?, ?, ?, ?, 'o', ?)`,
+    ).run(taskId, env.seeded.projectId, "K-OUT", "K-OUT", env.seeded.profileId);
+    db.prepare(
+      `INSERT INTO task_runs (id, task_id, attempt_number, status, pi_session_id,
+                              pi_session_dir, model_used, events_log_path, started_at)
+       VALUES (?, ?, 1, 'succeeded', ?, ?, 'm', ?, ?)`,
+    ).run(runId, taskId, runId, outside, join(outside, "events.jsonl"), new Date().toISOString());
+    db.close();
+    const data = ok(await env.client.request({ id: "p", op: "nova_daemon_prune", args: { retention_days: 0 } }));
+    const skipped = (data["skipped"] ?? []) as Array<Record<string, unknown>>;
+    assert.equal((data["purged"] as unknown[]).length, 0, "nothing purged");
+    assert.ok(
+      skipped.some((s) => String(s["reason"]).includes("outside the workspace")),
+      "the outside row is reported as refused",
+    );
+    assert.equal(existsSync(victim), true, "the outside file survives");
+  } finally {
+    await shutdown(env);
+  }
+});
+
+test("nova_daemon_prune containment: a SYMLINKED run dir cannot steer the delete outside the tree (judge B finding 1, CRITICAL)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-prune-sym-"));
+  const env = await boot(dir);
+  try {
+    // the victim home outside the runs tree, with a stale-looking raw file
+    const victimHome = join(dir, "victim-home");
+    mkdirSync(victimHome, { recursive: true });
+    const victim = join(victimHome, "events.raw.jsonl");
+    writeFileSync(victim, "{}\n");
+    const when = new Date(Date.now() - 90 * 24 * 3600 * 1000);
+    utimesSync(victim, when, when);
+
+    const taskId = ulid();
+    const runId = ulid();
+    // the recorded dir is LEXICALLY inside the runs tree but is a symlink
+    // to the victim home — the old resolve()-only containment admitted it
+    const linkDir = join(env.wsRoot, ".novaflow", "runs", taskId, runId);
+    mkdirSync(join(env.wsRoot, ".novaflow", "runs", taskId), { recursive: true });
+    symlinkSync(victimHome, linkDir);
+    const db = new Database(env.dbPath);
+    db.prepare(
+      `INSERT INTO tasks (id, project_id, key, title, objective, profile_id)
+       VALUES (?, ?, ?, ?, 'o', ?)`,
+    ).run(taskId, env.seeded.projectId, "K-SYM", "K-SYM", env.seeded.profileId);
+    db.prepare(
+      `INSERT INTO task_runs (id, task_id, attempt_number, status, pi_session_id,
+                              pi_session_dir, model_used, events_log_path, started_at)
+       VALUES (?, ?, 1, 'succeeded', ?, ?, 'm', ?, ?)`,
+    ).run(runId, taskId, runId, linkDir, join(linkDir, "events.jsonl"), new Date().toISOString());
+    db.close();
+
+    const data = ok(await env.client.request({ id: "p", op: "nova_daemon_prune", args: { retention_days: 0 } }));
+    const skipped = (data["skipped"] ?? []) as Array<Record<string, unknown>>;
+    assert.equal((data["purged"] as unknown[]).length, 0, "nothing purged through the symlink");
+    assert.ok(
+      skipped.some((s) => String(s["reason"]).includes("symlink pointing outside")),
+      "the symlinked run dir is reported as refused",
+    );
+    assert.equal(existsSync(victim), true, "the victim file outside the tree SURVIVES");
+    // pre-fix, this exact probe deleted the victim (judge B live-proven)
   } finally {
     await shutdown(env);
   }

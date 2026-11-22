@@ -91,17 +91,19 @@ async function create(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
   const ctx = await workspaceContext(workspaceOverride(p, opts));
   const projectId = await resolveProjectIdent(projectIdent, ctx.id);
   /**
-   * FR-WS-04 AC2: `--context` values that name an INDEXED DOCUMENT are
-   * resolved by the daemon against the workspace docs index and written to
-   * the same `tasks.context_files_json` the run loop injects from. The
-   * split is deliberate and narrow — a `docs/<name>.md|.txt|.rst` reference
-   * (or a bare `<name>` with one of those extensions) is a DOC REFERENCE;
-   * every other `--context` value stays the plain workspace-relative
-   * context file it has always been (FR-TSK-04). The daemon does the
-   * resolution because only it knows the workspace root.
+   * FR-WS-04 AC2: `--context` values in the docs-index spelling (`docs/…`,
+   * exactly what `nova docs list` prints in its path column) are DOC
+   * REFERENCES, resolved by the daemon against the workspace docs index and
+   * written to the same `tasks.context_files_json` the run loop injects
+   * from. EVERYTHING ELSE — including plain `.md`/`.txt`/`.rst` paths
+   * outside docs/ — stays the plain workspace-relative context file it has
+   * always been (FR-TSK-04): routing by extension broke previously-valid
+   * inputs (judge B finding 2), and the srs names the selection surface as
+   * the docs-list printed path, which is always `docs/…`. The daemon does
+   * the resolution because only it knows the workspace root.
    */
   const contextArgs = p.lists.get("context") ?? [];
-  const isDocReference = (v: string): boolean => /\.(md|txt|rst)$/i.test(v.replace(/^\.\//, ""));
+  const isDocReference = (v: string): boolean => v.replace(/^\.\//, "").startsWith("docs/");
   const docReferences = contextArgs.filter(isDocReference);
   const plainContextFiles = contextArgs.filter((v) => !isDocReference(v));
   const data = (await daemonRequest("nova_task_create", {

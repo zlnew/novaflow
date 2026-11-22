@@ -257,3 +257,59 @@ test("task creation refuses an unresolvable doc reference, naming it (schema_inv
     await shutdown(e);
   }
 });
+test("mixed --context: a PLAIN .md path outside docs/ stays a context file; a docs/ reference stays a doc (judge B finding 2)", async () => {
+  const e = await boot();
+  assert.equal(runNova(["workspace", "switch", e.slug], e.env).code, 0);
+  try {
+    writeFileSync(join(e.wsRoot, "docs", "spec.md"), "# Spec\n");
+    const prof = join(e.dir, "dev3.json");
+    writeFileSync(
+      prof,
+      JSON.stringify({
+        name: "dev3",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet-20241022",
+        thinking_level: "medium",
+        tools_allowlist: ["read"],
+        system_prompt_path: "prompts/dev.md",
+        limits: { max_timeout_sec: 3600, max_cost_usd: 5 },
+      }),
+    );
+    mkdirSync(join(e.wsRoot, "prompts"), { recursive: true });
+    // the exact pre-p7 working shape: a plain .md context file that is NOT
+    // an indexed doc — extension-based routing turned this into a hard
+    // schema_invalid; the docs/ prefix is the ONLY doc-reference spelling
+    writeFileSync(join(e.wsRoot, "prompts", "dev.md"), "You are a worker.\n");
+    assert.equal(runNova(["profile", "create", "--file", prof], e.env).code, 0);
+    assert.equal(runNova(["project", "create", "prj3", "--objective", "Build it."], e.env).code, 0);
+
+    const created = runNova(
+      [
+        "task",
+        "create",
+        "MIX-1",
+        "--title",
+        "mixed context",
+        "--objective",
+        "Use both.",
+        "--profile",
+        "dev3",
+        "--project",
+        "prj3",
+        "--context",
+        "docs/spec.md",
+        "--context",
+        "prompts/dev.md",
+      ],
+      e.env,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const list = runNova(["task", "list", "--json"], e.env);
+    const tasks = (JSON.parse(list.stdout.trim()) as { tasks: Array<{ context_files_json: string }> }).tasks;
+    const ctx = JSON.parse(tasks[0]!.context_files_json) as string[];
+    assert.ok(ctx.some((c) => c.endsWith("docs/spec.md")), "the doc reference resolved into context files");
+    assert.ok(ctx.includes("prompts/dev.md"), "the PLAIN .md path is recorded verbatim, as before p7");
+  } finally {
+    await shutdown(e);
+  }
+});
