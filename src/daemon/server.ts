@@ -9,7 +9,6 @@ import {
   createTask,
   enqueueTask,
   getTask,
-  listTasks,
   type CreateTaskTargetScope,
 } from "../tasks.ts";
 import {
@@ -26,7 +25,6 @@ import {
   createWorkspace,
   getWorkspace,
   isWritableDirectory,
-  listWorkspaces,
   resolveWorkspaceArg,
   setWorkspaceStatus,
   deleteWorkspace,
@@ -37,7 +35,6 @@ import {
   createProject,
   getProject,
   listProjectTargets,
-  listProjects,
   projectTaskCounts,
   setProjectPhase,
   MAX_PHASE_LENGTH,
@@ -46,7 +43,6 @@ import {
 } from "../projects.ts";
 import { bareId, isUlid } from "../store/ids.ts";
 import { RetryBudgetExhaustedError } from "../validating.ts";
-import { validateArtifact, type TaskHandoffArtifact } from "../runs/artifact.ts";
 import { parseCron, nextRun } from "../sched/cron.ts";
 import { parseIsoRunAt, canonicalTimestamp } from "../sched/iso.ts";
 import { nextOccurrenceAt, type ScheduleRow } from "./schedules.ts";
@@ -65,6 +61,26 @@ import {
 import { memberReadiness, type ChainEvaluator } from "../chain/readiness.ts";
 import { deliveredFeedbackPaths, driveSelfPathRequeue, type RoutingEvaluator } from "../chain/routing.ts";
 import { parseYaml, YamlParseError } from "../chain/yaml.ts";
+import {
+  latestRun,
+  projectList as readProjectList,
+  requireTask,
+  resultGet as readResultGet,
+  runById,
+  runLogs as readRunLogs,
+  taskList as readTaskList,
+  taskStatus as readTaskStatus,
+  workspaceList as readWorkspaceList,
+} from "./readops.ts";
+import {
+  OpError,
+  optBoolean,
+  optNonEmptyString,
+  optString,
+  optStringArray,
+  reqString,
+} from "../opcodes.ts";
+import type { TaxonomyCode } from "../opcodes.ts";
 
 /**
  * THE v1 CONTROL PLANE (architecture 8.1, control-surface transport):
@@ -115,33 +131,13 @@ import { parseYaml, YamlParseError } from "../chain/yaml.ts";
  */
 
 /**
- * The srs 4.1.1 error-code taxonomy, verbatim. NOTE: `preflight_failed`
- * and `budget_exceeded` are RESERVED-FOR-CLIENT-MAPPING in v1 — the
- * daemon's ops never return them as response frames; those verdicts
- * land on RUN ROWS (task_runs.error_summary: "preflight failure: …",
- * "budget_exceeded: …"). The CLI (p3b) and MCP server (p5) map the
- * run-row records to these codes client-side when surfacing outcomes.
+ * The taxonomy itself lives in src/opcodes.ts so the MCP server's
+ * SQLite-direct fallback (src/mcp/read.ts) raises the SAME typed
+ * failures this op table raises (mcp.md §4: one error taxonomy).
+ * Re-exported here for the established import sites.
  */
-export type TaxonomyCode =
-  | "invalid_transition"
-  | "schema_invalid"
-  /** Reserved-for-client-mapping (see the type doc above). */
-  | "preflight_failed"
-  /** Reserved-for-client-mapping (see the type doc above). */
-  | "budget_exceeded"
-  | "not_found"
-  | "daemon_unreachable"
-  | "duplicate"
-  | "aborted"
-  | "profile_unresolved";
-
-/** A typed op failure carrying a taxonomy code. */
-export class OpError extends Error {
-  constructor(readonly code: TaxonomyCode, message: string) {
-    super(message);
-    this.name = "OpError";
-  }
-}
+export type { TaxonomyCode } from "../opcodes.ts";
+export { OpError } from "../opcodes.ts";
 
 export type SocketSurface = "human" | "mcp";
 
@@ -195,37 +191,8 @@ export type ControlServer = {
 };
 
 /* ------------------------------ arg validation ------------------------------ */
-
-function reqString(args: Record<string, unknown>, key: string): string {
-  const v = args[key];
-  if (typeof v !== "string" || v.trim() === "") {
-    throw new OpError("schema_invalid", `args.${key} must be a non-empty string`);
-  }
-  return v;
-}
-
-function optString(args: Record<string, unknown>, key: string, fallback: string): string {
-  const v = args[key];
-  return typeof v === "string" && v.trim() !== "" ? v : fallback;
-}
-
-function optStringArray(args: Record<string, unknown>, key: string): string[] | undefined {
-  const v = args[key];
-  if (v === undefined) return undefined;
-  if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) {
-    throw new OpError("schema_invalid", `args.${key} must be an array of strings`);
-  }
-  return v as string[];
-}
-
-function optBoolean(args: Record<string, unknown>, key: string): boolean | undefined {
-  const v = args[key];
-  if (v === undefined) return undefined;
-  if (typeof v !== "boolean") {
-    throw new OpError("schema_invalid", `args.${key} must be a boolean`);
-  }
-  return v;
-}
+// the shared validators (src/opcodes.ts) — imported above, re-used here so
+// the socket and the MCP fallback validate identically
 
 /**
  * mcp.md §3.2 optional payload parts of nova_task_create, validated
@@ -235,15 +202,6 @@ function optBoolean(args: Record<string, unknown>, key: string): boolean | undef
  * (repo_alias + access_mode, optional string-array fields; column
  * defaults apply when omitted).
  */
-function optNonEmptyString(args: Record<string, unknown>, key: string): string | undefined {
-  const v = args[key];
-  if (v === undefined) return undefined;
-  if (typeof v !== "string" || v.trim() === "") {
-    throw new OpError("schema_invalid", `args.${key} must be a non-empty string`);
-  }
-  return v;
-}
-
 function parseOverridesArg(args: Record<string, unknown>): Record<string, unknown> | undefined {
   const v = args["overrides"];
   if (v === undefined) return undefined;
@@ -448,41 +406,6 @@ function parseTargetsArg(args: Record<string, unknown>): ProjectTargetInput[] | 
   return out;
 }
 
-type RunRow = {
-  id: string;
-  task_id: string;
-  attempt_number: number;
-  status: string;
-  preflight_status: string;
-  model_used: string;
-  pid: number | null;
-  input_tokens: number;
-  output_tokens: number;
-  cost_usd: number;
-  exit_code: number | null;
-  artifact_path: string | null;
-  events_log_path: string;
-  error_summary: string | null;
-  started_at: string;
-  ended_at: string | null;
-};
-
-function latestRun(db: Db, taskId: string): RunRow | undefined {
-  return db
-    .prepare("SELECT * FROM task_runs WHERE task_id = ? ORDER BY attempt_number DESC LIMIT 1")
-    .get(taskId) as RunRow | undefined;
-}
-
-function runById(db: Db, runId: string): RunRow | undefined {
-  return db.prepare("SELECT * FROM task_runs WHERE id = ?").get(runId) as RunRow | undefined;
-}
-
-function requireTask(db: Db, taskId: string) {
-  const task = getTask(db, taskId);
-  if (!task) throw new OpError("not_found", `no such task: ${taskId}`);
-  return task;
-}
-
 /** mcp.md §3.2 payload is {project_id, key, title, objective, profile_name…}. */
 function resolveProfileByName(db: Db, projectId: string, name: string): string {
   const project = db
@@ -581,78 +504,38 @@ export function buildOpTable(): Map<string, OpHandler> {
     return { task };
   });
 
-  ops.set("nova_task_status", (args, { deps }) => {
-    const task = requireTask(deps.db, reqString(args, "task_id"));
-    const current = latestRun(deps.db, task.id);
-    const elapsedMs =
-      current !== undefined && current.status === "running"
-        ? Date.now() - Date.parse(current.started_at)
-        : null;
-    const ws = deps.db
-      .prepare(
-        `SELECT w.status AS status, w.slug AS slug
-           FROM tasks t JOIN projects p ON p.id = t.project_id
-           JOIN workspaces w ON w.id = p.workspace_id WHERE t.id = ?`,
-      )
-      .get(task.id) as { status: string; slug: string };
-    return { task, current_run: current ?? null, elapsed_ms: elapsedMs, workspace: ws };
-  });
+  ops.set("nova_task_status", (args, { deps }) =>
+    // shared body (src/daemon/readops.ts) — the MCP daemon-down fallback
+    // serves the identical envelope (mcp.md §4)
+    readTaskStatus(deps.db, { task_id: reqString(args, "task_id") }),
+  );
 
-  ops.set("nova_task_list", (args, { deps }) => {
-    const projectId = args["project_id"] === undefined ? undefined : reqString(args, "project_id");
-    const state = args["state"] === undefined ? undefined : reqString(args, "state");
-    let rows = listTasks(deps.db, projectId);
-    if (state !== undefined) rows = rows.filter((t) => t.state === state);
-    return { tasks: rows };
-  });
+  ops.set("nova_task_list", (args, { deps }) =>
+    readTaskList(deps.db, {
+      ...(args["project_id"] === undefined ? {} : { project_id: reqString(args, "project_id") }),
+      ...(args["state"] === undefined ? {} : { state: reqString(args, "state") }),
+    }),
+  );
 
   // mcp.md §3.1 tool table: the wire name is `nova_result_get` — never
   // `nova_task_result` (one contract, no alias; the MCP server (p5) and
   // the CLI (p3b) build on exactly this name).
-  ops.set("nova_result_get", (args, { deps }) => {
-    const taskId = reqString(args, "task_id");
-    requireTask(deps.db, taskId);
-    const run =
-      args["run_id"] === undefined ? latestRun(deps.db, taskId) : runById(deps.db, reqString(args, "run_id"));
-    if (!run) throw new OpError("not_found", `no run for task ${taskId}`);
-    if (run.artifact_path === null) {
-      throw new OpError("not_found", `run ${run.id} has no validated result.json`);
-    }
-    let raw: unknown;
-    try {
-      raw = JSON.parse(readFileSync(run.artifact_path, "utf8"));
-    } catch {
-      throw new OpError("not_found", `result.json of run ${run.id} is unreadable`);
-    }
-    const res = validateArtifact(raw);
-    if (!res.ok) throw new OpError("schema_invalid", `result.json of run ${run.id} failed validation: ${res.errors.join("; ")}`);
-    return { run_id: run.id, artifact: res.artifact as TaskHandoffArtifact };
-  });
+  ops.set("nova_result_get", (args, { deps }) =>
+    readResultGet(deps.db, {
+      task_id: reqString(args, "task_id"),
+      ...(args["run_id"] === undefined ? {} : { run_id: reqString(args, "run_id") }),
+    }),
+  );
 
-  ops.set("nova_run_logs", (args, { deps }) => {
-    const taskId = reqString(args, "task_id");
-    requireTask(deps.db, taskId);
-    const run =
-      args["run_id"] === undefined ? latestRun(deps.db, taskId) : runById(deps.db, reqString(args, "run_id"));
-    if (!run) throw new OpError("not_found", `no run for task ${taskId}`);
+  ops.set("nova_run_logs", (args, { deps }) =>
     // FR-LOG-02: the run's log pointer IS the redacted read surface
     // (events_log_path = events.jsonl). The raw file is never served.
-    let text = "";
-    try {
-      text = readFileSync(run.events_log_path, "utf8");
-    } catch {
-      throw new OpError("not_found", `no events.jsonl for run ${run.id}`);
-    }
-    const tailLines = args["tail_lines"] === undefined ? 100 : (() => {
-      const n = args["tail_lines"];
-      if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || n > 1000) {
-        throw new OpError("schema_invalid", "args.tail_lines must be an integer 1..1000");
-      }
-      return n;
-    })();
-    const lines = text.split("\n").filter((l) => l !== "");
-    return { run_id: run.id, lines: lines.slice(-tailLines) };
-  });
+    readRunLogs(deps.db, {
+      task_id: reqString(args, "task_id"),
+      ...(args["run_id"] === undefined ? {} : { run_id: reqString(args, "run_id") }),
+      ...(args["tail_lines"] === undefined ? {} : { tail_lines: args["tail_lines"] }),
+    }),
+  );
 
   ops.set("nova_profile_list", (args, { deps }) => {
     // workspace filter (p3b, documented): the workspace's own profiles
@@ -740,9 +623,7 @@ export function buildOpTable(): Map<string, OpHandler> {
     return { id: workspace.id, workspace };
   });
 
-  ops.set("nova_workspace_list", (_args, { deps }) => {
-    return { workspaces: listWorkspaces(deps.db) };
-  });
+  ops.set("nova_workspace_list", (_args, { deps }) => readWorkspaceList(deps.db));
 
   // FR-WS-03 AC2: archive disables execution (dispatch skips non-active
   // workspaces). Idempotent by design: archiving an archived workspace
@@ -799,14 +680,13 @@ export function buildOpTable(): Map<string, OpHandler> {
 
   // workspace-scoped when workspace_id is given; otherwise every
   // workspace's projects (documented).
-  ops.set("nova_project_list", (args, { deps }) => {
-    const workspaceId =
-      args["workspace_id"] === undefined ? undefined : reqString(args, "workspace_id");
-    if (workspaceId !== undefined) {
-      requireWorkspaceById(deps.db, workspaceId);
-    }
-    return { projects: listProjects(deps.db, workspaceId) };
-  });
+  ops.set("nova_project_list", (args, { deps }) =>
+    readProjectList(deps.db, {
+      ...(args["workspace_id"] === undefined
+        ? {}
+        : { workspace_id: reqString(args, "workspace_id") }),
+    }),
+  );
 
   ops.set("nova_project_status", (args, { deps }) => {
     const projectId = reqString(args, "project_id");

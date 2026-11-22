@@ -16,6 +16,7 @@ import { taskCommand } from "./commands/task.ts";
 import { scheduleCommand } from "./commands/schedule.ts";
 import { daemonCommand } from "./commands/daemon.ts";
 import { chainCommand } from "./commands/chain.ts";
+import { mcpCommand } from "./commands/mcp.ts";
 import type { CommandOpts } from "./opts.ts";
 
 /**
@@ -23,10 +24,11 @@ import type { CommandOpts } from "./opts.ts";
  * JSONL socket surface: one command = one op call (single-writer rule,
  * architecture 8.1). The CLI never opens the SQLite store.
  *
- * Honest refusal: `nova mcp` is NOT in this phase (p5) — invoking it
- * prints a refusal to stderr and exits 2 (never fake success). The
- * usage table lists it with its phase note. `nova chain` shipped in
- * p4a (list/status/abort + FR-TSK-08's pause/resume).
+ * `nova mcp` (p5) starts the MCP control surface on stdio
+ * (novaflow-v1/mcp): it is a SERVER, so it runs until its client
+ * disconnects and exits 0 — see src/cli/commands/mcp.ts for why the srs
+ * exit map does not apply to it. `nova chain` shipped in p4a
+ * (list/status/abort + FR-TSK-08's pause/resume).
  */
 
 const VERSION = readVersion();
@@ -65,7 +67,7 @@ const USAGE = `USAGE: nova <noun> <sub> [args] [flags]
   nova schedule pause <schedule-id> | resume <schedule-id>
   nova chain list | status <chain-run-id>
   nova chain abort | pause | resume <chain-run-id>
-  nova mcp            (not implemented in this phase)`;
+  nova mcp            (MCP server on stdio; runs until its client disconnects)`;
 
 /**
  * Run one CLI invocation; returns the process exit code (0–5, the srs
@@ -128,8 +130,7 @@ async function dispatch(argv: string[]): Promise<number> {
     case "chain":
       return chainCommand(rest, opts);
     case "mcp":
-      console.error(`nova ${noun} is not implemented in this phase — refusing rather than faking success`);
-      return EXIT_USAGE;
+      return mcpCommand(rest, opts);
     default:
       throw new UsageError(`unknown command "${noun}"`);
   }

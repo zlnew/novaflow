@@ -11,9 +11,10 @@ import { waitFor } from "../daemon/client.ts";
  * CLI binary against a real detached daemon (stub pi via the documented
  * env knobs): both file formats over the wire, the exit-code battery
  * (schema_invalid → 3, not_found → 4, invalid_transition → 3, usage → 2),
- * the honest-refusal replacement (chain is real now; `nova mcp` still
- * refuses exit 2), and an end-to-end chain completing through the
- * operator's own commands (import → run root → propagate → completed).
+ * the p5 successor to the honest-refusal check (`nova mcp` is a server now:
+ * it exits 0 when its stdio client hangs up, and a stray argument is still
+ * usage → 2), and an end-to-end chain completing through the operator's
+ * own commands (import → run root → propagate → completed).
  */
 
 const REPO = join(import.meta.dirname, "..", "..");
@@ -237,10 +238,16 @@ test("nova project import-dag + nova chain end to end through the binary", async
     // unknown chain → 4; bare `nova chain` → 2
     assert.equal(runNova(["chain", "status", "01HJ8Z9X01ABCDEFGHJKMNPQRS"], h.env).code, 4);
     assert.equal(runNova(["chain"], h.env).code, 2);
-    // `nova mcp` still refuses honestly (exit 2)
+    // `nova mcp` is a SERVER now (p5): with no client on stdin it serves
+    // until EOF and exits 0 — a disconnected session is a normal end of
+    // service, not a usage error (mcp.md §2; src/cli/commands/mcp.ts).
     const mcp = runNova(["mcp"], h.env);
-    assert.equal(mcp.code, 2);
-    assert.match(mcp.stderr, /not implemented/);
+    assert.equal(mcp.code, 0, `stderr=${mcp.stderr}`);
+    assert.equal(mcp.stdout, "", "stdout is the protocol channel — nothing decorative");
+    // an extra argument is still a usage error (it would otherwise be
+    // silently dropped, which is the one thing a server must not do)
+    const mcpArg = runNova(["mcp", "stray"], h.env);
+    assert.equal(mcpArg.code, 2);
 
     // ---- the operator flow: run the root, the chain completes itself ----
     const runRoot = runNova(["task", "run", "A"], h.env);

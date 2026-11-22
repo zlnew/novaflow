@@ -329,6 +329,11 @@ if (RUN_MODES.has(mode)) {
               "  if (ms > 0) setTimeout(() => process.exit(0), ms);",
               "  else process.exit(0);",
               "});",
+              // readiness marker: the pid line is written at spawn(), but
+              // the handler only exists once node boots — abort tests wait
+              // for THIS line or a fast SIGTERM kills the grandchild before
+              // its handler installs (silent default-signal death)
+              "fs.appendFileSync(process.env.STUB_PIDFILE, 'GRANDCHILD-READY' + String.fromCharCode(10));",
               "setInterval(() => {}, 60000);",
             ].join(""),
           ],
