@@ -52,6 +52,12 @@ import type { Dispatcher } from "./dispatch.ts";
 import type { RetryEvaluator } from "./retry.ts";
 import { abortTriggerFor } from "./triggers.ts";
 import {
+  backupDaemonStore,
+  pruneRawEventStreams,
+  DEFAULT_RETENTION_DAYS,
+} from "./maintenance.ts";
+import { BackupRefusedError } from "../store/backup.ts";
+import {
   importChain,
   getChainRun,
   setChainRunAborted,
@@ -169,6 +175,12 @@ export type ServerDeps = {
   daemonConfig: DaemonConfig;
   /** The full nova_daemon_status payload (lifecycle owns uptime/version/budgets). */
   daemonStatus: () => Record<string, unknown>;
+  /**
+   * The store's on-disk path — the ONLY thing nova_daemon_backup needs
+   * besides the handle itself (the default destination sits alongside it).
+   * The daemon owns the store, so this is daemon state, not CLI state.
+   */
+  dbPath: string;
   /** Invoked AFTER the nova_daemon_stop response is written. */
   requestStop: () => void | Promise<void>;
   /** Catalog-probe injection for nova_task_run (tests point at the stub). */
@@ -587,6 +599,50 @@ export function buildOpTable(): Map<string, OpHandler> {
   });
 
   ops.set("nova_daemon_status", (_args, { deps }) => deps.daemonStatus());
+
+  /* -------------------- storage maintenance (p7; data.md 1.1/1.2) -------------------- */
+
+  /**
+   * data.md 1.1 "Database Backup Strategy" (MUST): live backups go through
+   * the SQLite online backup API. The op runs the copy IN THE DAEMON — it
+   * owns the store handle, so no other process ever opens the live file to
+   * take a backup (`src/daemon/maintenance.ts` → `src/store/backup.ts`).
+   * Default destination: alongside the store, `state.db.bak-<stamp>`.
+   * Attempting to write over an existing destination is `duplicate`.
+   */
+  ops.set("nova_daemon_backup", async (args, { deps }) => {
+    const out = optNonEmptyString(args, "out");
+    try {
+      return await backupDaemonStore(deps.db, deps.dbPath, out === undefined ? {} : { out });
+    } catch (err) {
+      if (err instanceof BackupRefusedError) {
+        // an existing destination is the taxonomy's `duplicate`; anything
+        // else the operator got wrong is `schema_invalid`
+        throw new OpError(/already exists/.test(err.message) ? "duplicate" : "schema_invalid", err.message);
+      }
+      throw err;
+    }
+  });
+
+  /**
+   * data.md 1.2 "Log Pruning & Rotation" (MAY): purge run-dir
+   * `events.raw.jsonl` files older than the retention window. The path
+   * allowlist — never a glob walk — lives in the op body.
+   */
+  ops.set("nova_daemon_prune", (args, { deps }) => {
+    const raw = args["retention_days"];
+    let retentionDays = DEFAULT_RETENTION_DAYS;
+    if (raw !== undefined) {
+      if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
+        throw new OpError(
+          "schema_invalid",
+          "args.retention_days must be a non-negative integer",
+        );
+      }
+      retentionDays = raw;
+    }
+    return pruneRawEventStreams(deps.db, { retentionDays });
+  });
 
   /* --------------- workspace / project / profile setup ops (p3b) -------------- */
 

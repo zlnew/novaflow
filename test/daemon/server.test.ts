@@ -915,6 +915,12 @@ test("write discipline: the daemon modules never issue a raw state UPDATE (grep-
     "src/mcp/version.ts",
     "src/daemon/readops.ts",
     "src/store/readonly.ts",
+    // p7: the storage-maintenance op bodies. backup writes a COPY of the
+    // store (never the store), prune unlinks run-dir raw streams via a
+    // structural path allowlist — neither may write state (the whole
+    // "never weaken the write discipline" point of a deleting op).
+    "src/daemon/maintenance.ts",
+    "src/store/backup.ts",
   ];
   for (const f of files) {
     const src = readFileSync(join(import.meta.dirname, "..", "..", f), "utf8");

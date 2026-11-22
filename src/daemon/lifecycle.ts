@@ -457,6 +457,7 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
         pausedChains,
         daemonConfig,
         daemonStatus,
+        dbPath: opts.dbPath,
         onGateApproved,
         requestStop: () => {
           void stop();
