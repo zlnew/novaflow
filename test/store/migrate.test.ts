@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { openDb } from "../../src/store/db.ts";
+import { openReadOnlyDb } from "../../src/store/readonly.ts";
 import { migrate, MIGRATIONS_DIR } from "../../src/store/migrate.ts";
 
 test("openDb creates a WAL database with foreign keys enforced", () => {
@@ -71,4 +72,22 @@ test("migrate is idempotent and refuses a tampered applied migration", () => {
   }
   db.close();
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("openDb applies the data.md 1.1 storage-layer pragmas (WAL, FK, busy_timeout 5000)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-pragmas-"));
+  const dbPath = join(dir, "state.db");
+  try {
+    const db = openDb(dbPath);
+    assert.equal(db.pragma("journal_mode", { simple: true }), "wal");
+    assert.equal(db.pragma("foreign_keys", { simple: true }), 1);
+    assert.equal(db.pragma("busy_timeout", { simple: true }), 5000);
+    db.close();
+    // the read-only handle carries the same busy timeout (data.md 1.1)
+    const ro = openReadOnlyDb(dbPath);
+    assert.equal(ro.pragma("busy_timeout", { simple: true }), 5000);
+    ro.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

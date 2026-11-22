@@ -28,7 +28,8 @@ export function openReadOnlyDb(path: string): ReadOnlyDb {
   // handle is a no-op the driver accepts. Guarded anyway: a store that
   // predates the migration would refuse, and the caller reports it.
   try {
-    db.pragma("busy_timeout = 2000");
+    // data.md 1.1: the same 5000 ms busy timeout on the read-only handle
+    db.pragma("busy_timeout = 5000");
   } catch {
     // a pragma failure is not a read failure — the query below decides
   }
