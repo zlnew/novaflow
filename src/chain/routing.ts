@@ -50,7 +50,8 @@ import { projectSummaryPath, writeProjectSummary } from "./summary.ts";
  * the retry evaluator's ONE `isTerminalGateFailure`) enqueues every
  * `on_failure` target in draft via the guarded draft→queued row
  * (`enqueueTask` — the same row readiness uses; trigger_type `engine`,
- * actor `chain-engine`), delivering a SYNTHESIZED failure context file:
+ * actor `chain-engine`; a target with no target_scopes refuses the
+ * same way — DEBT-010), delivering a SYNTHESIZED failure context file:
  * the member's latest run `error_summary` plus its result.json content
  * when one exists. Non-draft targets are consumed (matrix is the
  * arbiter — the schedule evaluator's quarantine discipline). The
