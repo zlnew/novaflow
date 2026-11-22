@@ -63,11 +63,17 @@ let requestId = 0;
  * Send one op, read one response. Throws DaemonUnreachableError (exit 5)
  * when the socket is missing or refuses; throws OpFailureError (exit by
  * the taxonomy map) when the daemon answers with an error frame.
+ *
+ * `surface` is the daemon's audit attribution (mcp.md §5): CLI commands
+ * omit it and get the wire default "human"; the MCP server (src/mcp)
+ * passes "mcp" so mutating calls record
+ * `state_transition_logs.trigger_type = 'mcp'`. One transport, one frame
+ * shape — the MCP surface is a client of THIS client, never a second one.
  */
 export async function daemonRequest(
   op: string,
   args: Record<string, unknown> = {},
-  opts: { socketPath?: string } = {},
+  opts: { socketPath?: string; surface?: "human" | "mcp" } = {},
 ): Promise<unknown> {
   const path = opts.socketPath ?? socketPath();
   if (!existsSync(path)) {
@@ -75,7 +81,10 @@ export async function daemonRequest(
       `no socket at ${path} — is the daemon running? (nova daemon start)`,
     );
   }
-  const line = await sendOneLine(path, JSON.stringify({ id: `cli-${++requestId}`, op, args, surface: "human" }));
+  const line = await sendOneLine(
+    path,
+    JSON.stringify({ id: `cli-${++requestId}`, op, args, surface: opts.surface ?? "human" }),
+  );
   let parsed: OpResponse;
   try {
     parsed = JSON.parse(line) as OpResponse;
