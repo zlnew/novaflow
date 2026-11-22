@@ -199,11 +199,10 @@ export function createNovaMcpServer(options: McpServerOptions = {}): Server {
       throw new OpError("not_found", `unknown MCP tool "${request.params.name}"`);
     }
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
-    // The SDK hands arguments through untouched; validate only what the
-    // daemon would validate anyway is NOT our job (the engine is the
-    // arbiter). One exception: `task_id`-shaped tools get a *type* check so
-    // a JSON object arrives as schema_invalid rather than as a confusing
-    // "no such task: [object Object]" — the daemon's own message is kept.
+    // Arguments go through untouched: the daemon's own validators are the
+    // only rejection surface (mcp.md §4 — the FSM/engine is the arbiter,
+    // and the SDK does not validate plain JSON Schema on dispatch, so the
+    // engine really does see every key the client sent).
     return invoke(tool, args, opts);
   });
 
