@@ -789,8 +789,8 @@ test("daemonRequest (ported client) honors NOVAFLOW_SOCK and frames surface 'hum
   await server.ready;
   try {
     process.env["NOVAFLOW_SOCK"] = sockPath;
-    const data = (await daemonRequest("nova_daemon_status", { x: 1 })) as Record<string, unknown>;
-    assert.equal(data["ok"], true);
+    const data = (await daemonRequest("nova_daemon_status", { x: 1 })) as { echoed?: boolean };
+    assert.equal(data["echoed"], true, "the ported client unwraps the daemon's data envelope");
     const frame = server.lastFrame as Record<string, unknown>;
     assert.equal(frame["op"], "nova_daemon_status");
     assert.equal(frame["surface"], "human", "the audit attribution is pinned (client.ts: surface 'human')");
