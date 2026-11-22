@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -13,7 +13,9 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import novaflowFactory, {
+  ARTIFACT_REQUIRED_KEYS,
   SUBMIT_TOOL_NAME,
+  SUBMIT_TOOL_PARAMS,
   bashWriteTargets,
   checkBashWriteScope,
   checkWritePath,
@@ -108,6 +110,14 @@ const RUN_ID = "01HJ8Z9XABCDEFGHJKMNPQRSTV";
 
 assert.match(TASK_ID, /^[0-9A-HJKMNP-TV-Z]{26}$/);
 assert.match(RUN_ID, /^[0-9A-HJKMNP-TV-Z]{26}$/);
+
+/** Foreign but PATTERN-VALID ids — the identity-binding probes (B4): they pass the §4.1 ULID check yet belong to another run. */
+const FOREIGN_TASK_ID = "01ZZZZZZZZZZZZZZZZZZZZZZZZ";
+const FOREIGN_RUN_ID = "01ZZZZZZZZZZZZZZZZZZZZZZZ0";
+assert.match(FOREIGN_TASK_ID, /^[0-9A-HJKMNP-TV-Z]{26}$/);
+assert.match(FOREIGN_RUN_ID, /^[0-9A-HJKMNP-TV-Z]{26}$/);
+assert.notEqual(FOREIGN_TASK_ID, TASK_ID);
+assert.notEqual(FOREIGN_RUN_ID, RUN_ID);
 
 type TargetFixture = {
   alias: string;
@@ -270,6 +280,25 @@ test("loadRunContext: zero mapped scopes mirror the engine — no enforcement, n
     const ctx = loadRunContext(contextPath);
     assert.equal(ctx.loadError, null);
     assert.deepEqual(ctx.scopes, []);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("loadRunContext: a snapshot target with an empty or non-absolute root_path is a loadError — never a silent process.cwd() scope", () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    const { contextPath } = seedRunDir(base);
+    const snapPath = join(dirname(contextPath), "protected-digests.json");
+    for (const bad of ["", "alpha"]) {
+      const snap = JSON.parse(readFileSync(snapPath, "utf8")) as { targets: Array<{ root_path: string }> };
+      snap.targets[0]!.root_path = bad;
+      writeFileSync(snapPath, JSON.stringify(snap));
+      const ctx = loadRunContext(contextPath);
+      assert.notEqual(ctx.loadError, null, `root_path ${JSON.stringify(bad)} must fail closed`);
+      assert.match(ctx.loadError!, /root_path/);
+      assert.match(ctx.loadError!, /failing closed/);
+    }
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -476,6 +505,95 @@ test("checkBashWriteScope: protected/read_only/out-of-scope bash writes refuse; 
   }
 });
 
+test("bashWriteTargets: the full redirect operator family, dd's of=, and the -t destination forms are extracted", () => {
+  assert.deepEqual(bashWriteTargets("cmd 2>> f"), ["f"], "append-on-stderr is a file write");
+  assert.deepEqual(bashWriteTargets("cmd 2>>f"), ["f"]);
+  assert.deepEqual(bashWriteTargets("cmd >| f"), ["f"], "the noclobber form is a file write");
+  assert.deepEqual(bashWriteTargets("cmd 2>| f"), ["f"]);
+  assert.deepEqual(bashWriteTargets("cmd &>> f"), ["f"]);
+  assert.deepEqual(bashWriteTargets("cmd 2>&1"), [], "fd duplication stays a non-write across the family");
+  assert.deepEqual(bashWriteTargets("dd if=/dev/zero of=f"), ["f"], "dd's write rides its of= operand");
+  assert.deepEqual(bashWriteTargets("dd if=/dev/zero of=alpha/src/disk.bin bs=1M count=1"), ["alpha/src/disk.bin"], "dd's other operands are not paths");
+  assert.deepEqual(bashWriteTargets("mv -t dir src"), ["dir", "dir/src"], "the -t directory is the destination, not the last operand");
+  assert.deepEqual(bashWriteTargets("cp -t dir a b"), ["dir", "dir/a", "dir/b"]);
+  assert.deepEqual(bashWriteTargets("install -t dir src"), ["dir", "dir/src"]);
+  assert.deepEqual(bashWriteTargets("mv --target-directory=dir a b"), ["dir", "dir/a", "dir/b"]);
+  assert.deepEqual(bashWriteTargets("mv a b"), ["b"], "the plain form keeps last-operand destination semantics");
+});
+
+test("checkBashWriteScope: operator family, dd of=, -t destinations and ln sources refuse; cd is tracked per segment", () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    const { contextPath } = seedRunDir(base);
+    const { scopes } = loadRunContext(contextPath);
+    mkdirSync(join(base, "outside"), { recursive: true });
+    writeFileSync(join(base, "outside", "evil.txt"), "x\n");
+
+    const blocked = (cmd: string, word: RegExp, cwd: string = base, note?: string): void => {
+      const res = checkBashWriteScope(scopes, cwd, cmd);
+      assert.equal(res.ok, false, `expected a block for: ${cmd}${note !== undefined ? ` (${note})` : ""}`);
+      assert.match((res as { reason: string }).reason, word);
+    };
+    const allowed = (cmd: string, cwd: string = base, note?: string): void => {
+      assert.deepEqual(
+        checkBashWriteScope(scopes, cwd, cmd),
+        { ok: true },
+        `expected a pass for: ${cmd}${note !== undefined ? ` (${note})` : ""}`,
+      );
+    };
+
+    // the operator family lands its targets
+    blocked("cmd 2>> alpha/other/o.txt", /write scope/);
+    blocked("cmd >| alpha/other/o.txt", /write scope/, base, "the noclobber form");
+    blocked("cmd 2>| alpha/other/o.txt", /write scope/);
+    blocked("dd if=/dev/zero of=alpha/other/d.bin", /write scope/);
+    blocked("mv -t alpha/other alpha/src/a.ts", /write scope/, base, "the -t directory is the destination");
+    blocked("cp --target-directory=alpha/other alpha/src/a.ts", /write scope/);
+
+    // ln TOCTOU: the source is held to the write-scope verdict — a link
+    // created inside a governed root from an out-of-scope source is the
+    // create-then-write window, refused at the ln itself
+    blocked(`ln -s ${join(base, "outside", "evil.txt")} ${join(base, "alpha", "src", "evil")}`, /create-then-write|no target scope/);
+    blocked(`ln ${join(base, "outside", "evil.txt")} ${join(base, "alpha", "src", "evil")}`, /create-then-write|no target scope/, base, "the hard-link form");
+    blocked(
+      `ln -s ${join(base, "beta", "data", "notes.txt")} ${join(base, "alpha", "src", "l")}`,
+      /read_only/,
+      base,
+      "a read_only target's file as the link source",
+    );
+    blocked(
+      `ln -s ${join(base, "outside", "evil.txt")} ${join(base, "alpha", "src", "evil")} && echo x > ${join(base, "alpha", "src", "evil")}`,
+      /create-then-write/,
+      base,
+      "the full same-command chain blocks at the ln",
+    );
+    blocked(
+      `ln -s ${join(base, "beta", "data", "notes.txt")} ${join(base, "alpha", "src", "l")} && echo pwned >> ${join(base, "alpha", "src", "l")}`,
+      /read_only/,
+    );
+
+    // cd moves the resolution base for every later segment
+    blocked("cd ../../outside && echo x > feature.ts", /no target scope/, join(base, "alpha", "src"), "the bypass probe");
+    blocked("cd - && echo x > f", /no target scope/, join(base, "alpha", "src"), "cd - fails closed");
+    blocked("cd no-such-dir && echo x > f", /no target scope/, join(base, "alpha", "src"), "a nonexistent cd fails closed");
+    blocked("cd && echo x > f", /no target scope/, join(base, "alpha", "src"), "cd with no argument fails closed");
+
+    // the in-scope directions stay allowed
+    allowed("cd alpha/src && echo done > build.log", base, "the in-scope landing after cd (no false positive)");
+    allowed("cd alpha && cd src && echo done > build.log", base, "chained cds track");
+    allowed("ln -s alpha/src/a.txt alpha/src/b.txt", base, "an in-scope link from an in-scope source is fine");
+    allowed("echo x > alpha/src/log.txt");
+    allowed("cd - && echo x > /dev/null", base, "device sinks are exempt even after an untracked cd");
+    allowed(
+      `cd - && echo x > ${join(base, "alpha", "src", "abs.txt")}`,
+      base,
+      "absolute targets never depended on the working directory",
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test("artifact parity: the ported structural validator answers identically to the engine's (src/runs/artifact.ts)", () => {
   const corpus: Array<[string, Record<string, unknown>]> = [
     ["full valid artifact", { ...validArtifact(), role: "worker", engine_verified: false, protected_files_untouched: true, verification_results: [{ command: "npm test", exit_code: 0, passed: true, output_tail: "ok" }] }],
@@ -568,6 +686,68 @@ test(`validateAndWriteResult: payloads over the ${MAX_RESULT_PAYLOAD_BYTES}-byte
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+test("validateAndWriteResult: the cap is measured on the SERIALIZED bytes that land on disk, not a compact projection", () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    // 140k multibyte chars: the compact JSON's UTF-16 length sits under
+    // the cap, but the pretty-printed result.json on disk is over it
+    const sneaky = { ...validArtifact(), summary: "\u00e9".repeat(140_000) };
+    assert.ok(JSON.stringify(sneaky).length < MAX_RESULT_PAYLOAD_BYTES, "the compact projection is under the cap");
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(sneaky, null, 2) + "\n", "utf8") > MAX_RESULT_PAYLOAD_BYTES,
+      "the on-disk form is over the cap",
+    );
+    const res = validateAndWriteResult(base, sneaky) as { ok: false; errors: string[] };
+    assert.equal(res.ok, false);
+    assert.ok(res.errors.some((e) => e.includes("serialized")), JSON.stringify(res.errors));
+    assert.ok(res.errors.some((e) => e.includes("cap")));
+    assert.ok(!existsSync(join(base, "result.json")), "an over-cap-on-disk payload must not leave a file");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("validateAndWriteResult: identity binding — foreign task_id/run_id (pattern-valid) refused; the true pair accepted", () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    const foreign = { ...validArtifact(), task_id: FOREIGN_TASK_ID, run_id: FOREIGN_RUN_ID };
+    assert.equal(validateArtifactStructure(foreign).ok, true, "the foreign pair passes the structural validator — only the binding catches it");
+    const res = validateAndWriteResult(base, foreign, { taskId: TASK_ID, runId: RUN_ID }) as { ok: false; errors: string[] };
+    assert.equal(res.ok, false);
+    assert.ok(res.errors.some((e) => e.includes("do not match")), JSON.stringify(res.errors));
+    assert.ok(res.errors.some((e) => e.includes(TASK_ID)));
+    assert.ok(res.errors.some((e) => e.includes(FOREIGN_TASK_ID)));
+    assert.ok(!existsSync(join(base, "result.json")), "a foreign-identity artifact must not leave a file");
+
+    const okRes = validateAndWriteResult(base, validArtifact(), { taskId: TASK_ID, runId: RUN_ID });
+    assert.equal(okRes.ok, true, "the loaded context's own pair is accepted");
+    assert.ok(existsSync(join(base, "result.json")));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("SUBMIT_TOOL_PARAMS: strict JSON Schema pinned — additionalProperties:false at every object level, file_location requires path+line", () => {
+  const p = SUBMIT_TOOL_PARAMS as unknown as {
+    additionalProperties: unknown;
+    required: unknown;
+    properties: Record<string, { items?: { additionalProperties: unknown; required: unknown; properties: Record<string, unknown> } }>;
+  };
+  assert.equal(p.additionalProperties, false, "the top level is a closed object");
+  assert.deepEqual(p.required, ARTIFACT_REQUIRED_KEYS);
+  for (const key of ["artifacts_modified", "feedback_items", "verification_results"]) {
+    const items = p.properties[key]!.items!;
+    assert.equal(items.additionalProperties, false, `${key}[] entries are closed objects`);
+    assert.ok(Array.isArray(items.required) && items.required.length > 0, `${key}[] entries carry required keys`);
+  }
+  const fl = p.properties["feedback_items"]!.items!.properties["file_location"] as {
+    additionalProperties: unknown;
+    required: unknown;
+  };
+  assert.equal(fl.additionalProperties, false);
+  assert.deepEqual(fl.required, ["path", "line"], "the pi layer matches the in-process validator's file_location rule");
 });
 
 /* ----------------------------- factory (run mode) ----------------------------- */
@@ -683,6 +863,111 @@ test("run mode: submit_result invalid → structured block error, NO terminate, 
   }
 });
 
+test("run mode: a structurally valid artifact with FOREIGN ids is rejected by the submit identity binding", async () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    const { pi, runDir } = buildRunMode(base);
+    await pi.handlers.get("session_start")!({ type: "session_start", reason: "startup" } as SessionStartEvent, fakeCtx(base).ctx);
+
+    const foreign = { ...validArtifact(), task_id: FOREIGN_TASK_ID, run_id: FOREIGN_RUN_ID };
+    assert.equal(validateArtifactStructure(foreign).ok, true, "the foreign pair is pattern-valid — only the binding catches it");
+    const res = await fireToolCall(pi.handlers, SUBMIT_TOOL_NAME, foreign, base);
+    assert.equal((res.result as { block?: boolean }).block, true);
+    assert.equal((res.result as { terminate?: boolean }).terminate, undefined);
+    assert.match((res.result as { reason: string }).reason, /do not match/);
+    assert.match((res.result as { reason: string }).reason, new RegExp(FOREIGN_TASK_ID));
+    assert.ok(!existsSync(join(runDir, "result.json")), "a foreign-identity submission must not leave a file");
+
+    // the true pair is still accepted on the same session
+    const okRes = await fireToolCall(pi.handlers, SUBMIT_TOOL_NAME, validArtifact(), base);
+    assert.deepEqual(okRes.result, { block: true, terminate: true, reason: "artifact accepted" });
+    assert.ok(existsSync(join(runDir, "result.json")));
+  } finally {
+    delete process.env["NOVAFLOW_RUN_CONTEXT"];
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("run mode: an unwritable result.json (pre-created as a directory) returns a structured block reason, never a throw", async () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    const { pi, runDir } = buildRunMode(base);
+    await pi.handlers.get("session_start")!({ type: "session_start", reason: "startup" } as SessionStartEvent, fakeCtx(base).ctx);
+    mkdirSync(join(runDir, "result.json")); // the EISDIR probe
+
+    // the hook must NOT throw EISDIR through pi's hook runner
+    const res = await fireToolCall(pi.handlers, SUBMIT_TOOL_NAME, validArtifact(), base);
+    assert.equal((res.result as { block?: boolean }).block, true);
+    assert.equal((res.result as { terminate?: boolean }).terminate, undefined);
+    assert.match((res.result as { reason: string }).reason, /cannot write result\.json/);
+    assert.match((res.result as { reason: string }).reason, /EISDIR/);
+    assert.ok(statSync(join(runDir, "result.json")).isDirectory(), "the failed write left the directory untouched");
+  } finally {
+    delete process.env["NOVAFLOW_RUN_CONTEXT"];
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("run mode: a mixed batch — the ordinary write passes per-call while the submit terminates per-call", async () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    const { pi, runDir } = buildRunMode(base);
+    await pi.handlers.get("session_start")!({ type: "session_start", reason: "startup" } as SessionStartEvent, fakeCtx(base).ctx);
+
+    // one batch, two per-call results, recorded independently per pi's
+    // every-finalized-result rule (the batch all-terminate rule is pi's)
+    const writeRes = await fireToolCall(pi.handlers, "write", { path: join(base, "alpha", "src", "batch.ts") }, base);
+    assert.equal(writeRes.result, undefined, "the in-scope write's per-call result is a pass-through (not terminating)");
+    const submitRes = await fireToolCall(pi.handlers, SUBMIT_TOOL_NAME, validArtifact(), base);
+    assert.deepEqual(submitRes.result, { block: true, terminate: true, reason: "artifact accepted" });
+    assert.ok(existsSync(join(runDir, "result.json")));
+  } finally {
+    delete process.env["NOVAFLOW_RUN_CONTEXT"];
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("run mode: the acceptance latch — resubmit and post-acceptance mutations are blocked; reads still pass", async () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    const { pi, runDir } = buildRunMode(base);
+    await pi.handlers.get("session_start")!({ type: "session_start", reason: "startup" } as SessionStartEvent, fakeCtx(base).ctx);
+
+    const first = await fireToolCall(pi.handlers, SUBMIT_TOOL_NAME, validArtifact(), base);
+    assert.equal((first.result as { terminate?: boolean }).terminate, true);
+
+    // resubmit: blocked, no terminate
+    const resubmit = await fireToolCall(pi.handlers, SUBMIT_TOOL_NAME, validArtifact(), base);
+    assert.equal((resubmit.result as { block?: boolean }).block, true);
+    assert.equal((resubmit.result as { terminate?: boolean }).terminate, undefined);
+    assert.match((resubmit.result as { reason: string }).reason, /already accepted/);
+
+    // post-acceptance write — in scope, but the latch owns it now
+    const write = await fireToolCall(pi.handlers, "write", { path: join(base, "alpha", "src", "late.ts") }, base);
+    assert.equal((write.result as { block?: boolean }).block, true);
+    assert.match((write.result as { reason: string }).reason, /already accepted/);
+
+    // post-acceptance bash mutation too
+    const bash = await fireToolCall(pi.handlers, "bash", { command: "echo x > alpha/src/late.txt" }, base);
+    assert.equal((bash.result as { block?: boolean }).block, true);
+    assert.match((bash.result as { reason: string }).reason, /already accepted/);
+
+    // reads stay open
+    const read = await fireToolCall(pi.handlers, "read", { path: join(base, "beta", "data", "notes.txt") }, base);
+    assert.equal(read.result, undefined, "a read after acceptance passes unblocked");
+    const grep = await fireToolCall(pi.handlers, "grep", { pattern: "notes" }, base);
+    assert.equal(grep.result, undefined);
+
+    // and result.json was written exactly once, with the true identity
+    const written = JSON.parse(readFileSync(join(runDir, "result.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(written["task_id"], TASK_ID);
+    assert.equal(written["run_id"], RUN_ID);
+  } finally {
+    delete process.env["NOVAFLOW_RUN_CONTEXT"];
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test("run mode: a context that failed to load fails CLOSED on every mutating call", async () => {
   const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
   try {
@@ -732,8 +1017,18 @@ test("run mode: the registered tool carries the completion-signal contract (desc
     const exec = await tool.execute("call_z", validArtifact(), undefined, undefined, fakeCtx(base).ctx as never);
     assert.equal(exec.terminate, true);
     assert.ok(existsSync(join(runDir, "result.json")));
-    // and rejects invalid input with an error result shape
-    await assert.rejects(tool.execute("call_z2", { ...validArtifact(), status: "nope" }, undefined, undefined, fakeCtx(base).ctx as never), /rejected/);
+    // the acceptance latch: a second execute on the same session is refused
+    await assert.rejects(
+      tool.execute("call_z2", validArtifact(), undefined, undefined, fakeCtx(base).ctx as never),
+      /already accepted/,
+    );
+    // and a FRESH session still reports the structured rejection for invalid input
+    const { pi: pi2 } = buildRunMode(base);
+    await pi2.handlers.get("session_start")!({ type: "session_start", reason: "startup" } as SessionStartEvent, fakeCtx(base).ctx);
+    await assert.rejects(
+      pi2.tools[0]!.execute("call_z3", { ...validArtifact(), status: "nope" }, undefined, undefined, fakeCtx(base).ctx as never),
+      /rejected/,
+    );
   } finally {
     delete process.env["NOVAFLOW_RUN_CONTEXT"];
     rmSync(base, { recursive: true, force: true });

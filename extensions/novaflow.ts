@@ -33,7 +33,12 @@
  *     - `tool_call` enforces the scopes per call: write/edit/bash
  *       targets must match the governing read_write target's
  *       write_scope_globs, never touch protected_test_globs, and
- *       read_only targets refuse writes outright. Blocked calls
+ *       read_only targets refuse writes outright. The check-time
+ *       realpath defends against links that already exist when the
+ *       call is judged; a same-command `ln`+write is source-scanned —
+ *       a link created inside a governed root from a source outside
+ *       that root's writable scope is refused up front (the
+ *       create-then-write window). Blocked calls
  *       return {block, reason} WITHOUT terminate — the agent retries
  *       with the reason as feedback.
  *     - `novaflow_submit_result` is the completion signal: it
@@ -55,10 +60,10 @@
  *   exit-5-style structured error to the chat, never a throw.
  */
 
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -473,21 +478,29 @@ export function loadRunContext(contextPath: string): RunContext {
     if (!Array.isArray(snap["targets"])) {
       throw new Error(`${SNAPSHOT_FILENAME} has no targets array`);
     }
-    const roots = new Map<string, { root_path: string; target_type: "git_repo" | "directory" }>();
+    const roots = new Map<string, { root_path: string; target_type: "git_repo" | "directory" } | null>();
     for (const t of snap["targets"]) {
       if (t === null || typeof t !== "object") continue;
       const o = t as Record<string, unknown>;
-      if (typeof o["target_id"] === "string" && typeof o["root_path"] === "string") {
-        roots.set(o["target_id"], {
-          root_path: o["root_path"],
-          target_type: o["target_type"] === "git_repo" ? "git_repo" : "directory",
-        });
+      if (typeof o["target_id"] !== "string" || typeof o["root_path"] !== "string") continue;
+      if (o["root_path"] === "" || !isAbsolute(o["root_path"])) {
+        // an empty root silently resolves to process.cwd() — a scope
+        // anchored nowhere is a scope that governs the wrong tree
+        roots.set(o["target_id"], null);
+        continue;
       }
+      roots.set(o["target_id"], {
+        root_path: o["root_path"],
+        target_type: o["target_type"] === "git_repo" ? "git_repo" : "directory",
+      });
     }
     for (const s of scopes) {
       const root = roots.get(s.target_id);
       if (root === undefined) {
         throw new Error(`target "${s.alias}" (${s.target_id}) has no entry in ${SNAPSHOT_FILENAME} — its root path is unknown, so its scope cannot be enforced; failing closed`);
+      }
+      if (root === null) {
+        throw new Error(`target "${s.alias}" (${s.target_id}) has an empty or non-absolute root_path in ${SNAPSHOT_FILENAME} — a rootless scope cannot be enforced; failing closed`);
       }
       s.root_path = root.root_path;
       s.target_type = root.target_type;
@@ -598,14 +611,48 @@ export function checkWritePath(scopes: RunScope[], absPath: string): CheckResult
 
 /**
  * Best-effort SYNTACTIC extraction of the paths a bash command writes
- * (documented limit): redirection targets (`>`, `>>`, `2>`, `&>`) and
- * the file arguments of direct mutators (rm, mv, cp, install, ln,
- * mkdir, touch, tee, truncate, sed -i, chmod, chown, rmdir). Reads
- * (cat, grep, git diff, test runners) and script bodies (python -c,
- * heredocs, git internals) are NOT analyzable here — the engine's
- * post-run verification (protected digests + git status) remains
- * the authority for everything this scan cannot see.
+ * (documented limit): redirection targets (the full operator family —
+ * `>`, `>>`, `>|`, `2>`, `2>>`, `2>|`, `&>`, `&>>`) and the file
+ * arguments of direct mutators (rm, mv, cp, install, ln, mkdir,
+ * touch, tee, truncate, sed -i, chmod, chown, rmdir, plus dd's
+ * `of=` operand; the mv/cp/install/ln `-t DIR` forms land every
+ * source INSIDE DIR, not at the last operand). `cd` segments are
+ * tracked, so later segments resolve their operands against the
+ * updated working directory — an unresolvable `cd` (no argument, a
+ * nonexistent path, `cd -`) leaves every later RELATIVE operand
+ * unmapped, which checkWritePath refuses (fail closed). `ln` — hard
+ * or symbolic — additionally exposes its SOURCES as link targets:
+ * a link created inside a governed root from a source outside that
+ * root's writable scope is exactly the create-then-write window
+ * (write through the new link), so the source is held to the same
+ * write-scope verdict as a direct write. Reads (cat, grep, git
+ * diff, test runners) and script bodies (python -c, heredocs, git
+ * internals) are NOT analyzable here — the engine's post-run
+ * verification (protected digests + git status) remains the
+ * authority for everything this scan cannot see.
  */
+
+/**
+ * The resolution base for operands after an unresolvable `cd`: an
+ * absolute path no target root can contain, so relative write
+ * operands land unmapped and are refused (fail closed). Absolute
+ * operands still resolve to themselves — they never depended on
+ * the working directory.
+ */
+const UNRESOLVED_CWD = "/novaflow-cd-untracked";
+
+/** The redirection operator family, as standalone tokens. */
+const REDIRECT_TOKEN_RE = /^(?:\d?>|&>)>?&?\|?$/;
+
+type ScannedTarget = {
+  /** The operand as written in the command. */
+  raw: string;
+  /** The absolute directory the operand resolves against (cd-aware). */
+  base: string;
+  /** True for `ln` sources — the link's source, not a direct write. */
+  viaLink: boolean;
+};
+
 /** Minimal quote-aware tokenizer: quoted spans stay one token, unquoted. */
 function tokenizeCommand(s: string): string[] {
   const out: string[] = [];
@@ -634,9 +681,20 @@ function tokenizeCommand(s: string): string[] {
   return out;
 }
 
-export function bashWriteTargets(command: string): string[] {
-  const out: string[] = [];
-  for (const segment of command.split(/&&|\|\||;|\|/)) {
+/** One scanned write target per (base, raw, kind) triple, first occurrence wins. */
+function scanBashWriteTargets(command: string, baseCwd: string): ScannedTarget[] {
+  const out: ScannedTarget[] = [];
+  let cwd = baseCwd;
+  let untracked = false;
+  const push = (raw: string, viaLink = false): void => {
+    if (raw === "") return;
+    out.push({ raw, base: untracked ? UNRESOLVED_CWD : cwd, viaLink });
+  };
+  // the noclobber forms (`>|`, `2>|`) carry a `|` that would read as a
+  // pipe split — rewrite them to their append spellings first (the scan
+  // only cares WHERE they write, not with what clobber semantics)
+  const presplit = command.replace(/(\d?)>\|/g, " $1>> ");
+  for (const segment of presplit.split(/&&|\|\||;|\|/)) {
     // normalize redirection operators into their own whitespace tokens
     const normalized = segment.replace(/(\d?>+)/g, " $1 ").replace(/(&>)/g, " $1 ");
     const tokens = tokenizeCommand(normalized);
@@ -644,9 +702,9 @@ export function bashWriteTargets(command: string): string[] {
 
     for (let i = 0; i < tokens.length; i++) {
       const t = tokens[i]!;
-      if (/^(?:\d?>|>>|&>>?)$/.test(t) && i + 1 < tokens.length) {
+      if (REDIRECT_TOKEN_RE.test(t) && i + 1 < tokens.length) {
         const target = tokens[i + 1]!;
-        if (!target.startsWith("&")) out.push(target);
+        if (!target.startsWith("&")) push(target); // `2>&1`-style fd duplication is not a file write
       }
     }
 
@@ -654,8 +712,26 @@ export function bashWriteTargets(command: string): string[] {
     while (first < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[first]!)) first++;
     const head = tokens[first];
     if (head === undefined) continue;
-    const name = head.includes("/") ? head.slice(head.lastIndexOf("/") + 1) : head;
+    const name = (head.includes("/") ? head.slice(head.lastIndexOf("/") + 1) : head).replace(/^\(+/, "");
     const rest = tokens.slice(first + 1);
+
+    // `cd` moves the resolution base for every later segment
+    if (name === "cd") {
+      const op = rest.find((t) => t !== "-" && !t.startsWith("-"));
+      if (op === undefined) {
+        untracked = true; // `cd` with no argument: untrackable, fail closed
+        continue;
+      }
+      const resolved = resolveToolPath(untracked ? UNRESOLVED_CWD : cwd, op);
+      if (existsSync(resolved) && statSync(resolved).isDirectory()) {
+        cwd = resolved;
+        untracked = false;
+      } else {
+        untracked = true; // a path bash itself would refuse — never guess
+      }
+      continue;
+    }
+
     const args = rest.filter((t) => !t.startsWith("-"));
     switch (name) {
       case "rm":
@@ -666,24 +742,88 @@ export function bashWriteTargets(command: string): string[] {
       case "chown":
       case "tee":
       case "truncate":
-        out.push(...args);
+        for (const t of args) push(t);
         break;
       case "mv":
       case "cp":
       case "install":
-      case "ln":
-        if (args.length >= 2) out.push(args[args.length - 1]!);
+      case "ln": {
+        // destination resolution: `-t DIR` / `--target-directory=DIR`
+        // forms land every source INSIDE DIR (as DIR/basename(source));
+        // the plain forms write the LAST operand. `ln` additionally
+        // exposes its sources (the create-then-write window, above).
+        let targetDir: string | undefined;
+        const operands: string[] = [];
+        for (let j = 0; j < rest.length; j++) {
+          const t = rest[j]!;
+          if (t === "-t" || t === "--target-directory") {
+            if (j + 1 < rest.length) targetDir = rest[++j];
+            continue;
+          }
+          if (t.startsWith("--target-directory=")) {
+            targetDir = t.slice("--target-directory=".length);
+            continue;
+          }
+          const gluedT = /^-([a-zA-Z]*t)(.+)$/.exec(t);
+          if (gluedT !== null) {
+            targetDir = gluedT[2]!;
+            continue;
+          }
+          if (t.startsWith("-")) continue;
+          operands.push(t);
+        }
+        if (targetDir !== undefined) {
+          push(targetDir);
+          for (const s of operands) push(join(targetDir, basename(s)));
+        } else if (name === "ln") {
+          if (operands.length >= 2) {
+            push(operands[operands.length - 1]!);
+            for (const s of operands.slice(0, -1)) push(s, true);
+          }
+        } else if (operands.length >= 2) {
+          push(operands[operands.length - 1]!);
+        }
+        break;
+      }
+      case "dd":
+        // dd's write target rides its `of=<path>` operand
+        for (const t of rest) {
+          if (t.startsWith("of=") && t.length > 3) push(t.slice(3));
+        }
         break;
       case "sed":
         if (rest.some((t) => /^-[a-zA-Z]*i/.test(t)) && args.length >= 1) {
-          out.push(args[args.length - 1]!);
+          push(args[args.length - 1]!);
         }
         break;
       default:
         break;
     }
   }
-  return [...new Set(out)];
+  const seen = new Set<string>();
+  const uniq: ScannedTarget[] = [];
+  for (const t of out) {
+    const key = `${t.base}\u0000${t.raw}\u0000${t.viaLink}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      uniq.push(t);
+    }
+  }
+  return uniq;
+}
+
+/**
+ * The write targets of a bash command as raw operand strings — the
+ * exported corpus seam; the cd-aware scope verdict itself lives in
+ * checkBashWriteScope, which resolves each operand against the base
+ * its segment actually ran under.
+ */
+export function bashWriteTargets(command: string): string[] {
+  const out: string[] = [];
+  for (const t of scanBashWriteTargets(command, process.cwd())) {
+    if (!out.includes(t.raw)) out.push(t.raw);
+  }
+  return out;
 }
 
 /** Device sinks that are never scope-relevant (documented exemption). */
@@ -699,12 +839,17 @@ const DEVICE_EXEMPT: ReadonlySet<string> = new Set([
 /** The write-scope verdict for a bash command, per the syntactic scan. */
 export function checkBashWriteScope(scopes: RunScope[], cwd: string, command: string): CheckResult {
   if (scopes.length === 0) return { ok: true };
-  for (const raw of bashWriteTargets(command)) {
-    const abs = resolveToolPath(cwd, raw);
+  for (const t of scanBashWriteTargets(command, cwd)) {
+    const abs = resolveToolPath(t.base, t.raw);
     if (DEVICE_EXEMPT.has(abs)) continue;
     const res = checkWritePath(scopes, abs);
     if (!res.ok) {
-      return { ok: false, reason: `bash command writes ${raw}: ${res.reason}` };
+      return t.viaLink
+        ? {
+            ok: false,
+            reason: `bash command links ${t.raw} into a governed target — writing through the new link would land out of scope (the create-then-write window): ${res.reason}`,
+          }
+        : { ok: false, reason: `bash command writes ${t.raw}: ${res.reason}` };
     }
   }
   return { ok: true };
@@ -716,37 +861,68 @@ export type SubmitResult =
   | { ok: true; path: string }
   | { ok: false; errors: string[] };
 
+/** The identity a submitted artifact must carry: the loaded run context's own ids. */
+export type SubmitIdentity = { taskId: string; runId: string };
+
 /**
  * Validate the submitted artifact in-process (§4.1 structural rules —
- * the ported validator) and write <run_dir>/result.json on success.
- * The run dir is DERIVED from the loaded context — a path argument is
- * never accepted (the validator's allow-list rejects any unknown
- * top-level key, path-shaped or otherwise), and the payload is
- * size-capped before anything touches disk. This is the ONLY write
- * the extension ever performs.
+ * the ported validator), bind it to the loaded run context (when the
+ * caller passes the identity, task_id/run_id must equal the context's
+ * own — this extension is the only layer holding both ids; the engine
+ * intakes result.json by path and never cross-checks), cap it on the
+ * bytes that actually land on disk, and write <run_dir>/result.json
+ * on success. The run dir is DERIVED from the loaded context — a path
+ * argument is never accepted (the validator's allow-list rejects any
+ * unknown top-level key, path-shaped or otherwise). The write is
+ * wrapped: an unwritable destination returns a structured refusal,
+ * never a throw out of the hook. This is the ONLY write the
+ * extension ever performs.
  */
-export function validateAndWriteResult(runDir: string, input: unknown): SubmitResult {
-  let serialized: string;
+export function validateAndWriteResult(
+  runDir: string,
+  input: unknown,
+  identity?: SubmitIdentity,
+): SubmitResult {
+  let serialized: string | undefined;
   try {
-    serialized = JSON.stringify(input) as string;
+    serialized = JSON.stringify(input, null, 2);
   } catch {
     return { ok: false, errors: ["the submitted artifact is not JSON-serializable"] };
   }
   if (serialized === undefined) {
     return { ok: false, errors: ["the submitted artifact is not JSON-serializable"] };
   }
-  if (serialized.length > MAX_RESULT_PAYLOAD_BYTES) {
+  serialized += "\n";
+  // the cap is measured on the SERIALIZED form — the exact bytes that
+  // land on disk, not a compact projection of them
+  const bytes = Buffer.byteLength(serialized, "utf8");
+  if (bytes > MAX_RESULT_PAYLOAD_BYTES) {
     return {
       ok: false,
       errors: [
-        `artifact payload is ${serialized.length} bytes — the cap is ${MAX_RESULT_PAYLOAD_BYTES} bytes; shrink summaries and diff text`,
+        `artifact payload is ${bytes} bytes serialized to ${RESULT_FILENAME} — the cap is ${MAX_RESULT_PAYLOAD_BYTES} bytes; shrink summaries and diff text`,
       ],
     };
   }
   const res = validateArtifactStructure(input);
   if (!res.ok) return { ok: false, errors: res.errors };
+  if (identity !== undefined) {
+    const o = res.artifact;
+    if (o["task_id"] !== identity.taskId || o["run_id"] !== identity.runId) {
+      return {
+        ok: false,
+        errors: [
+          `the artifact's task_id/run_id do not match this run's loaded context — expected task_id ${identity.taskId} / run_id ${identity.runId}, got ${JSON.stringify(o["task_id"])} / ${JSON.stringify(o["run_id"])}; submit the artifact for THIS run, not another`,
+        ],
+      };
+    }
+  }
   const path = join(runDir, RESULT_FILENAME);
-  writeFileSync(path, JSON.stringify(input, null, 2) + "\n");
+  try {
+    writeFileSync(path, serialized);
+  } catch (err) {
+    return { ok: false, errors: [`cannot write result.json: ${(err as Error).message}`] };
+  }
   return { ok: true, path };
 }
 
@@ -1246,7 +1422,7 @@ export const SUBMIT_TOOL_PARAMS: TSchema = {
           severity: { type: "string", description: "info | warning | error | critical" },
           category: { type: "string" },
           message: { type: "string" },
-          file_location: { type: "object", properties: { path: { type: "string" }, line: { type: "integer" } }, additionalProperties: false },
+          file_location: { type: "object", properties: { path: { type: "string" }, line: { type: "integer" } }, required: ["path", "line"], additionalProperties: false },
         },
         required: ["severity", "category", "message"],
         additionalProperties: false,
@@ -1276,7 +1452,7 @@ export const SUBMIT_TOOL_PARAMS: TSchema = {
   additionalProperties: false,
 } as unknown as TSchema;
 
-function submitToolDefinition(getRun: () => RunContext | null): ToolDefinition {
+function submitToolDefinition(getRun: () => RunContext | null, state: { accepted: boolean }): ToolDefinition {
   return {
     name: SUBMIT_TOOL_NAME,
     label: "Submit Result",
@@ -1290,16 +1466,21 @@ function submitToolDefinition(getRun: () => RunContext | null): ToolDefinition {
     parameters: SUBMIT_TOOL_PARAMS,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       // Defense in depth for paths that skip the tool_call hook
-      // (the hook owns the normal flow): same validation, same write,
-      // and terminate on acceptance per pi's structured-output rule.
+      // (the hook owns the normal flow): same validation, same
+      // identity binding, same write, and terminate on acceptance
+      // per pi's structured-output rule.
       const run = getRun();
       if (run === null || run.loadError !== null) {
         throw new Error(`novaflow: run context unavailable — refusing submission (${run?.loadError ?? "session_start not completed"})`);
       }
-      const res = validateAndWriteResult(run.runDir, params);
+      if (state.accepted) {
+        throw new Error("artifact already accepted for this run — the completion signal was sent; resubmission is not possible");
+      }
+      const res = validateAndWriteResult(run.runDir, params, { taskId: run.taskId, runId: run.runId });
       if (!res.ok) {
         throw new Error(`result.json rejected:\n- ${res.errors.join("\n- ")}`);
       }
+      state.accepted = true;
       if (ctx.hasUI) {
         ctx.ui.notify(`novaflow: artifact accepted → ${res.path}`, "info");
       }
@@ -1314,6 +1495,8 @@ function submitToolDefinition(getRun: () => RunContext | null): ToolDefinition {
 
 function registerRunMode(pi: ExtensionAPI, contextPath: string): void {
   let run: RunContext | null = null;
+  /** The acceptance latch: set once result.json is written for this run. */
+  const state = { accepted: false };
 
   pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
     run = loadRunContext(contextPath);
@@ -1328,23 +1511,40 @@ function registerRunMode(pi: ExtensionAPI, contextPath: string): void {
   });
 
   pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> => {
-    // the completion signal: validate in-process, write result.json,
-    // and end the run through pi's block-result rule
+    // the completion signal: validate in-process, bind to the loaded
+    // run context, write result.json, and end the run through pi's
+    // block-result rule
     if (event.toolName === SUBMIT_TOOL_NAME) {
+      if (state.accepted) {
+        return {
+          block: true,
+          reason: "artifact already accepted for this run — the completion signal was sent; resubmission is not possible",
+        };
+      }
       if (run === null || run.loadError !== null) {
         return {
           block: true,
           reason: `novaflow: run context unavailable — refusing submission (${run?.loadError ?? "session_start not completed"})`,
         };
       }
-      const res = validateAndWriteResult(run.runDir, event.input);
+      const res = validateAndWriteResult(run.runDir, event.input, { taskId: run.taskId, runId: run.runId });
       if (!res.ok) {
         return { block: true, reason: `result.json rejected:\n- ${res.errors.join("\n- ")}` };
       }
+      state.accepted = true;
       if (ctx.hasUI) {
         ctx.ui.notify(`novaflow: artifact accepted → ${res.path}`, "info");
       }
       return { block: true, terminate: true, reason: "artifact accepted" };
+    }
+
+    // the acceptance latch: after result.json is written the run is
+    // complete — mutating calls are refused, reads stay open
+    if (state.accepted && MUTATING_TOOLS.has(event.toolName)) {
+      return {
+        block: true,
+        reason: "artifact already accepted for this run — no further mutating tool calls are permitted",
+      };
     }
 
     // scope enforcement per mutating tool call (§6)
@@ -1375,7 +1575,7 @@ function registerRunMode(pi: ExtensionAPI, contextPath: string): void {
     return undefined;
   });
 
-  pi.registerTool(submitToolDefinition(() => run));
+  pi.registerTool(submitToolDefinition(() => run, state));
 }
 
 function registerOperatorMode(pi: ExtensionAPI): void {
