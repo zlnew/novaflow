@@ -34,7 +34,7 @@ import type { CommandOpts } from "../opts.ts";
 
 const SPEC: ArgSpec = {
   booleanFlags: ["foreground"],
-  valueFlags: ["lines", "workspace"],
+  valueFlags: ["lines", "workspace", "out", "retention-days"],
 };
 
 const START_BOUND_MS = 15_000;
@@ -56,10 +56,14 @@ export async function daemonCommand(argv: string[], opts: CommandOpts): Promise<
       return simple("nova_daemon_resume", "scheduler resumed", opts.json);
     case "kill-all":
       return killAll(opts);
+    case "backup":
+      return backup(p, opts);
+    case "prune":
+      return prune(p, opts);
     case "logs":
       return logs(p, opts);
     default:
-      throw new UsageError(`nova daemon [start|stop|status|pause|resume|kill-all|logs]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`);
+      throw new UsageError(`nova daemon [start|stop|status|pause|resume|kill-all|backup|prune|logs]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`);
   }
 }
 
@@ -289,6 +293,78 @@ async function killAll(opts: CommandOpts): Promise<number> {
   }
   console.log(`scheduler paused; aborted ${data.aborted.length} live run(s)`);
   console.log("resume with: nova daemon resume");
+  return EXIT_OK;
+}
+
+/* ---------------------------- storage maintenance ---------------------------- */
+
+/**
+ * `nova daemon backup [--out <path>]` — data.md 1.1's MUST: the backup runs
+ * IN the daemon through the SQLite online backup API. The CLI sends one op
+ * and prints the destination; it never opens the store (thin-client rule).
+ *
+ * Default destination (daemon-side): `<store dir>/state.db.bak-<stamp>`.
+ * An existing destination refuses as `duplicate` (the srs exit map puts that
+ * code on the operation-failure row, exit 1) — a backup never clobbers an
+ * earlier one.
+ */
+async function backup(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
+  const args: Record<string, unknown> = {};
+  const out = p.values.get("out");
+  if (out !== undefined) args["out"] = out;
+  const data = (await daemonRequest("nova_daemon_backup", args)) as {
+    destination: string;
+    totalPages: number;
+    remainingPages: number;
+  };
+  if (opts.json) {
+    console.log(JSON.stringify(data));
+    return EXIT_OK;
+  }
+  console.log(data.destination);
+  console.log(
+    `  ${data.totalPages} pages copied (SQLite online backup API; live WAL readers and writers unaffected)`,
+  );
+  return EXIT_OK;
+}
+
+/**
+ * `nova daemon prune [--retention-days N]` — data.md 1.2's MAY, with data.md's
+ * own 30-day example as the default. The daemon deletes ONLY run-dir
+ * `events.raw.jsonl` files past retention and reports every purge and every
+ * skip with its reason; `events.jsonl` and every SQLite row are untouched.
+ */
+async function prune(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
+  const args: Record<string, unknown> = {};
+  const daysFlag = p.values.get("retention-days");
+  if (daysFlag !== undefined) {
+    const n = Number(daysFlag);
+    if (!Number.isInteger(n) || n < 0) {
+      throw new UsageError("--retention-days must be a non-negative integer (days)");
+    }
+    args["retention_days"] = n;
+  }
+  const data = (await daemonRequest("nova_daemon_prune", args)) as {
+    retention_days: number;
+    purged: Array<{ path: string; age_days: number; reason: string }>;
+    skipped: Array<{ path: string; age_days: number | null; reason: string }>;
+    scanned_run_dirs: number;
+  };
+  if (opts.json) {
+    console.log(JSON.stringify(data));
+    return EXIT_OK;
+  }
+  console.log(`retention: ${data.retention_days} days (run-dir events.raw.jsonl only)`);
+  console.log(`purged: ${data.purged.length} of ${data.scanned_run_dirs} run dir(s) scanned`);
+  for (const entry of data.purged) {
+    console.log(`  - ${entry.path} (${entry.age_days} days old)`);
+  }
+  if (data.skipped.length > 0) {
+    console.log(`skipped: ${data.skipped.length}`);
+    for (const entry of data.skipped) {
+      console.log(`  - ${entry.path} — ${entry.reason}`);
+    }
+  }
   return EXIT_OK;
 }
 

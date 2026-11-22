@@ -52,6 +52,13 @@ import type { Dispatcher } from "./dispatch.ts";
 import type { RetryEvaluator } from "./retry.ts";
 import { abortTriggerFor } from "./triggers.ts";
 import {
+  backupDaemonStore,
+  pruneRawEventStreams,
+  DEFAULT_RETENTION_DAYS,
+} from "./maintenance.ts";
+import { BackupRefusedError } from "../store/backup.ts";
+import { DocReferenceError, indexDocs, resolveDocReferences } from "../docs.ts";
+import {
   importChain,
   getChainRun,
   setChainRunAborted,
@@ -169,6 +176,12 @@ export type ServerDeps = {
   daemonConfig: DaemonConfig;
   /** The full nova_daemon_status payload (lifecycle owns uptime/version/budgets). */
   daemonStatus: () => Record<string, unknown>;
+  /**
+   * The store's on-disk path — the ONLY thing nova_daemon_backup needs
+   * besides the handle itself (the default destination sits alongside it).
+   * The daemon owns the store, so this is daemon state, not CLI state.
+   */
+  dbPath: string;
   /** Invoked AFTER the nova_daemon_stop response is written. */
   requestStop: () => void | Promise<void>;
   /** Catalog-probe injection for nova_task_run (tests point at the stub). */
@@ -588,6 +601,50 @@ export function buildOpTable(): Map<string, OpHandler> {
 
   ops.set("nova_daemon_status", (_args, { deps }) => deps.daemonStatus());
 
+  /* -------------------- storage maintenance (p7; data.md 1.1/1.2) -------------------- */
+
+  /**
+   * data.md 1.1 "Database Backup Strategy" (MUST): live backups go through
+   * the SQLite online backup API. The op runs the copy IN THE DAEMON — it
+   * owns the store handle, so no other process ever opens the live file to
+   * take a backup (`src/daemon/maintenance.ts` → `src/store/backup.ts`).
+   * Default destination: alongside the store, `state.db.bak-<stamp>`.
+   * Attempting to write over an existing destination is `duplicate`.
+   */
+  ops.set("nova_daemon_backup", async (args, { deps }) => {
+    const out = optNonEmptyString(args, "out");
+    try {
+      return await backupDaemonStore(deps.db, deps.dbPath, out === undefined ? {} : { out });
+    } catch (err) {
+      if (err instanceof BackupRefusedError) {
+        // an existing destination is the taxonomy's `duplicate`; anything
+        // else the operator got wrong is `schema_invalid`
+        throw new OpError(/already exists/.test(err.message) ? "duplicate" : "schema_invalid", err.message);
+      }
+      throw err;
+    }
+  });
+
+  /**
+   * data.md 1.2 "Log Pruning & Rotation" (MAY): purge run-dir
+   * `events.raw.jsonl` files older than the retention window. The path
+   * allowlist — never a glob walk — lives in the op body.
+   */
+  ops.set("nova_daemon_prune", (args, { deps }) => {
+    const raw = args["retention_days"];
+    let retentionDays = DEFAULT_RETENTION_DAYS;
+    if (raw !== undefined) {
+      if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
+        throw new OpError(
+          "schema_invalid",
+          "args.retention_days must be a non-negative integer",
+        );
+      }
+      retentionDays = raw;
+    }
+    return pruneRawEventStreams(deps.db, { retentionDays });
+  });
+
   /* --------------- workspace / project / profile setup ops (p3b) -------------- */
 
   // FR-WS-01: create + register. The op validates (single writer: the
@@ -624,6 +681,41 @@ export function buildOpTable(): Map<string, OpHandler> {
   });
 
   ops.set("nova_workspace_list", (_args, { deps }) => readWorkspaceList(deps.db));
+
+  /**
+   * FR-WS-04 AC2 — the selectable prompt-injection list: every `.md`/`.txt`/
+   * `.rst` document under `<workspace_root>/docs/`, computed by a SCAN at
+   * call time (src/docs.ts: no watcher, no daemon state, nothing to go
+   * stale). The workspace resolves from an id/slug arg; absent, the single
+   * registered workspace is implied, and an ambiguous registry refuses
+   * rather than picking one silently. A missing docs directory is an honest
+   * empty list (FR-WS-02 creates `docs/` at registration, but an operator
+   * may have removed it).
+   */
+  ops.set("nova_docs_list", (args, { deps }) => {
+    const workspace =
+      args["workspace_id"] === undefined && args["slug"] === undefined
+        ? (() => {
+            const rows = deps.db.prepare("SELECT * FROM workspaces ORDER BY created_at, id").all() as WorkspaceRow[];
+            if (rows.length === 0) {
+              throw new OpError("not_found", "no workspace is registered — register one first (nova workspace create)");
+            }
+            if (rows.length > 1) {
+              throw new OpError(
+                "schema_invalid",
+                `${rows.length} workspaces are registered — name one (nova docs list <workspace>)`,
+              );
+            }
+            return rows[0]!;
+          })()
+        : requireWorkspaceArg(deps.db, args);
+    return {
+      workspace: workspace.slug,
+      workspace_id: workspace.id,
+      docs_dir: join(workspace.root_path, "docs"),
+      docs: indexDocs(workspace.root_path),
+    };
+  });
 
   // FR-WS-03 AC2: archive disables execution (dispatch skips non-active
   // workspaces). Idempotent by design: archiving an archived workspace
@@ -798,6 +890,33 @@ export function buildOpTable(): Map<string, OpHandler> {
     const profileId = resolveProfileByName(deps.db, projectId, reqString(args, "profile_name"));
     const requiresGate = optBoolean(args, "requires_human_gate");
     const contextFiles = optStringArray(args, "context_files");
+    /**
+     * FR-WS-04 AC2: `doc_references` (the CLI's `--context docs/<name>`
+     * inputs) resolve against the workspace docs index and land in the SAME
+     * `tasks.context_files_json` array the run loop feeds composePrompt —
+     * one injection path, never a second. An unresolvable reference throws
+     * DocReferenceError (mapped to schema_invalid), so nothing is created.
+     */
+    const docReferences = optStringArray(args, "doc_references");
+    const mergedContextFiles = (() => {
+      if (docReferences === undefined) return contextFiles;
+      const workspaceRoot = deps.db
+        .prepare(
+          `SELECT w.root_path AS root_path
+             FROM projects p JOIN workspaces w ON w.id = p.workspace_id
+            WHERE p.id = ?`,
+        )
+        .get(projectId) as { root_path: string } | undefined;
+      if (workspaceRoot === undefined) {
+        throw new OpError("not_found", `no such project: ${projectId}`);
+      }
+      const resolved = resolveDocReferences(workspaceRoot.root_path, docReferences);
+      const merged = [...resolved.contextFiles];
+      for (const extra of contextFiles ?? []) {
+        if (!merged.includes(extra)) merged.push(extra);
+      }
+      return merged;
+    })();
     // mcp.md §3.2 optional payload parts (previously dropped silently):
     // validate the shapes here, persist via the create service
     const overrides = parseOverridesArg(args);
@@ -811,7 +930,7 @@ export function buildOpTable(): Map<string, OpHandler> {
         objective,
         profileId,
         ...(requiresGate !== undefined ? { requiresHumanGate: requiresGate } : {}),
-        ...(contextFiles !== undefined ? { contextFiles } : {}),
+        ...(mergedContextFiles !== undefined ? { contextFiles: mergedContextFiles } : {}),
         ...(overrides !== undefined ? { overrides } : {}),
         ...(outputSchemaVersion !== undefined ? { outputSchemaVersion } : {}),
         ...(targetScopes !== undefined ? { targetScopes } : {}),
@@ -1541,6 +1660,11 @@ export function toErrorPayload(err: unknown): { code: TaxonomyCode; message: str
     return { code: "profile_unresolved", message: err.message };
   }
   if (err instanceof ProfileValidationError) {
+    return { code: "schema_invalid", message: err.message };
+  }
+  if (err instanceof DocReferenceError) {
+    // FR-WS-04: an unresolvable doc reference is a payload violation — the
+    // caller named a document the workspace does not index
     return { code: "schema_invalid", message: err.message };
   }
   if (

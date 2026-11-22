@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { openDb } from "../../src/store/db.ts";
+import { openReadOnlyDb } from "../../src/store/readonly.ts";
 import { migrate, MIGRATIONS_DIR } from "../../src/store/migrate.ts";
 
 test("openDb creates a WAL database with foreign keys enforced", () => {
@@ -55,13 +56,41 @@ test("migrate is idempotent and refuses a tampered applied migration", () => {
   assert.equal(migrate(db), 0); // idempotent
 
   // A new unapplied file must block boot (the block-on-contract-mismatch rule).
-  const sneaky = join(MIGRATIONS_DIR, "0002_sneaky.sql");
-  writeFileSync(sneaky, "CREATE TABLE nope (a);");
+  // DEBT-004: the probe file goes into a COPY of the migrations directory —
+  // writing into the repo's own dir raced every concurrently running daemon
+  // boot (they legitimately refused with "unapplied migration exists"), which
+  // is what failed whole suite copies while each test passed alone.
+  const copy = mkdtempSync(join(tmpdir(), "novaflow-migrations-"));
+  for (const name of readdirSync(MIGRATIONS_DIR)) {
+    copyFileSync(join(MIGRATIONS_DIR, name), join(copy, name));
+  }
   try {
-    assert.throws(() => migrate(db));
+    writeFileSync(join(copy, "0003_sneaky.sql"), "CREATE TABLE nope (a);");
+    assert.throws(() => migrate(db, { migrationsDir: copy }));
   } finally {
-    rmSync(sneaky);
+    rmSync(copy, { recursive: true, force: true });
   }
   db.close();
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("openDb applies the data.md 1.1 storage-layer pragmas (WAL, FK, busy_timeout 5000, synchronous NORMAL)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "novaflow-pragmas-"));
+  const dbPath = join(dir, "state.db");
+  try {
+    const db = openDb(dbPath);
+    assert.equal(db.pragma("journal_mode", { simple: true }), "wal");
+    assert.equal(db.pragma("foreign_keys", { simple: true }), 1);
+    assert.equal(db.pragma("busy_timeout", { simple: true }), 5000);
+    // data.md 1.1 pins FOUR settings; synchronous NORMAL is the fourth
+    // (judge A finding 1 — the first sweep pass pinned only three)
+    assert.equal(db.pragma("synchronous", { simple: true }), 1);
+    db.close();
+    // the read-only handle carries the same busy timeout (data.md 1.1)
+    const ro = openReadOnlyDb(dbPath);
+    assert.equal(ro.pragma("busy_timeout", { simple: true }), 5000);
+    ro.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync } from "node:fs";
+import { accessSync, constants, existsSync, statfsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import type { Db } from "../store/db.ts";
 import { loadWorkspaceConfig } from "../config.ts";
@@ -11,7 +11,8 @@ import { loadWorkspaceConfig } from "../config.ts";
  *
  *   AC1 every task_target_scopes row's project_targets.root_path
  *      exists and is accessible — W_OK for read_write scopes, R_OK for
- *      read_only scopes;
+ *      read_only scopes; AND the run directory's filesystem has free
+ *      space (DEBT-003: `checkDiskAvailability`, below);
  *   AC2 for `git_repo` targets, `git status --porcelain` is empty at
  *      pre-flight; non-empty output names the dirty paths (bounded
  *      list);
@@ -101,6 +102,102 @@ export function checkTargetScopes(db: Db, taskId: string): string | null {
       const more = entries.length - bounded.length;
       return `git_repo target "${scope.alias}" has a dirty base worktree (git status --porcelain: ${entries.length} entries): ${bounded.join("; ")}${more > 0 ? ` (+${more} more)` : ""}`;
     }
+  }
+  return null;
+}
+
+/**
+ * DEBT-003 — FR-TSK-10 AC1's disk-availability clause, verbatim from the
+ * srs: "Verifies target repository paths exist and are writable, and disk
+ * availability." The DEBT-002 closure implemented everything else in AC1
+ * and left this open (the srs ~:459 review note records the omission as a
+ * documented tension); this probe closes it.
+ *
+ * THRESHOLD — 1 GiB free, and it is a WORKING VALUE, not a derived one
+ * (flagged for the parent's DEC). Rationale for the choice: one Pi run
+ * writes a session log, `events.raw.jsonl`, `events.jsonl`, `result.json`
+ * and (through the agent's own tools) worktree edits; 1 GiB is an order of
+ * magnitude above a single task's footprint on this class of host, while
+ * still refusing a genuinely full disk BEFORE a token is spent. It is
+ * deliberately not a percentage: a percentage of a large disk passes while
+ * the number of bytes needed is unchanged.
+ *
+ * THE PROBE: `fs.statfsSync(runDirRoot)` and compare
+ * `bavail * bsize` (what an UNPRIVILEGED writer may use — `bfree` counts
+ * blocks reserved for root, which we cannot spend) against the floor. The
+ * reader is injectable so the refusal path is testable without a
+ * privileged tmpfs mount; the default is the real syscall, and the tests
+ * exercise BOTH, so deleting the probe cannot pass.
+ *
+ * An unreadable path is a refusal (fail-closed): if free space cannot be
+ * verified, the run must not start.
+ */
+
+/** The v1 disk floor: 1 GiB free (see the threshold note above). */
+export const DISK_FREE_FLOOR_BYTES = 1024 * 1024 * 1024;
+
+/** The subset of fs.StatsFs the probe reads (injectable in tests). */
+export type StatfsLike = {
+  bsize: number | bigint;
+  blocks: number | bigint;
+  bfree: number | bigint;
+  bavail: number | bigint;
+  files?: number | bigint;
+  ffree?: number | bigint;
+};
+
+export type DiskProbeOptions = {
+  /**
+   * The statfs reader. Defaults to `fs.statfsSync`; tests inject a
+   * filesystem shape (a full disk, a tiny tmpfs) to exercise the refusal.
+   */
+  statfs?: (path: string) => StatfsLike | Promise<StatfsLike>;
+  /** The free-space floor in bytes; defaults to DISK_FREE_FLOOR_BYTES. */
+  floorBytes?: number;
+};
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${bytes} B`;
+}
+
+/**
+ * AC1 (disk): the run directory's filesystem must have at least
+ * `floorBytes` available. Returns null on success, a one-line refusal
+ * otherwise (the loop turns it into a `preflight_failed` run row).
+ */
+export function checkDiskAvailability(
+  path: string,
+  opts: DiskProbeOptions = {},
+): string | null {
+  const floor = opts.floorBytes ?? DISK_FREE_FLOOR_BYTES;
+  const read = opts.statfs ?? ((p: string): StatfsLike => statfsSync(p) as unknown as StatfsLike);
+  let stats: StatfsLike;
+  try {
+    const got = read(path);
+    // the default reader is synchronous; an injected async reader is not
+    // supported by this sync seam (documented) — a promise is a programming
+    // error, never a silent pass
+    if (typeof (got as Promise<StatfsLike>).then === "function") {
+      return `disk availability cannot be verified for "${path}": the statfs reader returned a promise (the probe is synchronous)`;
+    }
+    stats = got as StatfsLike;
+  } catch (err) {
+    return `disk availability cannot be verified for "${path}": ${
+      (err as Error).message
+    } (FR-TSK-10 AC1 disk-availability probe)`;
+  }
+  // bavail: what an unprivileged writer may actually use
+  const available = Number(stats.bavail) * Number(stats.bsize);
+  if (!Number.isFinite(available) || available < 0) {
+    return `disk availability cannot be verified for "${path}": statfs reported an unusable availability (${available})`;
+  }
+  if (available < floor) {
+    return `insufficient disk availability at "${path}": ${formatBytes(available)} free (${available} bytes), ${formatBytes(
+      floor,
+    )} required (FR-TSK-10 AC1 disk-availability probe)`;
   }
   return null;
 }

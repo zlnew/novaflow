@@ -449,6 +449,25 @@ test("kill surface parity: nova_task_abort and nova_kill_all kill the same proce
     await waitFor(() => existsSync(pidfile), 15_000);
     await waitFor(() => readFileSync(pidfile, "utf8").trim() !== "", 15_000);
     const stubPid = Number(readFileSync(pidfile, "utf8").split("\n")[0]);
+    // DEBT-004: the pid arrives at spawn, but the child only INSTALLS its
+    // SIGTERM handler once it is booted and reading stdin. Under full-suite
+    // load a boot measures 231-284 ms, so a group kill landing before the
+    // handler exists is a default-signal death and the IGNORED marker never
+    // appears (the observed failure). The stub's receipt is written exactly
+    // when it reaches its prompt handler — poll that, never a sleep.
+    const runDir = ((): string => {
+      const db = new Database(seeded.dbPath, { readonly: true });
+      try {
+        return (
+          db.prepare("SELECT pi_session_dir FROM task_runs WHERE task_id = ? ORDER BY attempt_number DESC LIMIT 1").get(
+            aborted,
+          ) as { pi_session_dir: string }
+        ).pi_session_dir;
+      } finally {
+        db.close();
+      }
+    })();
+    await waitFor(() => existsSync(join(runDir, "stub-receipt.json")), 15_000);
 
     const abortRes = (await mcp.client.callTool({
       name: "nova_task_abort",
@@ -459,6 +478,7 @@ test("kill surface parity: nova_task_abort and nova_kill_all kill the same proce
     await waitFor(() => stateOf(aborted) === "cancelled", 15_000);
 
     // the spec's named kill path really ran: SIGTERM reached the child…
+    await waitFor(() => /SIGTERM-IGNORED/.test(readFileSync(pidfile, "utf8")), 15_000);
     assert.match(readFileSync(pidfile, "utf8"), /SIGTERM-IGNORED/);
     // …and the SIGKILL backstop reaped it
     await waitFor(() => {

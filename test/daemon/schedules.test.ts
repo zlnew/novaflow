@@ -311,6 +311,14 @@ test("evaluator: a dangling target_id row is skipped with a note and advanced �
 test("evaluator: NEVER bypasses the workspace gate — a non-active workspace skips + advances", async () => {
   const env = await boot();
   try {
+    // DEBT-004 (the second member of the same family, found by the 40× stress
+    // loop): the one-shot is due the moment it is attached, so a tick landing
+    // between the attach and the archive fired it LEGITIMATELY — the workspace
+    // was still active then, and the test's own premise was violated rather
+    // than the product's. Ordering is what makes this deterministic: pause
+    // freezes schedule evaluation too (pinned by the pause test), so the due
+    // row is only ever evaluated AFTER the archive.
+    await env.client.request({ id: "pause", op: "nova_daemon_pause", args: {} });
     const taskId = await createTaskVia(env, "T1");
     const attach = await attachVia(env, taskId, { run_at: new Date(Date.now() - 30_000).toISOString() });
     assert.equal(attach["ok"], true, JSON.stringify(attach));
@@ -322,8 +330,10 @@ test("evaluator: NEVER bypasses the workspace gate — a non-active workspace sk
       args: { workspace_id: env.workspaceId },
     });
     assert.equal(archive["ok"], true, JSON.stringify(archive));
+    // resume: the FIRST evaluation of the due row now sees an archived workspace
+    await env.client.request({ id: "resume", op: "nova_daemon_resume", args: {} });
 
-    await waitFor(() => scheduleRow(env, id)["next_run_at"] === null, 6000);
+    await waitFor(() => scheduleRow(env, id)["next_run_at"] === null, 15_000);
     assert.equal(taskState(env, taskId), "draft", "the task never moved — FR-WS-03 refuses");
     assert.equal(scheduleRow(env, id)["last_run_at"], null, "the run never happened");
   } finally {
@@ -622,8 +632,22 @@ test("an out-of-band corrupt cron row is quarantined, not fatal: warn + enabled=
     },
   });
   try {
-    // the first evaluation pass hits the corrupt row; the daemon survives
-    await new Promise((r) => setTimeout(r, 250));
+    // DEBT-004: the quarantine lands on the first evaluation pass, but a
+    // FIXED 250 ms wait assumed that pass had run by then — under full-suite
+    // load the pass (and any catalog probe ahead of it in the tick) can be
+    // later than that, which is the captured flake. Poll the ROW itself,
+    // bounded: the assertions below are unchanged.
+    await waitFor(() => {
+      const db = openDb(env.dbPath);
+      try {
+        const r = db
+          .prepare("SELECT enabled FROM schedules WHERE cron_expr = 'not a cron'")
+          .get() as { enabled: number } | undefined;
+        return r?.enabled === 0;
+      } finally {
+        db.close();
+      }
+    }, 15_000);
     const db = openDb(env.dbPath);
     const row = db
       .prepare("SELECT enabled, next_run_at FROM schedules WHERE cron_expr = 'not a cron'")

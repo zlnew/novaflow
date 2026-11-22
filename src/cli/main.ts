@@ -17,6 +17,7 @@ import { scheduleCommand } from "./commands/schedule.ts";
 import { daemonCommand } from "./commands/daemon.ts";
 import { chainCommand } from "./commands/chain.ts";
 import { mcpCommand } from "./commands/mcp.ts";
+import { docsCommand } from "./commands/docs.ts";
 import type { CommandOpts } from "./opts.ts";
 
 /**
@@ -60,7 +61,9 @@ const USAGE = `USAGE: nova <noun> <sub> [args] [flags]
   nova task gate-approve <id|key> [--run <id>] [--by <name>] [--note <text>]
   nova task gate-reject <id|key> <feedback...>
   nova daemon start [--foreground] | stop | status | pause | resume | kill-all
+  nova daemon backup [--out <path>] | prune [--retention-days <n>]
   nova daemon logs [--lines <n>]
+  nova docs list [<workspace>]
   nova version
   nova schedule attach <id|key> [--cron '<expr>' | --at <iso>] [--missed skip|run_immediately]
   nova schedule list [--task <id|key>] [--workspace <slug|id>]
@@ -131,6 +134,8 @@ async function dispatch(argv: string[]): Promise<number> {
       return chainCommand(rest, opts);
     case "mcp":
       return mcpCommand(rest, opts);
+    case "docs":
+      return docsCommand(rest, opts);
     default:
       throw new UsageError(`unknown command "${noun}"`);
   }
