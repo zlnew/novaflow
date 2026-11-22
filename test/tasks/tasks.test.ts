@@ -34,6 +34,12 @@ function seededDb(overrides: { toolsAllowlistJson?: string } = {}) {
     "INSERT INTO projects (id, workspace_id, slug, name, objective) VALUES (?, ?, ?, ?, ?)",
   ).run(ulid(), workspaceId, "prj", "prj", "o");
   const projectId = (db.prepare("SELECT id AS id FROM projects").get() as { id: string }).id;
+  // a project target row — the FK every enqueue-path task's
+  // target_scopes must reference (DEBT-010: zero-scope tasks refuse)
+  db.prepare(
+    "INSERT INTO project_targets (id, project_id, alias, target_type, root_path) VALUES (?, ?, 'app', 'directory', ?)",
+  ).run(ulid(), projectId, "/tmp/ws/target");
+  const targetId = (db.prepare("SELECT id AS id FROM project_targets").get() as { id: string }).id;
   db.prepare(
     `INSERT INTO agent_profiles
        (id, workspace_id, name, provider, model, system_prompt_path, tools_allowlist_json)
@@ -41,7 +47,12 @@ function seededDb(overrides: { toolsAllowlistJson?: string } = {}) {
              'prompts/dev_system.md', ?)`,
   ).run(ulid(), overrides.toolsAllowlistJson ?? '["read","bash"]');
   const profileId = (db.prepare("SELECT id AS id FROM agent_profiles").get() as { id: string }).id;
-  return { db, projectId, profileId };
+  return { db, projectId, profileId, targetId };
+}
+
+/** The seeded target as one target_scope — every enqueue-path task carries it (DEBT-010). */
+function seededScopes(targetId: string) {
+  return [{ targetId, accessMode: "read_write" as const }];
 }
 
 function logCount(db: Database.Database, taskId: string): number {
@@ -171,7 +182,7 @@ test("golden: ENQUEUE_TRIGGER is the verbatim 8.1 draft→queued trigger", () =>
 });
 
 test("enqueueTask: resolvable profile → draft becomes queued with one audit log row", async (t) => {
-  const { db, projectId, profileId } = seededDb();
+  const { db, projectId, profileId, targetId } = seededDb();
   const dir = mkdtempSync(join(tmpdir(), "novaflow-tasks-"));
   try {
     const task = createTask(db, {
@@ -180,6 +191,7 @@ test("enqueueTask: resolvable profile → draft becomes queued with one audit lo
       title: "t",
       objective: "o",
       profileId,
+      targetScopes: seededScopes(targetId),
     });
     const pidfile = join(dir, "stub.pid");
     const row = await withBound(
@@ -213,7 +225,7 @@ test("enqueueTask: resolvable profile → draft becomes queued with one audit lo
 });
 
 test("enqueueTask: profile_unresolved leaves the task in draft with no log row", async (t) => {
-  const { db, projectId, profileId } = seededDb();
+  const { db, projectId, profileId, targetId } = seededDb();
   const dir = mkdtempSync(join(tmpdir(), "novaflow-tasks-"));
   try {
     const task = createTask(db, {
@@ -222,6 +234,7 @@ test("enqueueTask: profile_unresolved leaves the task in draft with no log row",
       title: "t",
       objective: "o",
       profileId,
+      targetScopes: seededScopes(targetId),
     });
     const pidfile = join(dir, "stub.pid");
     await assert.rejects(
@@ -249,7 +262,7 @@ test("enqueueTask: profile_unresolved leaves the task in draft with no log row",
 });
 
 test("enqueueTask: an invalid stored profile row is rejected before any transition", async (t) => {
-  const { db, projectId, profileId } = seededDb({ toolsAllowlistJson: '[42]' });
+  const { db, projectId, profileId, targetId } = seededDb({ toolsAllowlistJson: '[42]' });
   const dir = mkdtempSync(join(tmpdir(), "novaflow-tasks-"));
   try {
     const task = createTask(db, {
@@ -258,6 +271,7 @@ test("enqueueTask: an invalid stored profile row is rejected before any transiti
       title: "t",
       objective: "o",
       profileId,
+      targetScopes: seededScopes(targetId),
     });
     const pidfile = join(dir, "stub.pid");
     await assert.rejects(
@@ -304,7 +318,7 @@ test("enqueueTask: unknown task id throws", async (t) => {
 });
 
 test("enqueueTask: an already-queued task refuses a second enqueue (matrix guard)", async (t) => {
-  const { db, projectId, profileId } = seededDb();
+  const { db, projectId, profileId, targetId } = seededDb();
   const dir = mkdtempSync(join(tmpdir(), "novaflow-tasks-"));
   try {
     const task = createTask(db, {
@@ -313,6 +327,7 @@ test("enqueueTask: an already-queued task refuses a second enqueue (matrix guard
       title: "t",
       objective: "o",
       profileId,
+      targetScopes: seededScopes(targetId),
     });
     const opts = {
       piBin: "node",
@@ -360,7 +375,7 @@ test("FK discipline: createTask with a bogus profile id is rejected under openDb
 });
 
 test("enqueueTask: triggerType surfaces are logged (human default, mcp for nova_task_run)", async (t) => {
-  const { db, projectId, profileId } = seededDb();
+  const { db, projectId, profileId, targetId } = seededDb();
   const dir = mkdtempSync(join(tmpdir(), "novaflow-tasks-"));
   try {
     for (const [i, triggerType] of [
@@ -373,6 +388,7 @@ test("enqueueTask: triggerType surfaces are logged (human default, mcp for nova_
         title: "t",
         objective: "o",
         profileId,
+        targetScopes: seededScopes(targetId),
       });
       await enqueueTask(db, task.id, "operator", {
         piBin: "node",
@@ -391,7 +407,7 @@ test("enqueueTask: triggerType surfaces are logged (human default, mcp for nova_
 });
 
 test("enqueueTask: the matrix guard runs BEFORE the catalog probe — a non-draft task is refused without spawning pi", async () => {
-  const { db, projectId, profileId } = seededDb();
+  const { db, projectId, profileId, targetId } = seededDb();
   const dir = mkdtempSync(join(tmpdir(), "novaflow-tasks-"));
   try {
     const task = createTask(db, {
@@ -400,6 +416,7 @@ test("enqueueTask: the matrix guard runs BEFORE the catalog probe — a non-draf
       title: "t",
       objective: "o",
       profileId,
+      targetScopes: seededScopes(targetId),
     });
     await enqueueTask(db, task.id, "operator", {
       piBin: "node",

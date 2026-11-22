@@ -124,6 +124,7 @@ test("operator mode over a live daemon: status, queue, plan, gate approve, gate 
         objective: "Prove the /nova gate surface drives the engine.",
         profile_name: "dev",
         requires_human_gate: true,
+        target_scopes: [{ repo_alias: "ws-app", access_mode: "read_write" }],
       }),
     )) as { task: { id: string; key: string; state: string } };
     const taskId = created.task.id;
@@ -177,6 +178,7 @@ test("operator mode over a live daemon: status, queue, plan, gate approve, gate 
         objective: "Prove the /nova gate reject path.",
         profile_name: "dev",
         requires_human_gate: true,
+        target_scopes: [{ repo_alias: "ws-app", access_mode: "read_write" }],
       }),
     )) as { task: { id: string } };
     const taskId2 = created2.task.id;

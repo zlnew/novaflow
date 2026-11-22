@@ -74,6 +74,11 @@ function seed(): Seed {
     "INSERT INTO projects (id, workspace_id, slug, name, objective) VALUES (?, ?, 'prj', 'prj', 'o')",
   ).run(ulid(), workspaceId);
   const projectId = (db.prepare("SELECT id FROM projects").get() as { id: string }).id;
+  // the FK every enqueued member's target_scopes reference (DEBT-010
+  // fixtures: the guarded draft→queued row refuses zero-scope tasks)
+  db.prepare(
+    "INSERT INTO project_targets (id, project_id, alias, target_type, root_path) VALUES (?, ?, 'app', 'directory', ?)",
+  ).run(ulid(), projectId, join(wsRoot, "target"));
   db.prepare(
     `INSERT INTO agent_profiles (id, workspace_id, name, provider, model, system_prompt_path)
      VALUES (?, NULL, 'dev', 'anthropic', 'm1', 'prompts/dev_system.md')`,
@@ -102,6 +107,7 @@ function importGraph(
         title: t.title ?? `Task ${t.key}`,
         objective: `The objective of task ${t.key}.`,
         profile_name: "dev",
+        target_scopes: [{ repo_alias: "app", access_mode: "read_write" }],
       })),
       edges,
     },

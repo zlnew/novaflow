@@ -182,6 +182,7 @@ test("nova_daemon_backup while a run is LIVE: the copy is consistent and the run
           title: "live",
           objective: "Take a backup while I run.",
           profile_name: "dev",
+          target_scopes: [{ repo_alias: "ws-app", access_mode: "read_write" }],
         },
       }),
     );

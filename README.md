@@ -108,9 +108,10 @@ cat > dev.json <<'JSON'
 JSON
 bin/nova profile create --file dev.json
 
-# 3. a task, run to completion
+# 3. a task, run to completion -- --scope names a project target the run
+#    is confined to (DEBT-010: the run refuses a task with no scopes)
 bin/nova task create FEAT-1 --title "Add PKCE" --objective "Implement PKCE." \
-  --profile dev --project app --context docs/spec.md
+  --profile dev --project app --context docs/spec.md --scope code
 bin/nova task run FEAT-1 --watch
 bin/nova task result FEAT-1
 ```

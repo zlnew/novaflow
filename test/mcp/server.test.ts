@@ -417,6 +417,7 @@ test("kill surface parity: nova_task_abort and nova_kill_all kill the same proce
           title: key,
           objective: `objective for ${key}`,
           profile_name: "dev",
+          target_scopes: [{ repo_alias: "ws-app", access_mode: "read_write" }],
         },
       })) as ToolResult;
       assert.equal(res.isError, undefined, JSON.stringify(res));
@@ -580,6 +581,7 @@ test("nova_task_abort over MCP group-kills a forked grandchild (judge B finding 
         title: "ABORT-GC",
         objective: "objective for ABORT-GC",
         profile_name: "dev",
+        target_scopes: [{ repo_alias: "ws-app", access_mode: "read_write" }],
       },
     })) as ToolResult;
     assert.equal(createRes.isError, undefined, JSON.stringify(createRes));

@@ -28,8 +28,9 @@ import { canonicalTimestamp } from "../sched/iso.ts";
  *     consumed) but forces NO transition: a schedule is a transition
  *     trigger, not an enqueuer of duplicates.
  *   - A fire whose enqueue is refused (catalog probe unresolved,
- *     another surface moved the task mid-probe, or the like) is
- *     logged and ADVANCES — never wedged, never a hot re-probe loop.
+ *     another surface moved the task mid-probe, a task with no
+ *     target_scopes — DEBT-010, or the like) is logged and ADVANCES —
+ *     never wedged, never a hot re-probe loop.
  *   - A dangling target_id row (DDL tolerance: no FK) is skipped with
  *     a logged note and advanced — the evaluator never wedges on a
  *     dead reference.
@@ -202,9 +203,10 @@ export function createScheduleEvaluator(db: Db, opts: ScheduleEvaluatorOptions) 
         ...(opts.enqueueOptions?.timeoutMs !== undefined ? { timeoutMs: opts.enqueueOptions.timeoutMs } : {}),
       });
     } catch (err) {
-      // a refused enqueue (unresolved profile, a concurrent surface
-      // moved the task mid-probe) is logged and ADVANCES — never a
-      // re-probe hot loop, never a wedge
+      // a refused enqueue (unresolved profile, a task with no
+      // target_scopes — DEBT-010, a concurrent surface moved the task
+      // mid-probe) is logged and ADVANCES — never a re-probe hot loop,
+      // never a wedge
       warn(`schedule ${row.id}: enqueue of task ${row.target_id} refused — ${(err as Error).message}; skipping (the run never happened) and advancing`);
       // last_run_at stays untouched — consistent with every other refusal
       // path (review finding: a refused occurrence must not claim a run)

@@ -137,6 +137,7 @@ async function createAndRun(env: Env, key: string): Promise<string> {
         title: key,
         objective: "Do the thing.",
         profile_name: "dev",
+        target_scopes: [{ repo_alias: "ws-app", access_mode: "read_write" }],
       },
     }),
   );
