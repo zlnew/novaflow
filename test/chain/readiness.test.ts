@@ -43,6 +43,10 @@ function seed(): {
     "INSERT INTO projects (id, workspace_id, slug, name, objective) VALUES (?, ?, 'prj', 'prj', 'o')",
   ).run(ulid(), workspaceId);
   const projectId = (db.prepare("SELECT id FROM projects").get() as { id: string }).id;
+  // the FK every member's target_scopes reference (DEBT-010 fixtures)
+  db.prepare(
+    "INSERT INTO project_targets (id, project_id, alias, target_type, root_path) VALUES (?, ?, 'app', 'directory', ?)",
+  ).run(ulid(), projectId, "/tmp/ws/target");
   db.prepare(
     `INSERT INTO agent_profiles (id, workspace_id, name, provider, model, system_prompt_path)
      VALUES (?, NULL, 'dev', 'anthropic', 'm1', 'prompts/dev_system.md')`,
@@ -55,14 +59,18 @@ type Seed = ReturnType<typeof seed>;
 
 const PROBE = { piBin: "node", args: [STUB, "ok"], timeoutMs: 5000 };
 
+/** Every member carries the seeded target's scope — the DEBT-010 guard
+ *  refuses an enqueue of a task with zero target_scopes. */
+const SCOPES = [{ repo_alias: "app", access_mode: "read_write" as const }];
+
 /** Import a linear chain A -> B (depends_on) into the seeded project. */
 function importLinearChain(s: Seed): { chainId: string; a: string; b: string } {
   const { chainRun, tasks } = importChain(s.db, { id: s.workspaceId }, { id: s.projectId, slug: "prj" }, {
     version: "1.0.0",
     project_slug: "prj",
     tasks: [
-      { key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "dev" },
-      { key: "B", title: "Task B", objective: "The objective of task B.", profile_name: "dev" },
+      { key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "dev", target_scopes: SCOPES },
+      { key: "B", title: "Task B", objective: "The objective of task B.", profile_name: "dev", target_scopes: SCOPES },
     ],
     edges: [{ source_key: "A", target_key: "B", edge_type: "depends_on" }],
   });
@@ -146,9 +154,9 @@ test("fan-in: a member waits for EVERY depends_on source to complete", async () 
       version: "1.0.0",
       project_slug: "prj",
       tasks: [
-        { key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "dev" },
-        { key: "B", title: "Task B", objective: "The objective of task B.", profile_name: "dev" },
-        { key: "C", title: "Task C", objective: "The objective of task C.", profile_name: "dev" },
+        { key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "dev", target_scopes: SCOPES },
+        { key: "B", title: "Task B", objective: "The objective of task B.", profile_name: "dev", target_scopes: SCOPES },
+        { key: "C", title: "Task C", objective: "The objective of task C.", profile_name: "dev", target_scopes: SCOPES },
       ],
       edges: [
         { source_key: "A", target_key: "C", edge_type: "depends_on" },

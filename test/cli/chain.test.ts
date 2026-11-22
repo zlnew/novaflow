@@ -92,8 +92,8 @@ function graphJson(keyA: string, keyB: string): string {
       version: "1.0.0",
       project_slug: "app",
       tasks: [
-        { key: keyA, title: "Task A", objective: "The objective of task A.", profile_name: "dev" },
-        { key: keyB, title: "Task B", objective: "The objective of task B.", profile_name: "dev" },
+        { key: keyA, title: "Task A", objective: "The objective of task A.", profile_name: "dev", target_scopes: [{ repo_alias: "code", access_mode: "read_write" }] },
+        { key: keyB, title: "Task B", objective: "The objective of task B.", profile_name: "dev", target_scopes: [{ repo_alias: "code", access_mode: "read_write" }] },
       ],
       edges: [{ source_key: keyA, target_key: keyB, edge_type: "depends_on" }],
     },
@@ -110,10 +110,16 @@ tasks:
     title: Task A
     objective: The objective of task A.
     profile_name: dev
+    target_scopes:
+      - repo_alias: code
+        access_mode: read_write
   - key: ${keyB}
     title: Task B
     objective: The objective of task B.
     profile_name: dev
+    target_scopes:
+      - repo_alias: code
+        access_mode: read_write
 edges:
   - source_key: ${keyA}
     target_key: ${keyB}
@@ -143,7 +149,7 @@ test("nova project import-dag + nova chain end to end through the binary", async
     assert.equal(runNova(["profile", "create", "--file", profileSrc], h.env).code, 0);
     mkdirSync(join(h.wsRoot, "prompts"), { recursive: true });
     writeFileSync(join(h.wsRoot, "prompts", "dev_system.md"), "You are a worker agent.\n");
-    assert.equal(runNova(["project", "create", "app", "--objective", "Ship it."], h.env).code, 0);
+    assert.equal(runNova(["project", "create", "app", "--objective", "Ship it.", "--target", `code=${h.wsRoot}`], h.env).code, 0);
 
     // ---- import-dag: JSON file, YAML file, --json envelope ----
     const jsonFile = join(h.dir, "chain.json");

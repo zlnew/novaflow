@@ -223,6 +223,7 @@ test("with a live daemon: mutating tools are recorded as trigger_type 'mcp'", as
           title: "cli-created",
           objective: "Prove the CLI server attributes mutations to mcp.",
           profile_name: "dev",
+          target_scopes: [{ repo_alias: "ws-app", access_mode: "read_write" }],
         },
       }),
     )) as ToolResult;

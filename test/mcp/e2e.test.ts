@@ -137,6 +137,7 @@ test("e2e over stdio: nova mcp drives create → run → gate approve against a 
           profile_name: "dev",
           requires_human_gate: true,
           overrides: { timeout_sec: 120 },
+          target_scopes: [{ repo_alias: "ws-app", access_mode: "read_write" }],
         },
       }),
     )) as ToolResult;

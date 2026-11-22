@@ -85,13 +85,19 @@ async function boot(
 
 
 /** A draft task inserted directly (schedule-seed helper; schedules fire the
- *  guarded enqueue later, so raw insert of the DRAFT row is safe here). */
+ *  guarded enqueue later, so raw insert of the DRAFT row is safe here).
+ *  The row carries the seeded target's scope — the guarded enqueue
+ *  refuses a task with zero target_scopes (DEBT-010). */
 function insertDraftTask(db: Database.Database, seeded: SeededStore, key: string): string {
   const id = ulid();
   db.prepare(
     `INSERT INTO tasks (id, project_id, key, title, objective, profile_id)
      VALUES (?, ?, ?, ?, ?, ?)`,
   ).run(id, seeded.projectId, key, key, `Objective for ${key}.`, seeded.profileId);
+  db.prepare(
+    `INSERT INTO task_target_scopes (id, task_id, target_id, access_mode)
+     VALUES (?, ?, ?, 'read_write')`,
+  ).run(ulid(), id, seeded.targetId);
   return id;
 }
 
@@ -112,6 +118,7 @@ async function createTaskVia(env: Env, key: string): Promise<string> {
       title: key,
       objective: "Implement the thing end to end.",
       profile_name: "dev",
+      target_scopes: [{ repo_alias: "ws-app", access_mode: "read_write" }],
     },
   });
   assert.equal(res["ok"], true, JSON.stringify(res));
@@ -418,6 +425,7 @@ test("boot recovery: run_immediately fires a missed cron EXACTLY ONCE, then adva
         title: "missed",
         objective: "o",
         profileId: seeded.profileId,
+        targetScopes: [{ targetId: seeded.targetId, accessMode: "read_write" }],
       });
       const row = db.prepare("SELECT id FROM tasks WHERE key = 'MISSED-RUN'").get() as { id: string };
       holder.id = row.id;
@@ -463,6 +471,7 @@ test("boot recovery: an expired one-shot goes NULL — skip leaves last_run_at u
         title: "one",
         objective: "o",
         profileId: seeded.profileId,
+        targetScopes: [{ targetId: seeded.targetId, accessMode: "read_write" }],
       });
       const row = db.prepare("SELECT id FROM tasks WHERE key = 'ONE-SKIP'").get() as { id: string };
       skipHolder.id = row.id;
@@ -499,6 +508,7 @@ test("boot recovery: an expired one-shot goes NULL — skip leaves last_run_at u
         title: "one",
         objective: "o",
         profileId: seeded.profileId,
+        targetScopes: [{ targetId: seeded.targetId, accessMode: "read_write" }],
       });
       const row = db.prepare("SELECT id FROM tasks WHERE key = 'ONE-RUN'").get() as { id: string };
       runHolder.id = row.id;

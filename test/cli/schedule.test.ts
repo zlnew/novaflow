@@ -111,12 +111,15 @@ async function bootWorkspace(h: Home): Promise<void> {
   );
   assert.equal(runNova(["profile", "create", "--file", profileSrc], h.env).code, 0);
   assert.equal(
-    runNova(["project", "create", "app", "--objective", "Ship the thing."], h.env).code,
+    runNova(
+      ["project", "create", "app", "--objective", "Ship the thing.", "--target", `work=${join(h.dir, "wsroot")}`],
+      h.env,
+    ).code,
     0,
   );
   assert.equal(
     runNova(
-      ["task", "create", "TASK-1", "--title", "Do the work", "--objective", "Do the work end to end.", "--profile", "dev", "--project", "app"],
+      ["task", "create", "TASK-1", "--title", "Do the work", "--objective", "Do the work end to end.", "--profile", "dev", "--project", "app", "--scope", "work"],
       h.env,
     ).code,
     0,

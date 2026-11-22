@@ -30,6 +30,11 @@ import { VERIFY_PASSED_TRIGGER } from "../../src/fsm/triggers.ts";
 
 const STUB = join(import.meta.dirname, "..", "fixtures", "pi-stub.ts");
 
+/** The seeded workspace target's scope — every member that can be
+ *  enqueued carries it (DEBT-010: the guarded draft→queued row refuses
+ *  a task with zero target_scopes). */
+const SCOPES = [{ repo_alias: "ws-app", access_mode: "read_write" as const }];
+
 type Env = {
   dir: string;
   dbPath: string;
@@ -84,8 +89,8 @@ function chainGraph(over: Record<string, unknown> = {}): Record<string, unknown>
     version: "1.0.0",
     project_slug: "prj",
     tasks: [
-      { key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "dev" },
-      { key: "B", title: "Task B", objective: "The objective of task B.", profile_name: "dev" },
+      { key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "dev", target_scopes: SCOPES },
+      { key: "B", title: "Task B", objective: "The objective of task B.", profile_name: "dev", target_scopes: SCOPES },
     ],
     edges: [{ source_key: "A", target_key: "B", edge_type: "depends_on" }],
     ...over,
@@ -348,7 +353,7 @@ test("the gate terminal outcome (confirm-failure) fails the chain over the wire"
   try {
     const res = await importVia(env, chainGraph({
       tasks: [
-        { key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "dev", requires_human_gate: true },
+        { key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "dev", requires_human_gate: true, target_scopes: SCOPES },
       ],
       edges: [],
     }));
@@ -497,8 +502,8 @@ test("chain abort with a LIVE running member: dispatcher.abortTask group-kills i
   try {
     const res = await importVia(env, chainGraph({
       tasks: [
-        { key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "dev" },
-        { key: "DONE", title: "Done already", objective: "A member that finished already.", profile_name: "dev" },
+        { key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "dev", target_scopes: SCOPES },
+        { key: "DONE", title: "Done already", objective: "A member that finished already.", profile_name: "dev", target_scopes: SCOPES },
       ],
       edges: [],
     }));
@@ -635,8 +640,8 @@ test("review path end to end: a reviewer-shaped emitter re-enters its completed 
       version: "1.0.0",
       project_slug: "prj",
       tasks: [
-        { key: "R", title: "Reviewer", objective: "The objective of task R.", profile_name: "dev" },
-        { key: "W", title: "Worker", objective: "The objective of task W.", profile_name: "dev" },
+        { key: "R", title: "Reviewer", objective: "The objective of task R.", profile_name: "dev", target_scopes: SCOPES },
+        { key: "W", title: "Worker", objective: "The objective of task W.", profile_name: "dev", target_scopes: SCOPES },
       ],
       edges: [{ source_key: "R", target_key: "W", edge_type: "on_changes_requested" }],
     });
@@ -744,8 +749,9 @@ test("failure path over the wire: confirm-failure enqueues the on_failure fallba
           objective: "The objective of task F.",
           profile_name: "dev",
           requires_human_gate: true,
+          target_scopes: SCOPES,
         },
-        { key: "T", title: "Fallback", objective: "The objective of task T.", profile_name: "dev" },
+        { key: "T", title: "Fallback", objective: "The objective of task T.", profile_name: "dev", target_scopes: SCOPES },
       ],
       edges: [{ source_key: "F", target_key: "T", edge_type: "on_failure" }],
     });
@@ -815,8 +821,9 @@ test("the gate-approved verification driver (p4a residual): approving the gate r
           objective: "The objective of task A.",
           profile_name: "dev",
           requires_human_gate: true,
+          target_scopes: SCOPES,
         },
-        { key: "B", title: "Follow-up", objective: "The objective of task B.", profile_name: "dev" },
+        { key: "B", title: "Follow-up", objective: "The objective of task B.", profile_name: "dev", target_scopes: SCOPES },
       ],
       edges: [{ source_key: "A", target_key: "B", edge_type: "depends_on" }],
     });

@@ -175,7 +175,7 @@ test("operator flow through bin/nova: daemon start → workspace → project →
     const targetRoot = join(h.dir, "target");
     mkdirSync(targetRoot);
     const proj = runNova(
-      ["project", "create", "app", "--objective", "Ship the thing.", "--target", `code=${targetRoot}:git_repo`],
+      ["project", "create", "app", "--objective", "Ship the thing.", "--target", `code=${targetRoot}:git_repo`, "--target", `work=${targetRoot}`],
       h.env,
     );
     assert.equal(proj.code, 0, proj.stderr);
@@ -190,7 +190,7 @@ test("operator flow through bin/nova: daemon start → workspace → project →
     mkdirSync(join(wsRoot, "prompts"), { recursive: true });
     writeFileSync(join(wsRoot, "prompts", "dev_system.md"), "You are a worker agent.\n");
     const task = runNova(
-      ["task", "create", "TASK-1", "--title", "Do the work", "--objective", "Do the work end to end.", "--profile", "dev", "--project", "app"],
+      ["task", "create", "TASK-1", "--title", "Do the work", "--objective", "Do the work end to end.", "--profile", "dev", "--project", "app", "--scope", "work"],
       h.env,
     );
     assert.equal(task.code, 0, task.stderr);
@@ -300,9 +300,10 @@ test("watch ending in a failed task exits 1 (the srs operation-failure row)", as
     assert.equal(runNova(["profile", "create", "--file", profileSrc], h.env).code, 0);
     mkdirSync(join(wsRoot, "prompts"), { recursive: true });
     writeFileSync(join(wsRoot, "prompts", "dev_system.md"), "You are a worker agent.\n");
-    assert.equal(runNova(["project", "create", "app", "--objective", "o"], h.env).code, 0);
+    mkdirSync(join(h.dir, "target"));
+    assert.equal(runNova(["project", "create", "app", "--objective", "o", "--target", `work=${join(h.dir, "target")}`], h.env).code, 0);
     assert.equal(
-      runNova(["task", "create", "CRASH", "--title", "t", "--objective", "o", "--profile", "dev", "--project", "app"], h.env).code,
+      runNova(["task", "create", "CRASH", "--title", "t", "--objective", "o", "--profile", "dev", "--project", "app", "--scope", "work"], h.env).code,
       0,
     );
     // run-crash fails; the default retry delay (300 s) keeps it failed
@@ -373,11 +374,12 @@ test("--watch on a task in an ARCHIVED workspace refuses fast — never a silent
     mkdirSync(join(wsRoot, "prompts"), { recursive: true });
     writeFileSync(join(wsRoot, "prompts", "dev_system.md"), "You are a worker agent.\n");
     assert.equal(runNova(["profile", "create", "--file", profileSrc], h.env).code, 0);
+    mkdirSync(join(h.dir, "target"));
     assert.equal(
-      runNova(["project", "create", "prj", "--objective", "Ship it."], h.env).code, 0,
+      runNova(["project", "create", "prj", "--objective", "Ship it.", "--target", `work=${join(h.dir, "target")}`], h.env).code, 0,
     );
     assert.equal(
-      runNova(["task", "create", "T1", "--title", "t", "--objective", "o", "--profile", "dev", "--project", "prj"], h.env).code, 0,
+      runNova(["task", "create", "T1", "--title", "t", "--objective", "o", "--profile", "dev", "--project", "prj", "--scope", "work"], h.env).code, 0,
     );
 
     // pause → enqueue (legitimately queued) → archive → watch must refuse
