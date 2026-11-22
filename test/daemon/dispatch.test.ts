@@ -2,8 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -111,6 +113,43 @@ function wait(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * DEBT-004: a spawned stub's boot exceeds any small fixed sleep under
+ * full-suite load (measured 231-284 ms for 12 concurrent boots against a
+ * 150 ms assumption), so readiness is POLLED for the state the assertion
+ * needs. Unchanged assertions follow each poll; only the scheduling
+ * assumption is gone. The bound is generous because a poll costs nothing
+ * when the condition is already true.
+ */
+/**
+ * The stub's boot is complete once it has written its receipt — that file
+ * appears only after the child reached its prompt handler (the pid row is
+ * recorded at spawn(), long before the child has installed its SIGTERM
+ * handler, which is precisely how the load flake produced `exit_code null`).
+ */
+function runDirReceiptExists(s: Seed): boolean {
+  const runsRoot = join(s.dir, "ws0", ".novaflow", "runs");
+  try {
+    for (const task of readdirSync(runsRoot)) {
+      for (const run of readdirSync(join(runsRoot, task))) {
+        if (existsSync(join(runsRoot, task, run, "stub-receipt.json"))) return true;
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+async function until(probe: () => boolean, what: string, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (probe()) return;
+    await wait(10);
+  }
+  assert.fail(`timed out after ${timeoutMs} ms waiting for ${what}`);
+}
+
 async function assertReaped(pid: number): Promise<void> {
   for (let i = 0; i < 80; i++) {
     try {
@@ -142,7 +181,7 @@ test("FR-SCH-02: global 1 — first task runs, surplus stays QUEUED (FIFO); free
     onRunConcluded: (taskId, outcome) => conclusions.push([taskId, outcome]),
   });
   try {
-    await wait(150);
+    await until(() => state(s, first) === "running", "the first run to be live");
     assert.equal(state(s, first), "running");
     assert.equal(state(s, second), "queued"); // AC2: surplus held in QUEUED
     assert.equal(d.status().running, 1);
@@ -152,7 +191,7 @@ test("FR-SCH-02: global 1 — first task runs, surplus stays QUEUED (FIFO); free
     const res = await d.abortTask(first, { triggerType: "human", actor: "op" });
     assert.ok(res.aborted);
     assert.equal(state(s, first), "cancelled");
-    await wait(150);
+    await until(() => state(s, second) === "running", "the FIFO successor to be dispatched");
     assert.equal(state(s, second), "running");
     assert.equal(conclusions.length, 1);
     assert.equal(conclusions[0]![0], first);
@@ -179,7 +218,10 @@ test("FR-SCH-02: per-workspace limit — workspace config 1 caps ws A, default 2
   const b2 = hangTask(s, 1, "B2");
   const d = createDispatcher(s.db, { globalConcurrency: 4, runOptions: runOpts(s), tickMs: 40 });
   try {
-    await wait(200);
+    await until(
+      () => state(s, a1) === "running" && state(s, b1) === "running" && state(s, b2) === "running",
+      "both workspaces to be at their limits",
+    );
     assert.equal(state(s, a1), "running");
     assert.equal(state(s, b1), "running");
     assert.equal(state(s, b2), "running");
@@ -200,18 +242,18 @@ test("paused scheduler: no NEW spawns; running runs continue; resume dispatches 
   const first = hangTask(s, 0, "A");
   const d = createDispatcher(s.db, { globalConcurrency: 4, runOptions: runOpts(s), tickMs: 40 });
   try {
-    await wait(150);
+    await until(() => state(s, first) === "running", "the first run to be live");
     assert.equal(state(s, first), "running");
     d.pause();
     assert.equal(d.status().paused, true);
 
     const second = hangTask(s, 0, "B");
-    await wait(200);
+    await wait(200); // observe the FROZEN state: a paused daemon never spawns
     assert.equal(state(s, second), "queued"); // frozen: no new spawn
     assert.equal(state(s, first), "running"); // the live run continues
 
     d.resume();
-    await wait(200);
+    await until(() => state(s, second) === "running", "the resumed dispatch to start the second run");
     assert.equal(state(s, second), "running");
   } finally {
     await d.stop();
@@ -318,6 +360,9 @@ test("regression: a poison task's start failures are cooldown-bounded, never a h
     },
   });
   try {
+    // the healthy candidate must be admitted before the rate window starts
+    // being observed (under load the first pass itself can be late)
+    await until(() => state(s, healthy) === "running", "the healthy candidate to be admitted");
     await wait(3500);
     // cooldown-bounded re-eligibility: ~1 attempt per (cooldown + tick)
     // window — NOT the pre-fix hot loop (~10,500 attempts/s). Bound has
@@ -342,7 +387,12 @@ test("abortTask: SIGTERM group kill + the running→cancelled row (loop-owned), 
   const taskId = hangTask(s, 0, "A");
   const d = createDispatcher(s.db, { globalConcurrency: 4, runOptions: runOpts(s), tickMs: 40 });
   try {
-    await wait(150);
+    // the abort needs the CHILD booted enough to take SIGTERM through its own
+    // handler: poll for the stub's receipt (written once it is reading
+    // stdin), never a fixed sleep (DEBT-004: a stub boot measures 231-284 ms
+    // under load, and a SIGTERM before the handler installs is a default
+    // signal death — the observed `exit_code null`)
+    await until(() => runDirReceiptExists(s), "the stub to finish booting");
     assert.equal(state(s, taskId), "running");
     const pid = lastRun(s, taskId).pid!;
     const res = await d.abortTask(taskId, { triggerType: "human", actor: "operator-x" });
@@ -385,7 +435,10 @@ test("abortTask escalates to SIGKILL when the child ignores SIGTERM (grace windo
     tickMs: 40,
   });
   try {
-    await wait(150);
+    // the stub must have reached its SIGTERM handler before the abort, or the
+    // group kill lands on a process whose handler is not installed yet and
+    // SIGTERM simply ends it (the observed flake: ENOENT on the pidfile)
+    await until(() => runDirReceiptExists(s), "the stub to finish booting");
     assert.equal(state(s, taskId), "running");
     const pid = lastRun(s, taskId).pid!;
     const res = await d.abortTask(taskId, { triggerType: "mcp", actor: "orchestrator" });
@@ -413,7 +466,9 @@ test("steerFrame: forwards a frame while the child is live; refuses with a reaso
     // no live run yet → refused
     const early = d.steerFrame(taskId, JSON.stringify({ id: "s1", type: "steer", message: "hi" }));
     assert.ok(!early.ok);
-    await wait(150);
+    // the steer sink opens when the child is spawned, but the child must be
+    // able to READ the frame: poll for its boot (DEBT-004)
+    await until(() => runDirReceiptExists(s), "the stub to finish booting");
     // live: the write goes through the child's stdin
     const frame = JSON.stringify({ id: "s2", type: "steer", message: "Use SHA-256." });
     const liveRes = d.steerFrame(taskId, frame);
@@ -437,7 +492,7 @@ test("stop() reaps every live run (operator-abort semantics) and leaves no stray
   const t1 = hangTask(s, 0, "A");
   const t2 = hangTask(s, 0, "B");
   const d = createDispatcher(s.db, { globalConcurrency: 4, runOptions: runOpts(s), tickMs: 40 });
-  await wait(150);
+  await until(() => runDirReceiptExists(s), "the stubs to finish booting");
   const pids = [lastRun(s, t1).pid!, lastRun(s, t2).pid!];
   await d.stop();
   assert.equal(state(s, t1), "cancelled");
@@ -454,7 +509,7 @@ test("PRESERVE: the dispatch slot still lands on the verbatim queued→running s
   const taskId = hangTask(s, 0, "A");
   const d = createDispatcher(s.db, { globalConcurrency: 1, runOptions: runOpts(s), tickMs: 40 });
   try {
-    await wait(150);
+    await until(() => state(s, taskId) === "running", "the dispatched run to be live");
     const tr = s.db
       .prepare("SELECT * FROM state_transition_logs WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1")
       .get(taskId) as Record<string, unknown>;

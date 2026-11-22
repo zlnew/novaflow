@@ -20,6 +20,25 @@ const IDENTITY = {
 /** Every handshake call is raced against a wall clock — the suite cannot hang. */
 const BOUND_MS = 8000;
 
+/**
+ * DEBT-004: a spawned stub's boot (node + tsx transform) exceeds a small
+ * fixed deadline under full-suite load (measured 231-284 ms for 12
+ * concurrent boots), so the pidfile may legitimately not exist yet when the
+ * probe's own timeout fires. Poll for it instead of assuming a boot time.
+ */
+async function waitForFile(path: string, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      readFileSync(path);
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+  assert.fail(`timed out after ${timeoutMs} ms waiting for ${path}`);
+}
+
 function readPid(pidfile: string): number {
   return Number(readFileSync(pidfile, "utf8").split("\n")[0]);
 }
@@ -102,19 +121,32 @@ test("silent: no response frame within the deadline → profile_unresolved, chil
   try {
     const pidfile = join(dir, "stub.pid");
     const started = Date.now();
+    // DEBT-004: the deadline must sit ABOVE a stub's boot time, because the
+    // child is only observable (and only reapable) once it has executed its
+    // first line. A boot measures 231-284 ms on an idle box and the old
+    // 300 ms deadline therefore killed the child DURING boot under load —
+    // no pidfile, nothing to reap, and the failure looked like a product
+    // bug. 2 s keeps an order of magnitude of headroom while the assertion
+    // still proves the timeout path (no frame was ever received).
+    const deadlineMs = 2000;
     const result = await withBound(
       t.signal,
       BOUND_MS,
       probeCatalog(IDENTITY, {
         piBin: "node",
         args: [STUB, "silent", pidfile],
-        timeoutMs: 300,
+        timeoutMs: deadlineMs,
       }),
     );
     const elapsed = Date.now() - started;
     unresolved(result);
-    assert.match(result.reason, /no response frame within 300 ms/);
-    assert.ok(elapsed < 5000, `timeout path must not stall, took ${elapsed} ms`);
+    assert.match(result.reason, new RegExp(`no response frame within ${deadlineMs} ms`));
+    assert.ok(elapsed < 8000, `timeout path must not stall, took ${elapsed} ms`);
+    // the stub writes its pidfile at BOOT — under full-suite load that boot
+    // can outlast the probe's own 300 ms deadline, so the file may not exist
+    // yet when the probe returns (DEBT-004). Poll for it, bounded; the
+    // reaping assertion itself is unchanged.
+    await waitForFile(pidfile);
     await assertReaped(readPid(pidfile));
   } finally {
     rmSync(dir, { recursive: true, force: true });

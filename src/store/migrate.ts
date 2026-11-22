@@ -8,6 +8,25 @@ export const MIGRATIONS_DIR = join(import.meta.dirname, "migrations");
 export class BootRefusedError extends Error {}
 
 /**
+ * The migration root is INJECTABLE (default: the shipped directory).
+ *
+ * Why the seam exists (DEBT-004's actual root cause): `migrate()` reads
+ * `MIGRATIONS_DIR`, which lives inside the repository. A test that proved
+ * the block-on-contract-mismatch rule by writing a temporary
+ * `0002_sneaky.sql` INTO that directory raced every other test file's
+ * daemon boot — those boots legitimately refused with "unapplied migration
+ * exists" while the file was present, so a whole concurrent suite copy
+ * failed while each test passed in isolation. The fix is not a longer wait:
+ * it is to let a caller point `migrate` at a COPY of the migrations, so no
+ * test ever mutates state that another test reads. Production passes
+ * nothing and behaves exactly as before.
+ */
+export type MigrateOptions = {
+  /** Directory holding the `*.sql` migration files (default MIGRATIONS_DIR). */
+  migrationsDir?: string | undefined;
+};
+
+/**
  * Plain SQL files applied in filename order, one row per file
  * (novaflow-v1/data, SCHEMA MIGRATIONS section).
  *
@@ -19,8 +38,9 @@ export class BootRefusedError extends Error {}
  * the store refuses to boot — the block-on-contract-mismatch rule.
  * Returns the number of migrations applied.
  */
-export function migrate(db: Db): number {
-  const files = readdirSync(MIGRATIONS_DIR)
+export function migrate(db: Db, opts: MigrateOptions = {}): number {
+  const migrationsDir = opts.migrationsDir ?? MIGRATIONS_DIR;
+  const files = readdirSync(migrationsDir)
     .filter((f) => f.endsWith(".sql"))
     .sort();
 
@@ -39,7 +59,7 @@ export function migrate(db: Db): number {
       ).map((r) => [r.filename, r.sha256]),
     );
     for (const filename of files) {
-      const sha256 = sha256Of(join(MIGRATIONS_DIR, filename));
+      const sha256 = sha256Of(join(migrationsDir, filename));
       const recorded = applied.get(filename);
       if (recorded === undefined) {
         throw new BootRefusedError(
@@ -57,11 +77,11 @@ export function migrate(db: Db): number {
 
   // First boot: apply everything in filename order.
   for (const filename of files) {
-    const sql = readFileSync(join(MIGRATIONS_DIR, filename), "utf8");
+    const sql = readFileSync(join(migrationsDir, filename), "utf8");
     db.exec(sql);
     db.prepare(
       "INSERT INTO schema_migrations (filename, sha256) VALUES (?, ?)",
-    ).run(filename, sha256Of(join(MIGRATIONS_DIR, filename)));
+    ).run(filename, sha256Of(join(migrationsDir, filename)));
   }
   return files.length;
 }

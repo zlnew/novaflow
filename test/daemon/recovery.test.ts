@@ -70,8 +70,16 @@ type Seed = {
   pricesDir: string;
 };
 
+/**
+ * The temp-root prefix carries THIS process's token: the leak assertion below
+ * compares the suite's own footprint, and a bare `novaflow-rec` prefix made
+ * two concurrent suite copies see each other's live directories (the same
+ * shared-namespace interference DEBT-004 was: not timing inside the subject).
+ */
+const TMP_TOKEN = `novaflow-rec-${process.pid}-`;
+
 function seed(): Seed {
-  const wsRoot = mkdtempSync(join(tmpdir(), "novaflow-rec-"));
+  const wsRoot = mkdtempSync(join(tmpdir(), TMP_TOKEN));
   mkdirSync(join(wsRoot, "prompts"), { recursive: true });
   writeFileSync(join(wsRoot, "prompts", "dev_system.md"), "You are a worker agent.\n");
 
@@ -102,7 +110,7 @@ function seed(): Seed {
   // queued→running move belongs to whichever path owns the spawn
   applyTransition(db, task.id, ENQUEUE_TRIGGER, { triggerType: "engine", actor: "test" });
 
-  const dir = mkdtempSync(join(tmpdir(), "novaflow-recp-"));
+  const dir = mkdtempSync(join(tmpdir(), TMP_TOKEN));
   const pricesPath = join(dir, "prices.json");
   writeFileSync(pricesPath, JSON.stringify(PRICES));
   return { db, wsRoot, taskId: task.id, pricesPath, pricesDir: dir };
@@ -157,9 +165,9 @@ function cleanup(s: Seed): void {
   rmSync(s.pricesDir, { recursive: true, force: true });
 }
 
-/** The suite's temp-dir footprint (both rec- and recp- prefixed roots). */
+/** This suite's own temp-dir footprint (token-scoped, see TMP_TOKEN). */
 function recTempDirs(): string[] {
-  return readdirSync(tmpdir()).filter((d) => d.startsWith("novaflow-rec"));
+  return readdirSync(tmpdir()).filter((d) => d.startsWith(TMP_TOKEN));
 }
 const recTempDirsBefore = recTempDirs();
 
@@ -383,6 +391,6 @@ test("recovery is idempotent: a second pass finds no orphans", () => {
 
 test("suite cleanup: zero temp dirs leaked (before/after delta 0)", () => {
   // every seed() in this suite cleans its wsRoot AND its prices dir —
-  // the leak this pins was ~6 novaflow-recp- dirs per run
+  // the leak this pins was ~6 workspace+prices roots per run
   assert.deepEqual(recTempDirs().filter((d) => !recTempDirsBefore.includes(d)), []);
 });
