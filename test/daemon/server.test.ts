@@ -905,6 +905,16 @@ test("write discipline: the daemon modules never issue a raw state UPDATE (grep-
     "src/chain/routing.ts",
     "src/chain/summary.ts",
     "src/daemonconfig.ts",
+    // p5: the MCP control surface is a read-only client of the socket and
+    // (with the daemon down) a read-only client of the store. It must join
+    // this pin as a PURE module: no tasks write, no state-column write.
+    "src/mcp/catalog.ts",
+    "src/mcp/server.ts",
+    "src/mcp/read.ts",
+    "src/mcp/errors.ts",
+    "src/mcp/version.ts",
+    "src/daemon/readops.ts",
+    "src/store/readonly.ts",
   ];
   for (const f of files) {
     const src = readFileSync(join(import.meta.dirname, "..", "..", f), "utf8");
