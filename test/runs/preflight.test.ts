@@ -149,6 +149,52 @@ function bound<T>(p: Promise<T>): Promise<T> {
 
 /* ------------------------------------- AC1 ------------------------------------- */
 
+test("AC1 (DEBT-003): a full run-dir filesystem → preflight failure naming disk availability, zero spawns", async () => {
+  const s = seed();
+  try {
+    // the injection seam IS the honest proof here: this box cannot mount a
+    // size-limited tmpfs without privileges, so the probe's reader reports a
+    // full filesystem. Deleting the probe leaves this test failing (no
+    // refusal would ever be produced) — see test/runs/disk.test.ts for the
+    // real-syscall half of the same guard.
+    const outcome = await bound(
+      run(s, { diskProbe: { statfs: () => ({ bsize: 4096, blocks: 100, bfree: 0, bavail: 0, files: 1, ffree: 0 }) } }),
+    );
+    assert.equal(outcome.finalState, "failed");
+    const row = runRow(s);
+    assert.equal(row.preflight_status, "failed");
+    assert.equal(row.pid, null);
+    assert.match(row.error_summary ?? "", /preflight failure/);
+    assert.match(row.error_summary ?? "", /disk availability/);
+    assert.match(row.error_summary ?? "", /FR-TSK-10/);
+    assert.match(row.error_summary ?? "", /1\.0 GiB required/);
+    // AC5: zero tokens, zero spawns
+    assert.equal(row.input_tokens, 0);
+    assert.equal(row.output_tokens, 0);
+    assert.equal(existsSync(s.pidfile), false);
+  } finally {
+    cleanup(s);
+  }
+});
+
+test("PRESERVE: a healthy filesystem passes the disk probe and the run proceeds (the probe never blocks a runnable task)", async () => {
+  const s = seed();
+  try {
+    const outcome = await bound(
+      run(s, { diskProbe: { statfs: () => ({ bsize: 4096, blocks: 1_000_000, bfree: 900_000, bavail: 900_000 }) } }),
+    );
+    // a settled run lands in validating (engine verification is the daemon's
+    // settle-seam duty) — what matters here is that preflight PASSED and the
+    // child really ran
+    assert.equal(outcome.finalState, "validating");
+    const row = runRow(s);
+    assert.equal(row.preflight_status, "passed");
+    assert.equal(existsSync(s.pidfile), true, "the child really spawned");
+  } finally {
+    cleanup(s);
+  }
+});
+
 test("AC1: a scoped target whose root is missing → preflight failure naming alias+path, zero spawns", async () => {
   const s = seed();
   addTarget(s, { alias: "app", type: "directory", root: join(s.wsRoot, "gone") });

@@ -19,9 +19,11 @@ import { createPump } from "./pump.ts";
 import { redactText } from "./redact.ts";
 import {
   checkBudgetCeiling,
+  checkDiskAvailability,
   checkPiBinary,
   checkRequiredEnvVars,
   checkTargetScopes,
+  type DiskProbeOptions,
   type GlobalBudgets,
 } from "./preflight.ts";
 import {
@@ -94,6 +96,13 @@ export type RunOptions = {
    * when the task's workspace defines none (documented precedence).
    */
   globalBudgets?: GlobalBudgets | undefined;
+  /**
+   * DEBT-003: the FR-TSK-10 AC1 disk-availability probe's injection seam.
+   * The DEFAULT is the real `fs.statfsSync` on the run directory's
+   * filesystem with the 1 GiB floor; tests inject a filesystem shape (a
+   * full disk) to prove the refusal spends zero tokens.
+   */
+  diskProbe?: DiskProbeOptions | undefined;
 };
 
 export type TaskRunRecord = {
@@ -401,6 +410,14 @@ export async function startRun(
     // all local, all before any spawn (AC5 holds for every failure) ----
     if (preflightError === null) {
       preflightError = checkTargetScopes(db, taskId); // AC1 roots + AC2 git
+    }
+    if (preflightError === null) {
+      // AC1 disk availability (DEBT-003): the RUN DIRECTORY's filesystem is
+      // where the log streams, session log, and result.json land
+      preflightError = checkDiskAvailability(join(task.workspace_root, ".novaflow", "runs"), {
+        ...(opts.diskProbe?.statfs !== undefined ? { statfs: opts.diskProbe.statfs } : {}),
+        ...(opts.diskProbe?.floorBytes !== undefined ? { floorBytes: opts.diskProbe.floorBytes } : {}),
+      });
     }
     if (preflightError === null) {
       preflightError = checkPiBinary(opts.piBin ?? "pi"); // AC3 tool dep
