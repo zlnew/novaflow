@@ -58,7 +58,7 @@ export type PruneReport = {
 
 const RAW_NAME = "events.raw.jsonl";
 
-type RunDirRow = { run_dir: string; task_id: string; run_id: string };
+type RunDirRow = { run_dir: string; real_dir: string; task_id: string; run_id: string };
 
 /**
  * Every run directory the store can prove exists: the recorded
@@ -119,7 +119,7 @@ function runDirs(db: Db): { dirs: RunDirRow[]; rejected: SkippedFile[] } {
       });
       continue;
     }
-    dirs.push({ run_dir: dir, task_id: row.task_id, run_id: row.run_id });
+    dirs.push({ run_dir: dir, real_dir: realDir, task_id: row.task_id, run_id: row.run_id });
   }
   return { dirs, rejected };
 }
@@ -193,6 +193,29 @@ export function pruneRawEventStreams(
           path: candidate,
           age_days: null,
           reason: "refused by the path allowlist (not exactly <run_dir>/events.raw.jsonl)",
+        });
+        continue;
+      }
+      // the TOCTOU residual of the static escape (re-judge suggestion 2):
+      // a local writer could swap the run dir to an out-of-tree symlink
+      // between the up-front realpath validation and this unlink — recheck
+      // the realpath AT the delete and refuse on any drift
+      let preDeleteReal: string;
+      try {
+        preDeleteReal = realpathSync(entry.run_dir);
+        if (!entry.real_dir || preDeleteReal !== entry.real_dir) {
+          skipped.push({
+            path: candidate,
+            age_days: null,
+            reason: "run dir realpath drifted between validation and deletion — refusing",
+          });
+          continue;
+        }
+      } catch {
+        skipped.push({
+          path: candidate,
+          age_days: null,
+          reason: "run dir vanished before deletion — refusing",
         });
         continue;
       }

@@ -327,6 +327,7 @@ test("nova_daemon_prune containment: a run row OUTSIDE the runs tree is refused,
     assert.equal(existsSync(victim), true, "the outside file survives");
   } finally {
     await shutdown(env);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -372,6 +373,7 @@ test("nova_daemon_prune containment: a SYMLINKED run dir cannot steer the delete
     // pre-fix, this exact probe deleted the victim (judge B live-proven)
   } finally {
     await shutdown(env);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
