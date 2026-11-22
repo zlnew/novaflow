@@ -20,6 +20,7 @@ import { START_TRIGGER } from "../../src/runs/triggers.ts";
 import { startDaemon, type DaemonHandle } from "../../src/daemon/lifecycle.ts";
 import { TestClient, waitFor } from "./client.ts";
 import { seedFileStore, readConnection, MODEL } from "./seed.ts";
+import { version } from "../../src/mcp/version.ts";
 
 /**
  * The v1 wire contract over the real socket: JSONL envelope, the srs
@@ -142,7 +143,9 @@ test("wire contract: JSONL envelope, id echo, taxonomy errors, 0600 socket", asy
     assert.equal(ok["id"], "req-42");
     assert.equal(ok["ok"], true);
     const data = ok["data"] as Record<string, unknown>;
-    assert.equal(data["version"], "0.1.0");
+    // the handshake reports the LIVE package version — a release bump must
+    // not need this test edited (bumped to 0.1.1 and the literal broke)
+    assert.equal(data["version"], version());
     assert.equal((data["scheduler"] as Record<string, unknown>)["paused"], false);
 
     // non-JSON line → id null + schema_invalid
