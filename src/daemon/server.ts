@@ -426,12 +426,18 @@ function resolveProfileByName(db: Db, projectId: string, name: string): string {
     .get(projectId) as { workspace_id: string } | undefined;
   if (!project) throw new OpError("not_found", `no such project: ${projectId}`);
   const row = db
+    // workspace-scoped FIRST (NULLS-last on the workspace column): a stale
+    // global row must never shadow the workspace's own profile — found in
+    // real use when a trial-era global "worker" (with a prompt path that no
+    // longer resolved) silently beat the workspace fleet on rowid order
     .prepare(
-      "SELECT id FROM agent_profiles WHERE name = ? AND (workspace_id IS NULL OR workspace_id = ?)",
+      "SELECT id FROM agent_profiles WHERE name = ? AND (workspace_id IS NULL OR workspace_id = ?) ORDER BY workspace_id IS NULL LIMIT 1",
     )
     .get(name, project.workspace_id) as { id: string } | undefined;
   if (!row) {
     throw new OpError("not_found", `no profile named "${name}" in the project's workspace`);
+  }
+  if (process.env["NF_DEBUG_PROFILE"] === "1") {
   }
   return row.id;
 }
