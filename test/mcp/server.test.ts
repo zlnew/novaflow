@@ -509,6 +509,105 @@ test("kill surface parity: nova_task_abort and nova_kill_all kill the same proce
   }
 });
 
+test("nova_task_abort over MCP group-kills a forked grandchild (judge B finding 1)", async () => {
+  // run-fork-grandchild's fork takes SIGTERM only if the kill reaches the
+  // whole process GROUP; a degraded bare-pid kill leaves it alive and
+  // unmarked. This case makes the MCP parity test discriminate on the
+  // group-kill itself, not just the leader — the engine-level discipline
+  // is pinned in test/runs/run-loop.test.ts; this pins that the MCP op
+  // reaches the same path. runArgs are fixed per daemon, hence a dedicated
+  // harness with the grandchild fixture.
+  const dir = tmp("novaflow-mcp-killgc-");
+  const seeded = seedFileStore(dir);
+  const pidfile = join(dir, "stub.pid");
+  const sockPath = join(dir, "d.sock");
+  const STUB = join(import.meta.dirname, "..", "fixtures", "pi-stub.ts");
+  let handle: DaemonHandle | undefined;
+  let h: Harness | undefined;
+  try {
+    handle = await startDaemon({
+      dbPath: seeded.dbPath,
+      socketPath: sockPath,
+      probePiBin: "node",
+      probeArgs: [STUB, "ok"],
+      probeTimeoutMs: 3000,
+      runPiBin: "node",
+      // the run forks a sleeping grandchild in the stub's process group
+      runArgs: [STUB, "run-fork-grandchild", pidfile],
+      extensionPath: "/ext/novaflow.ts",
+      pricesPath: join(dir, "no-prices.json"),
+      killGraceMs: 300,
+      tickMs: 30,
+    });
+    h = await harness({ socketPath: sockPath, dbPath: seeded.dbPath });
+    const mcp = h;
+
+    const stateOf = (taskId: string): string => {
+      const db = new Database(seeded.dbPath, { readonly: true });
+      try {
+        return (db.prepare("SELECT state FROM tasks WHERE id = ?").get(taskId) as { state: string })
+          .state;
+      } finally {
+        db.close();
+      }
+    };
+
+    const createRes = (await mcp.client.callTool({
+      name: "nova_task_create",
+      arguments: {
+        project_id: seeded.projectId,
+        key: "ABORT-GC",
+        title: "ABORT-GC",
+        objective: "objective for ABORT-GC",
+        profile_name: "dev",
+      },
+    })) as ToolResult;
+    assert.equal(createRes.isError, undefined, JSON.stringify(createRes));
+    const taskId = String((createRes.structuredContent?.["task"] as Record<string, unknown>)["id"]);
+    const runRes = (await mcp.client.callTool({ name: "nova_task_run", arguments: { task_id: taskId } })) as ToolResult;
+    assert.equal(runRes.isError, undefined, JSON.stringify(runRes));
+
+    await waitFor(() => stateOf(taskId) === "running", 15_000);
+    await waitFor(
+      // GRANDCHILD-READY, not just the pid line: the pid is written at
+      // spawn(), the SIGTERM handler only exists after node boots
+      () => existsSync(pidfile) && readFileSync(pidfile, "utf8").match(/GRANDCHILD-READY/),
+      15_000,
+    );
+
+    const abortRes = (await mcp.client.callTool({
+      name: "nova_task_abort",
+      arguments: { task_id: taskId },
+    })) as ToolResult;
+    assert.equal(abortRes.isError, undefined, JSON.stringify(abortRes));
+    await waitFor(() => stateOf(taskId) === "cancelled", 15_000);
+
+    const gcPidfile = readFileSync(pidfile, "utf8");
+    assert.match(
+      gcPidfile, /GRANDCHILD-SIGTERM/,
+      "the abort's SIGTERM reached the forked grandchild — group kill, not bare-pid",
+    );
+    const gcMatch = gcPidfile.match(/GRANDCHILD (\d+)/);
+    assert.ok(gcMatch, gcPidfile);
+    await waitFor(() => {
+      try {
+        process.kill(Number(gcMatch![1]), 0);
+        return false;
+      } catch {
+        return true;
+      }
+    }, 10_000);
+  } finally {
+    try {
+      await h?.close();
+    } catch {
+      /* bounded */
+    }
+    await handle?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 /* --------------------- read-only service from SQLite --------------------- */
 
 test("read-only tools serve from SQLite when the socket is down (mcp.md §4)", async () => {
@@ -655,6 +754,31 @@ test("a read-only tool with no store file answers not_found, never invents a sto
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.["code"], "not_found");
     assert.equal(existsSync(dbPath), false, "a read must never create the store");
+  } finally {
+    await h.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a CORRUPT store answers the catch-all code, never crashes (judge B finding 3)", async () => {
+  // better-sqlite3 opens a corrupt file lazily — the throw surfaces at
+  // first query and falls into errors.ts classify's catch-all, the SAME
+  // rule the daemon's toErrorPayload applies (mcp.md §4: MCP adds no
+  // second error model). Pinned deliberately: an orchestrator branching
+  // on codes sees {code: "aborted", message: "file is not a database"}
+  // for a broken installation — no crash, no hang, no side files.
+  const dir = tmp("novaflow-mcp-corrupt-");
+  const dbPath = join(dir, "state.db");
+  writeFileSync(dbPath, "this is not a sqlite database at all\n");
+  const h = await harness({ socketPath: join(dir, "absent.sock"), dbPath });
+  try {
+    const res = (await h.client.callTool({ name: "nova_workspace_list", arguments: {} })) as ToolResult;
+    assert.equal(res.isError, true);
+    assert.equal(res.structuredContent?.["code"], "aborted", "the documented catch-all, mirroring the daemon taxonomy");
+    assert.match(String(res.structuredContent?.["message"]), /file is not a database/);
+    // the server survives and keeps serving
+    const again = (await h.client.callTool({ name: "nova_workspace_list", arguments: {} })) as ToolResult;
+    assert.equal(again.isError, true);
   } finally {
     await h.close();
     rmSync(dir, { recursive: true, force: true });

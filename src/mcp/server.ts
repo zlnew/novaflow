@@ -10,7 +10,7 @@ import type Database from "better-sqlite3";
 import { MCP_TOOLS, toOpArgs, toolByName, type McpTool } from "./catalog.ts";
 import { serveReadOnly } from "./read.ts";
 import { presentError } from "./errors.ts";
-import { OpError, reqString, type TaxonomyCode } from "../opcodes.ts";
+import { OpError, type TaxonomyCode } from "../opcodes.ts";
 import { DaemonUnreachableError, OpFailureError, daemonRequest, defaultDbPath, socketPath } from "../cli/client.ts";
 import { openReadOnlyDb, storeExists } from "../store/readonly.ts";
 import { version as packageVersion } from "./version.ts";
@@ -137,8 +137,11 @@ async function invoke(
       } catch (err) {
         if (!(err instanceof OpError) || err.code !== "daemon_unreachable") throw err;
         if (NO_STORE_ANSWER.has(tool.name)) throw err;
-        // mcp.md §4: read-only tools serve from the SQLite store directly
-        data = withStore(opts.dbPath, (db) => serveReadOnly(tool.name, db, args));
+        // mcp.md §4: read-only tools serve from the SQLite store directly.
+        // opArgs, not raw args: a future read-tool rename (like the existing
+        // path→root_path one) must apply identically on both read paths
+        // (judge A finding 1).
+        data = withStore(opts.dbPath, (db) => serveReadOnly(tool.name, db, opArgs));
       }
     } else {
       data = await callDaemon(opts, tool.op, opArgs);
