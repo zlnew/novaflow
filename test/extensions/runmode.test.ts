@@ -574,6 +574,20 @@ test("checkBashWriteScope: operator family, dd of=, -t destinations and ln sourc
 
     // cd moves the resolution base for every later segment
     blocked("cd ../../outside && echo x > feature.ts", /no target scope/, join(base, "alpha", "src"), "the bypass probe");
+    // re-judge r2: the cd-tracking fixes' own bypass classes
+    blocked("\\cd ../../beta && echo x > pwn.ts", /read_only|no target scope/, join(base, "alpha", "src"), "backslash-cd is plain cd to bash");
+    blocked("command cd ../../beta && echo x > pwn.ts", /read_only|no target scope/, join(base, "alpha", "src"), "command cd moves the shell");
+    blocked("env cd ../../beta && echo x > pwn.ts", /read_only|no target scope/, join(base, "alpha", "src"), "an unrecognized head with a cd word fails closed");
+    blocked(
+      `(cd ${join(base, "alpha", "src")} && true); echo x > feature.ts`,
+      /no target scope/, join(base, "alpha", "src"),
+      "a subshell cd must not re-anchor later segments (both directions fail closed)",
+    );
+    blocked(
+      `ln -s -t ${join(base, "alpha", "src")} ${join(base, "outside", "evil.txt")}`,
+      /links .* into a governed target|no target scope/, join(base, "alpha", "src"),
+      "ln with -t still exposes its SOURCES to the link scan (r2 finding 1)",
+    );
     blocked("cd - && echo x > f", /no target scope/, join(base, "alpha", "src"), "cd - fails closed");
     blocked("cd no-such-dir && echo x > f", /no target scope/, join(base, "alpha", "src"), "a nonexistent cd fails closed");
     blocked("cd && echo x > f", /no target scope/, join(base, "alpha", "src"), "cd with no argument fails closed");
@@ -947,10 +961,15 @@ test("run mode: the acceptance latch — resubmit and post-acceptance mutations 
     assert.equal((write.result as { block?: boolean }).block, true);
     assert.match((write.result as { reason: string }).reason, /already accepted/);
 
-    // post-acceptance bash mutation too
+    // post-acceptance bash: MUTATING bash blocks under the latch
     const bash = await fireToolCall(pi.handlers, "bash", { command: "echo x > alpha/src/late.txt" }, base);
     assert.equal((bash.result as { block?: boolean }).block, true);
     assert.match((bash.result as { reason: string }).reason, /already accepted/);
+
+    // post-acceptance ZERO-WRITE bash stays open (re-judge r2 finding 4:
+    // the latch is scoped, not wholesale — grep-before-done is honest work)
+    const benignBash = await fireToolCall(pi.handlers, "bash", { command: "grep -rn todo alpha/src" }, base);
+    assert.equal(benignBash.result, undefined, "a zero-write bash call after acceptance passes the scope check");
 
     // reads stay open
     const read = await fireToolCall(pi.handlers, "read", { path: join(base, "beta", "data", "notes.txt") }, base);

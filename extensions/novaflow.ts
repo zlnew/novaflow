@@ -694,6 +694,13 @@ function scanBashWriteTargets(command: string, baseCwd: string): ScannedTarget[]
   // pipe split — rewrite them to their append spellings first (the scan
   // only cares WHERE they write, not with what clobber semantics)
   const presplit = command.replace(/(\d?)>\|/g, " $1>> ");
+  // re-judge r2 finding 2: the splitter is paren-blind, so a subshell
+  // `(cd x && true); ...` would leak its cd into later segments — one
+  // direction a masking bypass, the other a spurious block. Any paren
+  // anywhere untracks the whole command: every write resolves unmapped
+  // and blocks, subshell writes included. Conservative and honest.
+  const parenCommand = command.includes("(") || command.includes(")");
+  if (parenCommand) untracked = true;
   for (const segment of presplit.split(/&&|\|\||;|\|/)) {
     // normalize redirection operators into their own whitespace tokens
     const normalized = segment.replace(/(\d?>+)/g, " $1 ").replace(/(&>)/g, " $1 ");
@@ -712,12 +719,28 @@ function scanBashWriteTargets(command: string, baseCwd: string): ScannedTarget[]
     while (first < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[first]!)) first++;
     const head = tokens[first];
     if (head === undefined) continue;
-    const name = (head.includes("/") ? head.slice(head.lastIndexOf("/") + 1) : head).replace(/^\(+/, "");
+    const name = (head.includes("/") ? head.slice(head.lastIndexOf("/") + 1) : head)
+      .replace(/^\(+/, "")
+      .replace(/^\\+/, ""); // `\cd` is plain cd to bash (re-judge r2 finding 3)
     const rest = tokens.slice(first + 1);
 
-    // `cd` moves the resolution base for every later segment
-    if (name === "cd") {
-      const op = rest.find((t) => t !== "-" && !t.startsWith("-"));
+    // `command cd` / `builtin cd` move the shell exactly like cd
+    let cdLike = name === "cd";
+    let cdRest = rest;
+    if ((name === "command" || name === "builtin") && rest[0] === "cd") {
+      cdLike = true;
+      cdRest = rest.slice(1);
+    }
+
+    // `cd` moves the resolution base for every later segment — but
+    // NEVER adopt one inside a paren command (the splitter cannot tell a
+    // subshell cd from a top-level one; untracked stays true)
+    if (cdLike && parenCommand) {
+      untracked = true;
+      continue;
+    }
+    if (cdLike) {
+      const op = cdRest.find((t) => t !== "-" && !t.startsWith("-"));
       if (op === undefined) {
         untracked = true; // `cd` with no argument: untrackable, fail closed
         continue;
@@ -728,6 +751,9 @@ function scanBashWriteTargets(command: string, baseCwd: string): ScannedTarget[]
         untracked = false;
       } else {
         untracked = true; // a path bash itself would refuse — never guess
+        // over-block, documented: after an unresolvable cd a later
+        // RELATIVE cd can never recover (its base is the unmapped
+        // sentinel) — real bash would recover; we keep failing closed.
       }
       continue;
     }
@@ -774,7 +800,13 @@ function scanBashWriteTargets(command: string, baseCwd: string): ScannedTarget[]
         }
         if (targetDir !== undefined) {
           push(targetDir);
-          for (const s of operands) push(join(targetDir, basename(s)));
+          for (const s of operands) {
+            push(join(targetDir, basename(s)));
+            // re-judge r2 finding 1: with -t the SOURCES still feed the
+            // create-then-write window — `ln -s -t DIR OUT-OF-SCOPE-SRC`
+            // must not pass just because the destination parsing changed
+            if (name === "ln") push(s, true);
+          }
         } else if (name === "ln") {
           if (operands.length >= 2) {
             push(operands[operands.length - 1]!);
@@ -797,6 +829,11 @@ function scanBashWriteTargets(command: string, baseCwd: string): ScannedTarget[]
         }
         break;
       default:
+        // re-judge r2 finding 3: an unrecognized head whose segment
+        // contains a standalone `cd` word (env cd, exec cd, future
+        // spellings) — we cannot know whether bash moves the shell, so
+        // fail closed for the rest of the command
+        if (tokens.some((t) => t === "cd")) untracked = true;
         break;
     }
   }
@@ -1539,8 +1576,19 @@ function registerRunMode(pi: ExtensionAPI, contextPath: string): void {
     }
 
     // the acceptance latch: after result.json is written the run is
-    // complete — mutating calls are refused, reads stay open
+    // complete — mutating calls are refused, reads stay open. bash is
+    // SCOPED, not wholesale (re-judge r2 finding 4): a zero-write bash
+    // call after acceptance still passes the write-scope check.
     if (state.accepted && MUTATING_TOOLS.has(event.toolName)) {
+      if ((event.toolName === "bash" || event.toolName === "powershell") && run !== null && run.loadError === null) {
+        const raw = (event.input as { command?: unknown })["command"];
+        // ZERO-WRITE, not merely in-scope: an in-scope write after
+        // acceptance still violates the latch — only a bash call whose
+        // scan finds NO write targets at all stays open
+        if (typeof raw === "string" && bashWriteTargets(raw).length === 0) {
+          return undefined; // zero-write bash stays open post-acceptance
+        }
+      }
       return {
         block: true,
         reason: "artifact already accepted for this run — no further mutating tool calls are permitted",
