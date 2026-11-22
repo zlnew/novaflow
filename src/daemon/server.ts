@@ -57,6 +57,7 @@ import {
   DEFAULT_RETENTION_DAYS,
 } from "./maintenance.ts";
 import { BackupRefusedError } from "../store/backup.ts";
+import { DocReferenceError, indexDocs, resolveDocReferences } from "../docs.ts";
 import {
   importChain,
   getChainRun,
@@ -681,6 +682,41 @@ export function buildOpTable(): Map<string, OpHandler> {
 
   ops.set("nova_workspace_list", (_args, { deps }) => readWorkspaceList(deps.db));
 
+  /**
+   * FR-WS-04 AC2 — the selectable prompt-injection list: every `.md`/`.txt`/
+   * `.rst` document under `<workspace_root>/docs/`, computed by a SCAN at
+   * call time (src/docs.ts: no watcher, no daemon state, nothing to go
+   * stale). The workspace resolves from an id/slug arg; absent, the single
+   * registered workspace is implied, and an ambiguous registry refuses
+   * rather than picking one silently. A missing docs directory is an honest
+   * empty list (FR-WS-02 creates `docs/` at registration, but an operator
+   * may have removed it).
+   */
+  ops.set("nova_docs_list", (args, { deps }) => {
+    const workspace =
+      args["workspace_id"] === undefined && args["slug"] === undefined
+        ? (() => {
+            const rows = deps.db.prepare("SELECT * FROM workspaces ORDER BY created_at, id").all() as WorkspaceRow[];
+            if (rows.length === 0) {
+              throw new OpError("not_found", "no workspace is registered — register one first (nova workspace create)");
+            }
+            if (rows.length > 1) {
+              throw new OpError(
+                "schema_invalid",
+                `${rows.length} workspaces are registered — name one (nova docs list <workspace>)`,
+              );
+            }
+            return rows[0]!;
+          })()
+        : requireWorkspaceArg(deps.db, args);
+    return {
+      workspace: workspace.slug,
+      workspace_id: workspace.id,
+      docs_dir: join(workspace.root_path, "docs"),
+      docs: indexDocs(workspace.root_path),
+    };
+  });
+
   // FR-WS-03 AC2: archive disables execution (dispatch skips non-active
   // workspaces). Idempotent by design: archiving an archived workspace
   // is a no-op success (documented). NO switch op exists — the active
@@ -854,6 +890,33 @@ export function buildOpTable(): Map<string, OpHandler> {
     const profileId = resolveProfileByName(deps.db, projectId, reqString(args, "profile_name"));
     const requiresGate = optBoolean(args, "requires_human_gate");
     const contextFiles = optStringArray(args, "context_files");
+    /**
+     * FR-WS-04 AC2: `doc_references` (the CLI's `--context docs/<name>`
+     * inputs) resolve against the workspace docs index and land in the SAME
+     * `tasks.context_files_json` array the run loop feeds composePrompt —
+     * one injection path, never a second. An unresolvable reference throws
+     * DocReferenceError (mapped to schema_invalid), so nothing is created.
+     */
+    const docReferences = optStringArray(args, "doc_references");
+    const mergedContextFiles = (() => {
+      if (docReferences === undefined) return contextFiles;
+      const workspaceRoot = deps.db
+        .prepare(
+          `SELECT w.root_path AS root_path
+             FROM projects p JOIN workspaces w ON w.id = p.workspace_id
+            WHERE p.id = ?`,
+        )
+        .get(projectId) as { root_path: string } | undefined;
+      if (workspaceRoot === undefined) {
+        throw new OpError("not_found", `no such project: ${projectId}`);
+      }
+      const resolved = resolveDocReferences(workspaceRoot.root_path, docReferences);
+      const merged = [...resolved.contextFiles];
+      for (const extra of contextFiles ?? []) {
+        if (!merged.includes(extra)) merged.push(extra);
+      }
+      return merged;
+    })();
     // mcp.md §3.2 optional payload parts (previously dropped silently):
     // validate the shapes here, persist via the create service
     const overrides = parseOverridesArg(args);
@@ -867,7 +930,7 @@ export function buildOpTable(): Map<string, OpHandler> {
         objective,
         profileId,
         ...(requiresGate !== undefined ? { requiresHumanGate: requiresGate } : {}),
-        ...(contextFiles !== undefined ? { contextFiles } : {}),
+        ...(mergedContextFiles !== undefined ? { contextFiles: mergedContextFiles } : {}),
         ...(overrides !== undefined ? { overrides } : {}),
         ...(outputSchemaVersion !== undefined ? { outputSchemaVersion } : {}),
         ...(targetScopes !== undefined ? { targetScopes } : {}),
@@ -1597,6 +1660,11 @@ export function toErrorPayload(err: unknown): { code: TaxonomyCode; message: str
     return { code: "profile_unresolved", message: err.message };
   }
   if (err instanceof ProfileValidationError) {
+    return { code: "schema_invalid", message: err.message };
+  }
+  if (err instanceof DocReferenceError) {
+    // FR-WS-04: an unresolvable doc reference is a payload violation — the
+    // caller named a document the workspace does not index
     return { code: "schema_invalid", message: err.message };
   }
   if (

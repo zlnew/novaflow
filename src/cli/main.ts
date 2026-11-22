@@ -17,6 +17,7 @@ import { scheduleCommand } from "./commands/schedule.ts";
 import { daemonCommand } from "./commands/daemon.ts";
 import { chainCommand } from "./commands/chain.ts";
 import { mcpCommand } from "./commands/mcp.ts";
+import { docsCommand } from "./commands/docs.ts";
 import type { CommandOpts } from "./opts.ts";
 
 /**
@@ -133,6 +134,8 @@ async function dispatch(argv: string[]): Promise<number> {
       return chainCommand(rest, opts);
     case "mcp":
       return mcpCommand(rest, opts);
+    case "docs":
+      return docsCommand(rest, opts);
     default:
       throw new UsageError(`unknown command "${noun}"`);
   }

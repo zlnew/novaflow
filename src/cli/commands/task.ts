@@ -90,6 +90,20 @@ async function create(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
   }
   const ctx = await workspaceContext(workspaceOverride(p, opts));
   const projectId = await resolveProjectIdent(projectIdent, ctx.id);
+  /**
+   * FR-WS-04 AC2: `--context` values that name an INDEXED DOCUMENT are
+   * resolved by the daemon against the workspace docs index and written to
+   * the same `tasks.context_files_json` the run loop injects from. The
+   * split is deliberate and narrow — a `docs/<name>.md|.txt|.rst` reference
+   * (or a bare `<name>` with one of those extensions) is a DOC REFERENCE;
+   * every other `--context` value stays the plain workspace-relative
+   * context file it has always been (FR-TSK-04). The daemon does the
+   * resolution because only it knows the workspace root.
+   */
+  const contextArgs = p.lists.get("context") ?? [];
+  const isDocReference = (v: string): boolean => /\.(md|txt|rst)$/i.test(v.replace(/^\.\//, ""));
+  const docReferences = contextArgs.filter(isDocReference);
+  const plainContextFiles = contextArgs.filter((v) => !isDocReference(v));
   const data = (await daemonRequest("nova_task_create", {
     project_id: projectId,
     key,
@@ -97,7 +111,8 @@ async function create(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
     objective,
     profile_name: profileName,
     ...(p.flags.has("gate") ? { requires_human_gate: true } : {}),
-    ...(p.lists.has("context") ? { context_files: p.lists.get("context") } : {}),
+    ...(plainContextFiles.length > 0 ? { context_files: plainContextFiles } : {}),
+    ...(docReferences.length > 0 ? { doc_references: docReferences } : {}),
   })) as { task: { id: string; key: string; state: string } };
   if (opts.json) console.log(JSON.stringify(data));
   else console.log(`created task ${data.task.key} (tsk_${data.task.id}) — ${data.task.state}`);
