@@ -981,6 +981,9 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
   ops.set("nova_task_run", async (args, { deps, surface }) => {
     const taskId = reqString(args, "task_id");
     requireActiveWorkspace(deps.db, taskId);
+    // the guarded draft→queued row (enqueueTask) carries the DEBT-010
+    // scope guard: a task with zero target_scopes refuses here with
+    // schema_invalid naming DEBT-010, and the task stays draft
     const actor = optString(args, "actor", "operator");
     const task = await enqueueTask(deps.db, taskId, actor, {
       ...(deps.enqueueOptions?.piBin !== undefined ? { piBin: deps.enqueueOptions.piBin } : {}),

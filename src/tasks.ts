@@ -3,6 +3,7 @@ import { ulid } from "./store/ids.ts";
 import { applyTransition, canTransition, InvalidTransitionError } from "./fsm/engine.ts";
 import { ROWS } from "./fsm/matrix.ts";
 import { ProfileValidationError, validateProfile } from "./profiles.ts";
+import { OpError } from "./opcodes.ts";
 import {
   probeCatalog,
   ProfileUnresolvedError,
@@ -15,6 +16,17 @@ import {
  * "profile assigned and resolvable" — the catalog probe runs before any
  * transition, and a `profile_unresolved` probe leaves the task in draft
  * with no log row.
+ *
+ * DEBT-010: the guarded draft→queued row also refuses a task that
+ * carries ZERO target_scopes (task_target_scopes rows) — fail-closed,
+ * `schema_invalid` naming DEBT-010. An unscoped run executes unconfined
+ * in the daemon process's cwd (real incident: an unscoped MCP task wrote
+ * into this engine's own source repo). The guard lives INSIDE
+ * enqueueTask — the ONE draft→queued row — so every enqueuing surface
+ * (the nova_task_run op, the chain readiness evaluator, the chain
+ * failure-routing fallback, the schedule evaluator) refuses uniformly;
+ * draft-without-scopes stays a legal parked state (chain import may
+ * create one; only the run transition is refused).
  */
 
 export type TaskRow = {
@@ -204,11 +216,13 @@ export function listTasks(db: Db, projectId?: string): TaskRow[] {
 
 /**
  * Enqueue a draft task (the 8.1 draft→queued row, trigger verbatim):
- * resolve the task's profile — the agent_profiles ROW is the stored
- * profile, validated with the same §4.2 validator — probe the catalog with
- * the row's identity, and only then applyTransition. A `profile_unresolved`
- * probe (or a row that fails §4.2 validation) throws and leaves the task
- * in draft with no log row.
+ * require at least one target_scope (DEBT-010), resolve the task's
+ * profile — the agent_profiles ROW is the stored profile, validated with
+ * the same §4.2 validator — probe the catalog with the row's identity,
+ * and only then applyTransition. A `profile_unresolved` probe (or a row
+ * that fails §4.2 validation) throws and leaves the task in draft with
+ * no log row. A scopeless task refuses the same way (fail-closed, the
+ * taxonomy's schema_invalid, the message naming DEBT-010).
  */
 export async function enqueueTask(
   db: Db,
@@ -223,6 +237,26 @@ export async function enqueueTask(
   // refuse anyway (review round finding — draft is the only legal source).
   if (!canTransition(task.state, ENQUEUE_TRIGGER)) {
     throw new InvalidTransitionError(task.state, ENQUEUE_TRIGGER);
+  }
+
+  // DEBT-010 scope guard (fail-closed): a task with zero target_scopes
+  // would run unconfined in the daemon process's cwd — the guarded
+  // draft→queued row refuses it before any profile work or probe is
+  // spent. Every enqueuing surface rides this ONE row, so every caller
+  // (nova_task_run, chain readiness, chain failure-routing fallback,
+  // the schedule evaluator) refuses the same way. The task stays draft
+  // with no log row; schema_invalid is the taxonomy's best fit (the
+  // task's persisted payload lacks a required part for this transition).
+  const scopeCount = (
+    db
+      .prepare("SELECT COUNT(*) AS n FROM task_target_scopes WHERE task_id = ?")
+      .get(taskId) as { n: number }
+  ).n;
+  if (scopeCount === 0) {
+    throw new OpError(
+      "schema_invalid",
+      `task ${taskId} carries no target_scopes — an unscoped run would execute unconfined in the daemon process's cwd (DEBT-010); the guarded draft→queued transition refuses. Add target_scopes (mcp.md §3.2) and retry.`,
+    );
   }
 
   const profileRow = db

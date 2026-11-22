@@ -46,7 +46,8 @@ import { writeProjectSummary } from "./summary.ts";
  * workspace is skipped with a logged note (the schedules evaluator's
  * FR-WS-03 discipline — never enqueue work into a workspace whose
  * execution is disabled); a refused enqueue (unresolved profile, a
- * surface moving the member mid-probe) is logged and skipped — the
+ * surface moving the member mid-probe, a member with no target_scopes —
+ * DEBT-010) is logged and skipped — the
  * evaluator never wedges and never hot-loops.
  */
 
@@ -190,7 +191,8 @@ export function createChainEvaluator(db: Db, opts: ChainEvaluatorOptions) {
             : {}),
         });
       } catch (err) {
-        // a refused enqueue (unresolved profile, a surface moving the
+        // a refused enqueue (unresolved profile, a member with no
+        // target_scopes — DEBT-010, a surface moving the
         // member mid-probe) is logged and skipped — the pass continues
         warn(`chain ${chainRunId}: propagation of member ${taskId} refused — ${(err as Error).message}`);
         continue;

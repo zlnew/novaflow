@@ -27,7 +27,7 @@ import type { CommandOpts } from "../opts.ts";
 const SPEC: ArgSpec = {
   booleanFlags: ["gate"],
   valueFlags: ["title", "objective", "profile", "project", "workspace", "run", "by", "note", "lines", "state"],
-  repeatableFlags: ["context"],
+  repeatableFlags: ["context", "scope"],
 };
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
@@ -85,9 +85,29 @@ async function create(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
   const projectIdent = p.values.get("project");
   if (key === undefined || title === undefined || objective === undefined || profileName === undefined || projectIdent === undefined) {
     throw new UsageError(
-      "nova task create <key> --title <t> --objective <o> --profile <name> --project <slug|id> [--gate] [--context <path>]...",
+      "nova task create <key> --title <t> --objective <o> --profile <name> --project <slug|id> [--gate] [--context <path>]... [--scope <repo_alias>[:read_only|read_write]]...",
     );
   }
+  /**
+   * DEBT-010: `--scope <repo_alias>[:access_mode]` (repeatable) — the
+   * guarded draft→queued row refuses a task with zero target_scopes, so
+   * the CLI's create must be able to scope the task it creates. Syntax
+   * mirrors `project create --target alias=path[:type]`; access_mode
+   * defaults to read_write.
+   */
+  const scopeArgs = p.lists.get("scope") ?? [];
+  const targetScopes = scopeArgs.map((v) => {
+    const [alias, mode] = v.split(":", 2);
+    if (alias === undefined || alias.trim() === "") {
+      throw new UsageError(`--scope #${scopeArgs.indexOf(v) + 1} must be <repo_alias>[:read_only|read_write], got "${v}"`);
+    }
+    if (mode !== undefined && mode !== "read_only" && mode !== "read_write") {
+      throw new UsageError(
+        `--scope #${scopeArgs.indexOf(v) + 1} access mode must be read_only or read_write, got "${mode}"`,
+      );
+    }
+    return { repo_alias: alias, access_mode: mode ?? "read_write" };
+  });
   const ctx = await workspaceContext(workspaceOverride(p, opts));
   const projectId = await resolveProjectIdent(projectIdent, ctx.id);
   /**
@@ -115,6 +135,7 @@ async function create(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
     ...(p.flags.has("gate") ? { requires_human_gate: true } : {}),
     ...(plainContextFiles.length > 0 ? { context_files: plainContextFiles } : {}),
     ...(docReferences.length > 0 ? { doc_references: docReferences } : {}),
+    ...(targetScopes.length > 0 ? { target_scopes: targetScopes } : {}),
   })) as { task: { id: string; key: string; state: string } };
   if (opts.json) console.log(JSON.stringify(data));
   else console.log(`created task ${data.task.key} (tsk_${data.task.id}) — ${data.task.state}`);

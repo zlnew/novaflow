@@ -301,7 +301,14 @@ test("nova_workspace_archive: status archived; dispatch SKIPS non-active workspa
       const pr = await env.client.request({
         id: `pr-${wsId}`,
         op: "nova_project_create",
-        args: { workspace_id: wsId, name: "prj", objective: "Ship it." },
+        args: {
+          workspace_id: wsId,
+          name: "prj",
+          objective: "Ship it.",
+          // a directory target every task scopes to (DEBT-010: the guarded
+          // draft→queued row refuses a task with zero target_scopes)
+          targets: [{ alias: "app", root_path: root, target_type: "directory" }],
+        },
       });
       assert.equal(pr["ok"], true, JSON.stringify(pr));
       projectIds[wsId] = (pr["data"] as { project: { id: string } }).project["id"];
@@ -312,7 +319,14 @@ test("nova_workspace_archive: status archived; dispatch SKIPS non-active workspa
       const t = await env.client.request({
         id: `t${i}`,
         op: "nova_task_create",
-        args: { project_id: projectId, key: `T${i}`, title: "t", objective: "Do the work.", profile_name: "dev" },
+        args: {
+          project_id: projectId,
+          key: `T${i}`,
+          title: "t",
+          objective: "Do the work.",
+          profile_name: "dev",
+          target_scopes: [{ repo_alias: "app", access_mode: "read_write" }],
+        },
       });
       assert.equal(t["ok"], true, JSON.stringify(t));
       taskIds.push((t["data"] as { task: { id: string } }).task["id"]);

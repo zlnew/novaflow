@@ -18,6 +18,9 @@ export type SeededStore = {
   workspaceId: string;
   projectId: string;
   profileId: string;
+  /** The seeded directory target's id — every enqueue-path task's
+   *  target_scopes reference it (DEBT-010: zero-scope tasks refuse). */
+  targetId: string;
 };
 
 export function seedFileStore(dir: string, slug = "ws"): SeededStore {
@@ -42,6 +45,15 @@ export function seedFileStore(dir: string, slug = "ws"): SeededStore {
     "INSERT INTO projects (id, workspace_id, slug, name, objective) VALUES (?, ?, 'prj', 'prj', 'o')",
   ).run(ulid(), workspaceId);
   const projectId = (db.prepare("SELECT id FROM projects WHERE workspace_id = ?").get(workspaceId) as { id: string }).id;
+  // a directory target under the seeded workspace root: task fixtures
+  // scope to it (DEBT-010 — the guarded draft→queued row refuses a task
+  // with zero target_scopes). Alias "ws-app" is deliberately distinct from
+  // the "app" some tests create for their own verification scenarios.
+  mkdirSync(join(wsRoot, "target"), { recursive: true });
+  db.prepare(
+    "INSERT INTO project_targets (id, project_id, alias, target_type, root_path) VALUES (?, ?, 'ws-app', 'directory', ?)",
+  ).run(ulid(), projectId, join(wsRoot, "target"));
+  const targetId = (db.prepare("SELECT id FROM project_targets WHERE project_id = ?").get(projectId) as { id: string }).id;
   db.prepare(
     `INSERT INTO agent_profiles
        (id, workspace_id, name, provider, model, thinking_level, system_prompt_path,
@@ -50,7 +62,7 @@ export function seedFileStore(dir: string, slug = "ws"): SeededStore {
   ).run(ulid(), workspaceId, MODEL);
   const profileId = (db.prepare("SELECT id FROM agent_profiles WHERE name = 'dev'").get() as { id: string }).id;
   db.close();
-  return { dbPath, wsRoot, workspaceId, projectId, profileId };
+  return { dbPath, wsRoot, workspaceId, projectId, profileId, targetId };
 }
 
 /** A second WAL connection onto the daemon's store (test-side reads). */

@@ -100,6 +100,9 @@ async function createTaskVia(
       title: key,
       objective: "Implement the thing end to end.",
       profile_name: "dev",
+      // the seeded workspace target's scope — DEBT-010: the guarded
+      // draft→queued row refuses a task with zero target_scopes
+      target_scopes: [{ repo_alias: "ws-app", access_mode: "read_write" }],
       ...over,
     },
   });
@@ -302,7 +305,7 @@ test("nova_task_run with an unresolvable model → profile_unresolved, zero toke
     const res = await client.request({
       id: "c",
       op: "nova_task_create",
-      args: { project_id: seeded.projectId, key: "T", title: "t", objective: "o", profile_name: "dev" },
+      args: { project_id: seeded.projectId, key: "T", title: "t", objective: "o", profile_name: "dev", target_scopes: [{ repo_alias: "ws-app", access_mode: "read_write" }] },
     });
     const taskId = (res["data"] as { task: { id: string } }).task.id;
     const runRes = await client.request({ id: "r", op: "nova_task_run", args: { task_id: taskId } });
