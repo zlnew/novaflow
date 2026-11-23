@@ -122,6 +122,29 @@ export const EDGE_KNOWN_KEYS: ReadonlySet<string> = new Set([
 export const EDGE_TYPES = ["depends_on", "on_changes_requested", "on_failure"] as const;
 export type EdgeType = (typeof EDGE_TYPES)[number];
 
+/**
+ * Every §4.3 key whose schema `type` is `array` — the ONLY keys whose
+ * bare form (`key:` with no value and no nested block) may parse as an
+ * EMPTY LIST (the v0.3.0 parser note, amendment row 8 / DEBT-013: the
+ * schema puts no minItems on `edges`, so a one-task graph is legal).
+ * Any other key keeps the parser's empty-value refusal — a bare `wake:`
+ * must never silently mean `[]`. Golden-pinned to the live spec block
+ * (test/golden/chain-schema.test.ts), so a schema array key cannot be
+ * forgotten here.
+ */
+export const CHAIN_ARRAY_KEYS: ReadonlySet<string> = new Set([
+  // top level
+  "tasks",
+  "edges",
+  // task members
+  "context_files",
+  "target_scopes",
+  // target_scopes members
+  "write_scope_globs",
+  "protected_test_globs",
+  "verification_commands",
+]);
+
 /* ------------------------------ typed shape ----------------------------- */
 
 export type ValidatedTargetScope = {

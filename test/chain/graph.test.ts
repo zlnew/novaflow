@@ -187,6 +187,21 @@ function task(key: string): Record<string, unknown> {
   };
 }
 
+test("zero edges is schema-legal: §4.3 sets no minItems on edges (the one-task chain)", () => {
+  const { db, workspaceId } = seed();
+  try {
+    const chain = validateChainGraph(db, workspaceId, graph({ edges: [] }));
+    assert.deepEqual(chain.edges, []);
+    assert.equal(chain.tasks.length, 2);
+    // the import the parser now enables: one member, no edges
+    const single = validateChainGraph(db, workspaceId, graph({ tasks: [task("SOLO")], edges: [] }));
+    assert.equal(single.tasks.length, 1);
+    assert.deepEqual(single.edges, []);
+  } finally {
+    db.close();
+  }
+});
+
 test("duplicate task keys refuse as duplicate, naming the key", () => {
   const { db, workspaceId } = seed();
   try {

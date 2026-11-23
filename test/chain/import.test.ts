@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import { extractDdl } from "../helpers/spec.ts";
 import { ulid } from "../../src/store/ids.ts";
 import { createTask } from "../../src/tasks.ts";
+import { parseYaml } from "../../src/chain/yaml.ts";
 import {
   importChain,
   getChainRun,
@@ -278,6 +279,84 @@ test("an unknown repo_alias refuses as not_found, nothing persisted", () => {
       (err: unknown) => err instanceof ChainValidationError && err.code === "not_found",
     );
     assert.deepEqual(counts(s.db), before);
+  } finally {
+    s.db.close();
+  }
+});
+
+test("a one-task DAG with a bare `edges:` imports as a single-member chain (DEBT-013)", () => {
+  const s = seed();
+  try {
+    // the user's own automation shape: `nova project import-dag` of a
+    // YAML file whose graph has one member and no edges at all
+    const yaml = [
+      'version: "1.0.0"',
+      "project_slug: prj",
+      "tasks:",
+      "  - key: SOLO",
+      "    title: Do the only task",
+      "    objective: The single member of a one-task chain.",
+      "    profile_name: dev",
+      "edges:",
+    ].join("\n");
+    const { chainRun, tasks } = importChain(
+      s.db,
+      { id: s.workspaceId },
+      projectRow(s),
+      parseYaml(yaml),
+    );
+    assert.equal(chainRun.state, "active");
+    assert.deepEqual(Object.keys(tasks), ["SOLO"]);
+    assert.equal(tasks["SOLO"]!.state, "draft");
+    assert.equal(tasks["SOLO"]!.chain_run_id, chainRun.id);
+    assert.equal(listChainMembers(s.db, chainRun.id).length, 1);
+    // zero edges, zero enqueues: roots are still the operator's call
+    assert.deepEqual(counts(s.db), { chains: 1, tasks: 1, edges: 0 });
+    assert.equal(
+      (s.db.prepare("SELECT COUNT(*) AS n FROM state_transition_logs").get() as { n: number }).n,
+      0,
+    );
+  } finally {
+    s.db.close();
+  }
+});
+
+test("regression: a normal two-task two-edge DAG written in YAML still imports unchanged", () => {
+  const s = seed();
+  try {
+    const yaml = [
+      '# a chain.yaml in the strict subset (data.md §4.3 shapes)',
+      'version: "1.0.0"',
+      "project_slug: prj",
+      "tasks:",
+      "  - key: PLAN",
+      '    title: "Plan the work"',
+      "    objective: Write the implementation plan end to end.",
+      "    profile_name: dev",
+      "  - key: WORK",
+      "    title: Do the work",
+      "    objective: Implement the planned feature end to end.",
+      "    profile_name: dev",
+      "    target_scopes:",
+      "      - repo_alias: code",
+      "        access_mode: read_write",
+      "edges:",
+      "  - source_key: PLAN",
+      "    target_key: WORK",
+      "    edge_type: depends_on",
+      "  - source_key: WORK",
+      "    target_key: PLAN",
+      "    edge_type: on_changes_requested",
+      "    condition_expr: review.status == 'changes_requested'",
+    ].join("\n");
+    const { tasks } = importChain(s.db, { id: s.workspaceId }, projectRow(s), parseYaml(yaml));
+    assert.deepEqual(Object.keys(tasks).sort(), ["PLAN", "WORK"]);
+    assert.deepEqual(counts(s.db), { chains: 1, tasks: 2, edges: 2 });
+    const rows = s.db
+      .prepare("SELECT * FROM task_edges WHERE project_id = ? ORDER BY edge_type")
+      .all(s.projectId) as Array<Record<string, unknown>>;
+    assert.deepEqual(rows.map((r) => r["edge_type"]), ["depends_on", "on_changes_requested"]);
+    assert.equal(rows[1]!["condition_expr"], "review.status == 'changes_requested'");
   } finally {
     s.db.close();
   }
