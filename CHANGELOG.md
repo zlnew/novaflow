@@ -3,6 +3,17 @@
 What changed for the operator, release by release. The numbers are the ones the code and the
 run records enforce; the repository history is the PR list.
 
+## [0.3.1] — 2026-11-24
+
+**Fix:** `install.sh`'s default route (`git clone … && sh novaflow/install.sh`) did not work on
+npm >= 12. npm now blocks dependency install scripts by default and rejects the
+`--allow-scripts` environment override in *project-scoped* installs, so the native SQLite
+binding never landed and the daemon could not start. The package now declares npm 12's
+documented project field (`allowScripts` for `better-sqlite3` and `esbuild`), the from-source
+route stops passing the invalid override, and the global/tarball route keeps it. Found by the
+v0.3.0 stranger test on npm 12.2.3 and verified end to end there: install, extension deploy,
+config written once, three next commands, binary runs, binding loads, re-run byte-identical.
+
 ## [0.3.0] — 2026-11-24
 
 The release that makes NovaFlow handable to someone else: work runs in the background, in its own

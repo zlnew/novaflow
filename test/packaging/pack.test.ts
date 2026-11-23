@@ -140,4 +140,19 @@ test("every runtime dependency of bin/nova ships as a dependency, not a devDepen
   assert.equal(pkg.devDependencies?.["tsx"], undefined, "tsx must not be dev-only");
   assert.ok(pkg.dependencies?.["better-sqlite3"] !== undefined, "the store driver ships");
   assert.ok(pkg.dependencies?.["@modelcontextprotocol/sdk"] !== undefined, "the MCP server ships");
+test("the package declares allowScripts for the one native dep (npm >= 12 blocks install scripts)", () => {
+  // npm 12 refuses `--allow-scripts` in a project-scoped install (EALLOWSCRIPTS),
+  // so install.sh's default route needs the package's own field — without it the
+  // better-sqlite3 prebuilt binding never lands and `nova daemon start` cannot
+  // load its driver. Found by the 2026-11-24 stranger test on npm 12.2.3.
+  const pkg = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8")) as {
+    allowScripts?: Record<string, unknown>;
+  };
+  assert.equal(
+    pkg.allowScripts?.["better-sqlite3"],
+    true,
+    "package.json must allow install scripts for better-sqlite3",
+  );
+});
+
 });
