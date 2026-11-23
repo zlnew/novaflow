@@ -136,13 +136,16 @@ check_sqlite3() {
 install_from_source() {
   [ -f "$repo_root/package.json" ] ||
     die "no package.json in $repo_root — run install.sh from the novaflow checkout, or use --from-tarball <pkg.tgz>."
-  # npm (>= 12) blocks dependency install scripts by default; allowing the one
-  # native dep makes its prebuilt binding land with the install itself.
+  # npm (>= 12) blocks dependency install scripts by default. In a PROJECT-scoped
+  # install the env form is REJECTED (EALLOWSCRIPTS), so the checkout's own
+  # package.json carries `allowScripts` for the one native dep — npm's documented
+  # project mechanism.
   note "installing dependencies in $repo_root"
-  ( cd "$repo_root" && npm_config_allow_scripts=better-sqlite3 npm install ) || die "npm install failed — fix the error above and re-run this script."
+  ( cd "$repo_root" && npm install ) || die "npm install failed — fix the error above and re-run this script."
   # belt and braces: the binding is load-bearing, rebuild if it did not land.
-  ( cd "$repo_root" && npm rebuild better-sqlite3 ) || printf '%s
-' "install.sh: warning: npm rebuild better-sqlite3 failed — if 'nova daemon start' reports a better_sqlite3.node error, see docs/install.md (The native binding)." >&2
+  if ! ( cd "$repo_root" && npm rebuild better-sqlite3 ); then
+    printf '%s\n' "install.sh: warning: npm rebuild better-sqlite3 failed — if 'nova daemon start' reports a better_sqlite3.node error, see docs/install.md (The native binding)." >&2
+  fi
   note "linking nova onto PATH from this checkout"
   ( cd "$repo_root" && npm link ) || die "npm link failed — check that npm's global prefix is writable (npm prefix -g) and re-run."
 }
