@@ -84,6 +84,22 @@ mkdir -p ~/.pi/agent/extensions
 cp extensions/novaflow.ts ~/.pi/agent/extensions/novaflow.ts
 ```
 
+In an **operator** session (a plain `pi` session, no `NOVAFLOW_RUN_CONTEXT`) the same
+extension adds the `/nova` command family and the **wake watcher**: it polls the
+transition stream every ~2 s and injects one `[novaflow] …` follow-up message per
+transition that needs a human — `awaiting_gate`, `failed`, and inferred chain
+completion. It seeds at head on session start, so pre-existing history never wakes.
+Configure it in `~/.novaflow/config.yaml`:
+
+```yaml
+wake:
+  enabled: true      # default true
+  workspace: null    # a workspace slug to narrow, or null for every workspace
+```
+
+`NOVAFLOW_WAKE=off` disables the watcher for the session; `NOVAFLOW_WAKE_MS` overrides
+the poll interval.
+
 `npm test` runs the suite and `npm run typecheck` the type check; both must be green.
 
 ## Quickstart — a chained task workflow in three steps
