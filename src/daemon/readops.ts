@@ -34,8 +34,11 @@ export type RunRow = {
   preflight_status: string;
   model_used: string;
   pid: number | null;
+  /** FRESH prompt tokens only (spend.md: cache has its own two columns). */
   input_tokens: number;
   output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
   cost_usd: number;
   exit_code: number | null;
   artifact_path: string | null;
@@ -53,6 +56,33 @@ export function latestRun(db: Db, taskId: string): RunRow | undefined {
 
 export function runById(db: Db, runId: string): RunRow | undefined {
   return db.prepare("SELECT * FROM task_runs WHERE id = ?").get(runId) as RunRow | undefined;
+}
+
+/**
+ * `cost_basis` (novaflow-v02/spend.md): "History is not rewritten: rows written
+ * before the migration keep their values and are reported as
+ * `cost_basis: "legacy"`."
+ *
+ * The pinned migration carries no marker column (its two statements are
+ * fixed), so the marker is the store's own migration record: a run row whose
+ * `started_at` predates `schema_migrations.applied_at` for 0003 was written by
+ * earlier code (cache tokens unrecorded, cost priced without them) and reports
+ * "legacy". A store without that record cannot prove any row is priced, so it
+ * conservatively reports "legacy" too. Such rows are only READ — their stored
+ * tokens and cost_usd are never rewritten.
+ */
+export type CostBasis = "priced" | "legacy";
+
+const COST_BASIS_MIGRATION = "0003_cache_tokens.sql";
+
+export function costBasis(db: Db, run: { started_at: string }): CostBasis {
+  const marker = db
+    .prepare("SELECT applied_at FROM schema_migrations WHERE filename = ?")
+    .get(COST_BASIS_MIGRATION) as { applied_at: string } | undefined;
+  if (marker === undefined) return "legacy";
+  // both columns are the store's own UTC `YYYY-MM-DDTHH:MM:SS.sssZ` format,
+  // so the lexicographic compare is a chronological compare
+  return run.started_at < marker.applied_at ? "legacy" : "priced";
 }
 
 export function requireTask(db: Db, taskId: string) {
@@ -76,7 +106,14 @@ export function taskStatus(db: Db, args: Record<string, unknown>): Record<string
          JOIN workspaces w ON w.id = p.workspace_id WHERE t.id = ?`,
     )
     .get(task.id) as { status: string; slug: string };
-  return { task, current_run: current ?? null, elapsed_ms: elapsedMs, workspace: ws };
+  return {
+    task,
+    // the run record carries the cache columns (SELECT *) plus the derived
+    // cost basis, so a reader can tell a legacy row from a priced one
+    current_run: current === undefined ? null : { ...current, cost_basis: costBasis(db, current) },
+    elapsed_ms: elapsedMs,
+    workspace: ws,
+  };
 }
 
 /**

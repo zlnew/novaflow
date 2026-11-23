@@ -9,6 +9,12 @@ import {
   type DaemonConfig,
 } from "../daemonconfig.ts";
 import { recoverOrphanedRuns, type RecoveryReport } from "./recovery.ts";
+import {
+  defaultPricesPath,
+  isModelPriced,
+  loadPricesDetailed,
+  type PricesLoad,
+} from "../runs/prices.ts";
 import { createDispatcher, type DispatchStatus } from "./dispatch.ts";
 import { createRetryEvaluator, type RetryEvaluator } from "./retry.ts";
 import { createScheduleEvaluator, type ScheduleEvaluator } from "./schedules.ts";
@@ -72,6 +78,76 @@ export type StartDaemonOptions = {
   notifyOptions?: NotifyOptions | undefined;
 };
 
+export type SpendWindow = { cost_usd: number; runs: number };
+export type SpendByModel = { model: string; cost_usd: number; runs: number };
+
+/** The spec's exact spend shape (novaflow-v02/spend.md). */
+export type SpendBlock = {
+  prices_armed: boolean;
+  inert_models: string[];
+  today: SpendWindow;
+  month: SpendWindow;
+  by_model: SpendByModel[];
+};
+
+/**
+ * The `nova_daemon_status` spend block — novaflow-v02/spend.md, verbatim shape:
+ *
+ *   spend: { prices_armed, inert_models, today {cost_usd, runs},
+ *            month {cost_usd, runs}, by_model [{model, cost_usd, runs}] }
+ *
+ * Every number derives from `task_runs` (no new table, no new writes): the
+ * window filter is `started_at >= <window start>`, so a run still in flight
+ * counts as soon as it has a `cost_usd` (the column always has one).
+ *
+ * Day and month boundaries are UTC — the store writes UTC timestamps and an
+ * operator-local boundary would make two daemons disagree. `by_model` is the
+ * month window, grouped by `model_used`, ordered cost desc then model asc so
+ * two daemons render the same order.
+ *
+ * `prices_armed` is false whenever the breaker is decorative: no usable
+ * price file, or a model in use (any `model_used` the store has run) without
+ * a price row covering all four rates. `inert_models` names those models —
+ * the honest answer, never a zero presented as if it were free.
+ */
+export function spendBlock(db: Db, prices: PricesLoad, now: Date = new Date()): SpendBlock {
+  const dayStart = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+  ).toISOString();
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+
+  const window = (since: string): SpendWindow => {
+    const row = db
+      .prepare(
+        "SELECT COALESCE(SUM(cost_usd), 0) AS cost, COUNT(*) AS runs FROM task_runs WHERE started_at >= ?",
+      )
+      .get(since) as { cost: number; runs: number };
+    return { cost_usd: row.cost, runs: row.runs };
+  };
+  const byModel = db
+    .prepare(
+      `SELECT model_used AS model, COALESCE(SUM(cost_usd), 0) AS cost, COUNT(*) AS runs
+         FROM task_runs WHERE started_at >= ?
+        GROUP BY model_used
+        ORDER BY cost DESC, model ASC`,
+    )
+    .all(monthStart) as Array<{ model: string; cost: number; runs: number }>;
+  const inUse = (
+    db.prepare("SELECT DISTINCT model_used AS model FROM task_runs ORDER BY model_used").all() as Array<{
+      model: string;
+    }>
+  ).map((r) => r.model);
+  const inert = inUse.filter((model) => !isModelPriced(prices.table, model));
+
+  return {
+    prices_armed: prices.source === "file" && inert.length === 0,
+    inert_models: inert,
+    today: window(dayStart),
+    month: window(monthStart),
+    by_model: byModel.map((r) => ({ model: r.model, cost_usd: r.cost, runs: r.runs })),
+  };
+}
+
 export type DaemonStatus = {
   version: string;
   started_at: string;
@@ -84,6 +160,8 @@ export type DaemonStatus = {
     spend_today_usd: number;
     spend_month_usd: number;
   };
+  /** novaflow-v02/spend.md — additive to the v1 payload. */
+  spend: SpendBlock;
 };
 
 export type DaemonHandle = {
@@ -110,20 +188,6 @@ function warn(message: string): void {
   console.warn(`[novaflow-daemon] ${message}`);
 }
 
-/** Global spend since the current UTC day/month start (spec-silent: UTC boundaries). */
-function globalSpend(db: Db): { today: number; month: number } {
-  const now = new Date();
-  const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-  const q = (since: Date): number =>
-    (
-      db.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS s FROM task_runs WHERE started_at >= ?").get(
-        since.toISOString(),
-      ) as { s: number }
-    ).s;
-  return { today: q(dayStart), month: q(monthStart) };
-}
-
 export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandle> {
   const db = openDb(opts.dbPath);
   let server: ControlServer | undefined;
@@ -135,6 +199,10 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
   let stopped = false;
   try {
     migrate(db);
+
+    // the price table the spend block reports coverage for (novaflow-v02/
+    // spend.md): loaded once at boot, from the same path the runs use
+    const priceLoad: PricesLoad = loadPricesDetailed(opts.pricesPath ?? defaultPricesPath());
 
     const configLoad = loadDaemonConfig(opts.daemonConfigPath ?? defaultDaemonConfigPath());
     if (!configLoad.ok) {
@@ -411,7 +479,7 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
     await chains.bootScan();
 
     const daemonStatus = (): DaemonStatus => {
-      const spend = globalSpend(db);
+      const spend = spendBlock(db, priceLoad);
       return {
         version,
         started_at: new Date(startedAt).toISOString(),
@@ -425,9 +493,10 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
         budgets: {
           daily_usd: daemonConfig.budgets.dailyUsd,
           monthly_usd: daemonConfig.budgets.monthlyUsd,
-          spend_today_usd: spend.today,
-          spend_month_usd: spend.month,
+          spend_today_usd: spend.today.cost_usd,
+          spend_month_usd: spend.month.cost_usd,
         },
+        spend,
       };
     };
 

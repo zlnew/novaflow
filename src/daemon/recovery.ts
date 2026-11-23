@@ -6,7 +6,7 @@ import { RUN_FAILED_TRIGGER } from "../runs/triggers.ts";
 import { createFrameTally } from "../runs/pump.ts";
 import { finalizeRunRecord, intakeSettledRun } from "../runs/settle-replay.ts";
 import {
-  costUsd,
+  costUsdTokens,
   defaultPricesPath,
   inertPricesNote,
   loadPricesDetailed,
@@ -175,6 +175,8 @@ export function recoverOrphanedRuns(db: Db, opts: RecoveryOptions = {}): Recover
           exitCode: null, // unobserved: the process died with the daemon
           inputTokens: tally.inputTokens,
           outputTokens: tally.outputTokens,
+          cacheReadTokens: tally.cacheReadTokens,
+          cacheWriteTokens: tally.cacheWriteTokens,
           startedWall: wall,
           pricesNote,
           actor: "daemon-recovery",
@@ -200,7 +202,14 @@ export function recoverOrphanedRuns(db: Db, opts: RecoveryOptions = {}): Recover
         preflightStatus: row.preflight_status === "passed" ? "passed" : "failed",
         inputTokens: tally.inputTokens,
         outputTokens: tally.outputTokens,
-        costUsd: costUsd(priceTable, row.model_used, tally.inputTokens, tally.outputTokens),
+        cacheReadTokens: tally.cacheReadTokens,
+        cacheWriteTokens: tally.cacheWriteTokens,
+        costUsd: costUsdTokens(priceTable, row.model_used, {
+          input: tally.inputTokens,
+          cacheRead: tally.cacheReadTokens,
+          cacheWrite: tally.cacheWriteTokens,
+          output: tally.outputTokens,
+        }),
         exitCode: null,
         artifactPath: null,
         errorSummary: pricesNote(
@@ -230,6 +239,8 @@ export function recoverOrphanedRuns(db: Db, opts: RecoveryOptions = {}): Recover
           preflightStatus: row.preflight_status === "passed" ? "passed" : "failed",
           inputTokens: tally.inputTokens,
           outputTokens: tally.outputTokens,
+          cacheReadTokens: tally.cacheReadTokens,
+          cacheWriteTokens: tally.cacheWriteTokens,
           costUsd: 0,
           exitCode: null,
           artifactPath: null,

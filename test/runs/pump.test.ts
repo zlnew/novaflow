@@ -74,6 +74,33 @@ test("usage accumulates across multiple frames; message_update zero-usage adds n
   }
 });
 
+test("cache components are tallied into their own counters, never folded into input", () => {
+  const d = dir();
+  try {
+    const pump = createPump(join(d, "events.raw.jsonl"), join(d, "events.jsonl"));
+    pump.onLine(JSON.stringify({ type: "message_update", usage: { input: 0, output: 0 } }));
+    pump.onLine(
+      JSON.stringify({
+        type: "message_end",
+        usage: { input: 1000, output: 50, cacheRead: 200_000, cacheWrite: 30_000 },
+      }),
+    );
+    // a malformed cache field is ignored, not coerced into the sums
+    pump.onLine(
+      JSON.stringify({
+        type: "message_end",
+        usage: { input: 10, output: 5, cacheRead: -1, cacheWrite: "lots" },
+      }),
+    );
+    assert.equal(pump.inputTokens, 1010); // FRESH prompt tokens only
+    assert.equal(pump.outputTokens, 55);
+    assert.equal(pump.cacheReadTokens, 200_000);
+    assert.equal(pump.cacheWriteTokens, 30_000);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
 test("a non-JSON line is logged verbatim in raw and string-scrubbed in redacted, never dropped", () => {
   const d = dir();
   try {
