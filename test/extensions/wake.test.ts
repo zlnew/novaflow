@@ -686,9 +686,10 @@ test("wake: an ENABLED watcher pins exactly one interval, and re-start does not 
   const { api } = fakePi();
   const { request } = stubRequest((op) => (op === "nova_transitions_since" ? page([], 0) : {}));
   const watcher = createWakeWatcher(api, { scheduler, request, send: () => undefined });
-  await watcher.start();
+  const { ctx } = fakeCtx();
+  await watcher.start(ctx);
   assert.equal(timers.length, 1, "one interval after start");
-  await watcher.start();
+  await watcher.start(ctx);
   assert.equal(timers.length, 1, "a second start re-pins rather than doubling");
   await watcher.stop();
   assert.equal(timers.length, 0, "shutdown clears it");
