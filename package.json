@@ -1,6 +1,6 @@
 {
   "name": "novaflow",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Deterministic orchestration for chains of Pi coding-agent tasks: per-run git worktrees, gates, verification, and a live operator view.",
   "type": "module",
   "license": "MIT",
