@@ -25,6 +25,7 @@ import { getWorkspace, listWorkspaces } from "../workspaces.ts";
 import { getProject, listProjects } from "../projects.ts";
 import { validateArtifact, type TaskHandoffArtifact } from "../runs/artifact.ts";
 import { OpError, optNonEmptyString } from "../opcodes.ts";
+import { withFixHint } from "../fixhint.ts";
 
 export type RunRow = {
   id: string;
@@ -87,7 +88,7 @@ export function costBasis(db: Db, run: { started_at: string }): CostBasis {
 
 export function requireTask(db: Db, taskId: string) {
   const task = getTask(db, taskId);
-  if (!task) throw new OpError("not_found", `no such task: ${taskId}`);
+  if (!task) throw new OpError("not_found", withFixHint(`no such task: ${taskId}`, "list tasks with `nova task list`"));
   return task;
 }
 

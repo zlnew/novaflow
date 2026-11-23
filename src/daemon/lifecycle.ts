@@ -22,8 +22,10 @@ import { createChainEvaluator, type ChainEvaluator } from "../chain/readiness.ts
 import { createRoutingEvaluator, driveSelfPathRequeue, type RoutingEvaluator } from "../chain/routing.ts";
 import { bindControlServer, type ControlServer } from "./server.ts";
 import { runVerification } from "../verify/runner.ts";
-import { verifyProtectedAndScope } from "../verify/protected.ts";
+import { loadExecutionRoots, verifyProtectedAndScope } from "../verify/protected.ts";
 import { annotateRunVerification } from "../verify/artifact-annotate.ts";
+import { buildVerificationRecord } from "../verify/record.ts";
+import { appendRunEngineFrame } from "../runs/pump.ts";
 import { completeValidation } from "../validating.ts";
 import type { RunOptions, RunOutcome } from "../runs/loop.ts";
 import type { NotifyOptions } from "../notify.ts";
@@ -279,7 +281,30 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
     const driveVerification = (taskId: string, run: { id: string; pi_session_dir: string }): void => {
       const job = (async (): Promise<void> => {
         try {
-          const verify = await runVerification(db, taskId);
+          // P9 worktrees: FR-TSK-12 commands and the scope checks run at
+          // each target's EXECUTION root — the worktree path the run's
+          // preflight snapshot recorded (the tree the agent actually
+          // worked in), never the shared checkout
+          const executionRoots = loadExecutionRoots(run.pi_session_dir);
+          const verify = await runVerification(
+            db,
+            taskId,
+            executionRoots !== null ? { executionRoots } : {},
+          );
+          // RECORD, THEN REPORT (DEBT-006): the run's own verification frame
+          // — every executed command with its exit status and the cwd it ran
+          // in — goes into the run's REDACTED events.jsonl through the pump's
+          // one redacting writer. `nova chain verify` reads THIS record (plus
+          // the §4.1 block), never the task's current config. Telemetry must
+          // never decide engine state: a failed append is a warning, and the
+          // artifact's verification_results still records the pass.
+          try {
+            appendRunEngineFrame(run.pi_session_dir, buildVerificationRecord(run.id, verify));
+          } catch (err) {
+            warn(
+              `verification record for run ${run.id} was not written: ${(err as Error).message}`,
+            );
+          }
           const protectedCheck = await verifyProtectedAndScope(db, taskId, run.pi_session_dir);
           annotateRunVerification(db, run.id, verify, protectedCheck);
           const passed =

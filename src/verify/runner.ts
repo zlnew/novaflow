@@ -4,8 +4,10 @@ import type { Db } from "../store/db.ts";
 /**
  * FR-TSK-12 — the independent post-run command verifier. The engine
  * executes the task's configured verification commands (test runners,
- * typecheckers, linters) directly in the target's root_path, never
- * trusting the agent's self-report.
+ * typecheckers, linters) directly in the target's EXECUTION root — the
+ * run's worktree path for worktree-placed targets (passed from the
+ * run's protected-digests snapshot), the recorded `root_path`
+ * otherwise — never trusting the agent's self-report.
  *
  * Verdict per command: the exit code is authoritative. When the
  * command's stdout contains the TRAILING MARKER LINE
@@ -109,10 +111,16 @@ function parseStringArray(json: string, column: string): string[] {
  * extraction the p2b engine-context builder performs (src/runs/context.ts;
  * the context builder does not export its per-target pairing, so this
  * is reimplemented identically: scopes in tts.id ULID order, commands
- * deduped first-seen). Each command carries the root_path of the
- * target it came from (its cwd at execution).
+ * deduped first-seen). Each command carries the root it came from (its
+ * cwd at execution): the target's EXECUTION root when the caller passes
+ * one (the run's worktree path for worktree-placed targets — the tree
+ * the agent actually worked in), otherwise the recorded `root_path`.
  */
-export function collectScopeCommands(db: Db, taskId: string): ScopeCommand[] {
+export function collectScopeCommands(
+  db: Db,
+  taskId: string,
+  executionRoots: Record<string, string> = {},
+): ScopeCommand[] {
   const rows = db
     .prepare(
       `SELECT tts.target_id AS target_id, pt.alias AS alias,
@@ -131,7 +139,12 @@ export function collectScopeCommands(db: Db, taskId: string): ScopeCommand[] {
     for (const command of commands) {
       if (seen.has(command)) continue;
       seen.add(command);
-      out.push({ command, rootPath: r.root_path, targetId: r.target_id, alias: r.alias });
+      out.push({
+        command,
+        rootPath: executionRoots[r.target_id] ?? r.root_path,
+        targetId: r.target_id,
+        alias: r.alias,
+      });
     }
   }
   return out;
@@ -273,6 +286,14 @@ export type VerifyOutcome = {
   /** ALL commands passed. No commands configured → vacuous pass. */
   passed: boolean;
   /**
+   * The command set as COLLECTED for this pass, each pinned to the root it
+   * runs in (empty when collection failed — the set is then unknown). The
+   * configured side of the run's verification record (src/verify/record.ts,
+   * DEBT-006): `nova chain verify` prints THIS, never the task's current
+   * config.
+   */
+  configured: ScopeCommand[];
+  /**
    * Non-null when the command set itself could not be collected
    * (malformed `verification_commands_json` in a task_target_scopes
    * row): a FAILED verdict with no per-command results — collecting
@@ -282,7 +303,14 @@ export type VerifyOutcome = {
   results: CommandResult[];
 };
 
-export type VerifyOptions = GroupedCommandOptions;
+export type VerifyOptions = GroupedCommandOptions & {
+  /**
+   * Per-target EXECUTION roots (target_id → path, from the run's
+   * protected-digests snapshot): worktree-placed targets verify in
+   * their worktree, never the shared checkout.
+   */
+  executionRoots?: Record<string, string>;
+};
 
 /** Map a raw group-command outcome to the per-command verdict + artifact exit code. */
 function judge(command: string, cwd: string, res: GroupedCommandResult): CommandResult {
@@ -323,16 +351,16 @@ export async function runVerification(
 ): Promise<VerifyOutcome> {
   let commands: ScopeCommand[];
   try {
-    commands = collectScopeCommands(db, taskId);
+    commands = collectScopeCommands(db, taskId, opts.executionRoots ?? {});
   } catch (err) {
     // a malformed command-set definition is a FAILED verdict — the
     // verifier's "never throws" contract starts at collection
-    return { passed: false, collectionError: (err as Error).message, results: [] };
+    return { passed: false, collectionError: (err as Error).message, configured: [], results: [] };
   }
   const results: CommandResult[] = [];
   for (const c of commands) {
     const res = await runGroupedCommand(["/bin/sh", "-c", c.command], c.rootPath, opts);
     results.push(judge(c.command, c.rootPath, res));
   }
-  return { passed: results.every((r) => r.passed), collectionError: null, results };
+  return { passed: results.every((r) => r.passed), collectionError: null, configured: commands, results };
 }

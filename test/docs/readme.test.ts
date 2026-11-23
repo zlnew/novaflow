@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { MCP_TOOLS } from "../../src/mcp/catalog.ts";
 import { DEFAULT_RETENTION_DAYS } from "../../src/daemon/maintenance.ts";
 import { DISK_FREE_FLOOR_BYTES } from "../../src/runs/preflight.ts";
+import { DEFAULT_CONCURRENCY_WORKSPACE } from "../../src/config.ts";
+import { DEFAULT_CONCURRENCY_GLOBAL } from "../../src/daemonconfig.ts";
 
 /**
  * README honesty pin.
@@ -46,15 +48,63 @@ test("README's quickstart references only verbs the CLI actually has", () => {
     ["task result", /bin\/nova task result FEAT-1/],
     ["project import-dag", /bin\/nova project import-dag chain\.yaml/],
     ["chain status", /bin\/nova chain status/],
+    ["status --watch (tier C)", /bin\/nova status --watch/],
+    ["web sync --all (tier D)", /bin\/nova web sync --all/],
+    ["web start", /bin\/nova web start/],
+    ["web stop", /bin\/nova web stop/],
   ];
   for (const [what, re] of must) assert.match(README, re, `README must show ${what}`);
-  // and the exact verb lists the help prints
-  const help = readFileSync(join(REPO, "src", "cli", "main.ts"), "utf8");
+  // and the exact verb lists the help prints (the overview is generated from
+  // the verb table — P12 moved the usage text out of main.ts)
+  const help = readFileSync(join(REPO, "src", "cli", "verbs.ts"), "utf8");
   // the usage block prints both daemon verbs on one line; the individual
   // names must each appear
   for (const verb of [/nova workspace create/, /nova docs list/, /daemon backup/, /prune \[--retention-days/]) {
     assert.match(help, verb, `the CLI usage names ${verb}`);
   }
+});
+
+test("README's install route is the installer this repo ships (R3.1)", () => {
+  // the acquisition step is one command, and it is the script in this repo
+  assert.match(README, /git clone https:\/\/github\.com\/zlnew\/novaflow && sh novaflow\/install\.sh/);
+  assert.ok(existsSync(join(REPO, "install.sh")), "the installer the README names exists");
+  const installer = readFileSync(join(REPO, "install.sh"), "utf8");
+  // the README describes this mechanism and these flags; the script must have them
+  assert.match(installer, /npm link/);
+  assert.match(installer, /--from-tarball/);
+  assert.match(installer, /--start/);
+  assert.match(installer, /\.novaflow/, "the config directory it writes once");
+  assert.match(installer, /config\.yaml/);
+});
+
+test("README's measured cost facts name both runs, both denominators, and their sources", () => {
+  // the two facts are different runs with different denominators: the README
+  // must state both exactly, so neither can be quoted as the other.
+  assert.match(README, /v0\.2\.0 dogfood trial/);
+  assert.match(README, /3 runs/);
+  assert.match(README, /\$0\.0643/);
+  assert.match(README, /88\.8% of\s+the trial's prompt tokens/);
+  assert.match(README, /1,230,016 of 1,384,732/);
+  assert.match(README, /DEBT-009-era GLM run/);
+  assert.match(README, /88% of\s+the COST/);
+  assert.match(README, /13,652,160/);
+  assert.match(README, /98\.8% of that run's prompt tokens/);
+});
+
+test("README's isolation, concurrency and live-view claims are the shipped shapes", () => {
+  // worktree path + branch command are the engine's (src/runs/worktrees.ts)
+  assert.match(README, /\.novaflow\/worktrees\/<run_id>\/<alias>\//);
+  assert.match(README, /git worktree add -b novaflow\/run-<run_id>/);
+  assert.match(README, /migration 0004/i);
+  // the concurrency defaults are the constants the dispatcher reads
+  assert.equal(DEFAULT_CONCURRENCY_WORKSPACE, 2);
+  assert.equal(DEFAULT_CONCURRENCY_GLOBAL, 4);
+  assert.match(README, /concurrency\.workspace` defaults to \*\*2\*\*/);
+  assert.match(README, /concurrency\.global` to\s+\*\*4\*\*/);
+  // tier D's port and its one absolute mirror rule
+  assert.match(README, /30142/);
+  assert.match(README, /events\.raw\.jsonl` is never copied/);
+  assert.match(README, /\[novaflow\]/);
 });
 
 test("README's storage numbers are the numbers the code enforces (no marketing drift)", () => {

@@ -395,6 +395,10 @@ test("run-repair-ok: execution settles missing → FR-TSK-06 repair run → vali
       repairFeedback: "result.json missing after agent_settled",
     });
     assert.equal(rec.prompt, expected.message);
+    // DEBT-014: an in-place attempt (worktree_root NULL) adds NO pointer —
+    // the one repair sentence is absent, not merely empty
+    assert.equal(first.worktree_root, null);
+    assert.equal(String(rec.prompt).includes("read-only evidence"), false);
     // and the repair run's engine-context says attempt_kind repair
     assert.equal((rec.context as Record<string, unknown>)["attempt_kind"], "repair");
 
@@ -703,15 +707,19 @@ test("unspawnable pi binary → AC3 preflight failure (DEBT-002), exit_code null
 test("missing prices.json + a budget → the run still succeeds, but records that cost enforcement is inert", async (t) => {
   const s = seed();
   try {
+    const pricesPath = join(s.pidfile, "..", "no-such-prices.json");
     const outcome = await withBound(
       t.signal,
       BOUND_MS,
-      run(s, "run-ok", { pricesPath: join(s.pidfile, "..", "no-such-prices.json") }),
+      run(s, "run-ok", { pricesPath }),
     );
     assert.equal(outcome.finalState, "validating");
     const row = runRow(s, 1);
     assert.equal(row.status, "succeeded");
-    assert.ok(row.error_summary?.includes(inertPricesNote("missing")), row.error_summary ?? "");
+    assert.ok(
+      row.error_summary?.includes(inertPricesNote("missing", pricesPath)),
+      row.error_summary ?? "",
+    );
     assert.equal(row.cost_usd, 0); // all-zero pricing — pricing never took the run down
   } finally {
     s.db.close();

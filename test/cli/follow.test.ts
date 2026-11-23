@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { waitFor } from "../daemon/client.ts";
+import { formatTransitionLine, type TransitionRow } from "../../src/cli/watch.ts";
 
 /**
  * The live follow surfaces through the ACTUAL CLI binary against a real
@@ -14,8 +15,8 @@ import { waitFor } from "../daemon/client.ts";
  *     a run whose log is already closed (never sit there), printing every
  *     line the redacted events.jsonl holds;
  *   - `nova task status <id> --watch` — one line per transition
- *     (`HH:MM:SS KEY from→to (trigger, actor) run=<id>`) until terminal, then
- *     the unchanged v1 status block;
+ *     (`HH:MM:SS UTC KEY from→to (trigger, actor) run=<id>`) until terminal,
+ *     then the unchanged v1 status block;
  *   - `nova chain status <id> --watch` — member transitions until every member
  *     AND the chain row are terminal (completion is inferred: chain runs have
  *     no transition rows of their own).
@@ -163,6 +164,38 @@ function taskState(h: Home, key: string): string {
   return (JSON.parse(res.stdout) as { task: { state: string } }).task.state;
 }
 
+/* ---------------------- the one transition-line format --------------------- */
+
+test("the shared transition formatter pins the WHOLE line, zone label included", () => {
+  // Both `--watch` verbs print through this one formatter, so a literal pin of
+  // the complete line is what stops the zone label (or any other field) from
+  // drifting on one side. DEBT-012: the clock stays UTC — the timestamp is the
+  // store's own stamp — and the line now SAYS so.
+  const row: TransitionRow = {
+    cursor: 7,
+    task_id: "01M81ZZZZZZZZZZZZZZZZZZZZZ",
+    run_id: "01M81ABZ6Q8N4T2V9C3X5K7MD1",
+    chain_run_id: null,
+    task_key: "WC2",
+    chain_slug: null,
+    from_state: "queued",
+    to_state: "running",
+    trigger_type: "engine",
+    actor: "daemon-dispatch",
+    reason: null,
+    created_at: "2026-11-23T12:06:54.123Z",
+  };
+  assert.equal(
+    formatTransitionLine(row),
+    "12:06:54 UTC WC2 queued→running (engine, daemon-dispatch) run=01M81ABZ6Q8N4T2V9C3X5K7MD1",
+  );
+  // a row that names no run still carries the zone, and prints run=-
+  assert.equal(
+    formatTransitionLine({ ...row, run_id: null }),
+    "12:06:54 UTC WC2 queued→running (engine, daemon-dispatch) run=-",
+  );
+});
+
 /* ------------------------- nova task logs --follow ------------------------- */
 
 test("nova task logs --follow on a CLOSED run prints every line and exits at once", async () => {
@@ -183,6 +216,8 @@ test("nova task logs --follow on a CLOSED run prints every line and exits at onc
     const follow = runNova(["task", "logs", "T1", "--follow"], h.env, 20_000);
     assert.equal(follow.code, 0, `a done run must not wait: stdout=${follow.stdout} stderr=${follow.stderr}`);
     const followLines = follow.stdout.split("\n").filter((l) => l !== "");
+    // PRESERVE: the log follow prints the run's lines verbatim — it carries no
+    // clock of its own and gains no zone label from the transition-line change
     assert.deepEqual(followLines, tailLines, "the follow serves the same redacted lines the tail does");
     assert.match(follow.stderr, /closed|nothing more|new run/, "the follow says why it stopped");
 
@@ -207,6 +242,30 @@ test("nova task logs --follow on a CLOSED run prints every line and exits at onc
   }
 });
 
+/* -------------------- nova task run --watch (v1, untouched) ------------------ */
+
+test("PRESERVE: nova task run --watch keeps its v1 snapshot line and gains no zone label", async () => {
+  const h = makeHome();
+  try {
+    bootstrap(h);
+    createTask(h, "T3");
+    const watch = runNova(["task", "run", "T3", "--watch"], h.env, 30_000);
+    assert.equal(watch.code, 0, `stdout=${watch.stdout} stderr=${watch.stderr}`);
+    // v1's snapshot watch, byte for byte: `[HH:MM:SS] tsk_<ulid> <state>` — the
+    // transition-line zone label must NOT leak into this surface
+    assert.match(
+      watch.stdout,
+      /^\[\d{2}:\d{2}:\d{2}\] tsk_[0-9A-HJKMNP-TV-Z]{26} (queued|running|completed)$/m,
+      `the v1 snapshot line is unchanged: ${watch.stdout}`,
+    );
+    assert.doesNotMatch(watch.stdout, / UTC /, "--watch's zone label belongs to the transition line only");
+    // v1 snapshot semantics: the closing line, no status block on this verb
+    assert.match(watch.stdout, /^SUCCESS task completed$/m);
+  } finally {
+    await forceStopDaemon(h);
+  }
+});
+
 /* ------------------------- nova task status --watch ------------------------- */
 
 test("nova task status --watch on a terminal task prints the unchanged v1 status block and exits", async () => {
@@ -226,15 +285,16 @@ test("nova task status --watch on a terminal task prints the unchanged v1 status
     assert.match(watch.stdout, /^run_status: succeeded$/m);
     assert.match(watch.stdout, /^verification: passed$/m);
     assert.match(watch.stdout, /SUCCESS task completed/);
-    // and the transition lines the head page offered (watched, not polled)
+    // and the transition lines the head page offered (watched, not polled);
+    // each assertion pins the WHOLE line, zone label included
     assert.match(
       watch.stdout,
-      /^\d{2}:\d{2}:\d{2} T1 running→validating \(engine, daemon-dispatch\) run=[0-9A-HJKMNP-TV-Z]{26}$/m,
+      /^\d{2}:\d{2}:\d{2} UTC T1 running→validating \(engine, daemon-dispatch\) run=[0-9A-HJKMNP-TV-Z]{26}$/m,
       "one line per transition, in the pinned format, carrying the run id the row names",
     );
     assert.match(
       watch.stdout,
-      /^\d{2}:\d{2}:\d{2} T1 validating→completed \(engine, daemon-verify\) run=-$/m,
+      /^\d{2}:\d{2}:\d{2} UTC T1 validating→completed \(engine, daemon-verify\) run=-$/m,
       "a row that names no run prints run=- rather than inventing one",
     );
   } finally {
@@ -262,10 +322,14 @@ test("a --watch that sees a transition land and then the terminal state exits 0"
     assert.equal(watch.code, 0, `stdout=${watch.stdout} stderr=${watch.stderr}`);
     assert.match(
       watch.stdout,
-      /^\d{2}:\d{2}:\d{2} T2 queued→running \(engine, daemon-dispatch\) run=-$/m,
+      /^\d{2}:\d{2}:\d{2} UTC T2 queued→running \(engine, daemon-dispatch\) run=-$/m,
       "the transition that landed AFTER the watch started is printed",
     );
-    assert.match(watch.stdout, /T2 \S+→completed /, "and so is the terminal one");
+    assert.match(
+      watch.stdout,
+      /^\d{2}:\d{2}:\d{2} UTC T2 \S+→completed \(engine, [\w-]+\) run=(?:-|[0-9A-HJKMNP-TV-Z]{26})$/m,
+      "and so is the terminal one, on the same whole pinned line",
+    );
     assert.match(watch.stdout, /^state: completed$/m, "the v1 block closes the watch");
     assert.match(watch.stdout, /SUCCESS task completed/);
   } finally {
@@ -314,10 +378,14 @@ test("nova chain status --watch prints member transitions and exits on the infer
     // member transitions for the chain run, same line format as the task watch
     assert.match(
       watch.stdout,
-      /^\d{2}:\d{2}:\d{2} A queued→running \(engine, daemon-dispatch\) run=-$/m,
+      /^\d{2}:\d{2}:\d{2} UTC A queued→running \(engine, daemon-dispatch\) run=-$/m,
       "a member's transition line is chain-scoped and greppable",
     );
-    assert.match(watch.stdout, /^\d{2}:\d{2}:\d{2} B \S+→completed /m, "the downstream member's too");
+    assert.match(
+      watch.stdout,
+      /^\d{2}:\d{2}:\d{2} UTC B \S+→completed \(engine, [\w-]+\) run=(?:-|[0-9A-HJKMNP-TV-Z]{26})$/m,
+      "the downstream member's too, on the same whole pinned line",
+    );
     // then the unchanged v1 chain block
     assert.match(watch.stdout, new RegExp(`^id: ${chain.id}$`, "m"));
     assert.match(watch.stdout, /^state: completed$/m);

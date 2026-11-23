@@ -5,6 +5,7 @@ import { workspaceContext } from "../context.ts";
 import { operatorActor } from "../context.ts";
 import { readFileSync } from "node:fs";
 import type { CommandOpts } from "../opts.ts";
+import { withFixHint } from "../../fixhint.ts";
 
 /**
  * `nova project …` (srs 4.1.1): create/list/status/phase.
@@ -143,7 +144,10 @@ async function resolveProject(
   };
   const row = data.projects.find((x) => x.slug === ident || x.id === ident);
   if (row === undefined) {
-    throw new OpFailureError("not_found", `no project "${ident}" in workspace ${ctx.slug}`);
+    throw new OpFailureError(
+      "not_found",
+      withFixHint(`no project "${ident}" in workspace ${ctx.slug}`, "list projects with `nova project list` and pass the exact slug"),
+    );
   }
   return row.id;
 }

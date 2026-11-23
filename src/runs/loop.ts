@@ -13,9 +13,17 @@ import {
 import { finalizeRunRecord, intakeSettledRun } from "./settle-replay.ts";
 import { buildEngineContext, writeEngineContext } from "./context.ts";
 import { writeProtectedDigests } from "../verify/protected.ts";
-import { composePrompt, type ComposedPrompt } from "./prompt.ts";
+import { composePrompt, type ComposedPrompt, type RepairWorktreePointer } from "./prompt.ts";
 import { buildRunArgv, defaultExtensionPath, runDirPath } from "./spawn.ts";
-import { createPump } from "./pump.ts";
+import {
+  appendWorktreeReport,
+  provisionRunWorktrees,
+  recordRunWorktreeArtifacts,
+  rollbackProvisionedOutcome,
+  runWorkspacePatchPath,
+  type ProvisionOutcome,
+} from "./worktrees.ts";
+import { appendRunEngineFrame, createPump } from "./pump.ts";
 import { redactText } from "./redact.ts";
 import {
   checkBudgetCeiling,
@@ -128,6 +136,8 @@ export type TaskRunRecord = {
   exit_code: number | null;
   artifact_path: string | null;
   events_log_path: string;
+  /** Migration 0004: the run's worktree ROOT, NULL for an in-place run. */
+  worktree_root: string | null;
   git_commits_json: string;
   error_summary: string | null;
   started_at: string;
@@ -302,7 +312,8 @@ export async function startRun(
     throw new InvalidTransitionError(task.state, START_TRIGGER);
   }
 
-  const priceLoad = loadPricesDetailed(opts.pricesPath ?? defaultPricesPath());
+  const pricesPath = opts.pricesPath ?? defaultPricesPath();
+  const priceLoad = loadPricesDetailed(pricesPath);
   const priceTable: PriceTable = priceLoad.table;
   const extensionPath = opts.extensionPath ?? defaultExtensionPath();
 
@@ -311,6 +322,9 @@ export async function startRun(
 
   let attemptKind: "execution" | "repair" = "execution";
   let repairFeedback: string | undefined;
+  // DEBT-014: the previous attempt's worktree (and its persisted diff), when
+  // that attempt ran in one — absent for an in-place previous attempt
+  let repairWorktree: RepairWorktreePointer | undefined;
 
   for (;;) {
     const runId = ulid();
@@ -339,8 +353,8 @@ export async function startRun(
     const withPricesNote = (summary: string | null): string | null =>
       priceLoad.source !== "file" && effective.maxCostUsd > 0
         ? summary === null
-          ? inertPricesNote(priceLoad.source)
-          : summary + "\n" + inertPricesNote(priceLoad.source)
+          ? inertPricesNote(priceLoad.source, pricesPath)
+          : summary + "\n" + inertPricesNote(priceLoad.source, pricesPath)
         : summary;
 
     insertRunRow(db, {
@@ -375,6 +389,9 @@ export async function startRun(
           ...(attemptKind === "repair" && repairFeedback !== undefined
             ? { repairFeedback }
             : {}),
+          ...(attemptKind === "repair" && repairWorktree !== undefined
+            ? { repairWorktree }
+            : {}),
         });
       } catch (err) {
         preflightError = (err as Error).message;
@@ -396,19 +413,6 @@ export async function startRun(
         preflightError = `engine context: ${(err as Error).message}`;
       }
     }
-    // pre-run protected-digest snapshot (FR-TSK-11, architecture 5.8
-    // Post-Run Verifier): taken at preflight, BEFORE the agent runs, so
-    // the post-run verifier can prove protected-file integrity against
-    // the pre-run state. A scoped target whose root is missing fails
-    // preflight here (zero tokens, full audit trail).
-    if (preflightError === null && contextPath !== null) {
-      try {
-        writeProtectedDigests(db, taskId, runDir, runId);
-      } catch (err) {
-        preflightError = `protected digests: ${(err as Error).message}`;
-      }
-    }
-
     // ---- DEBT-002 closure (FR-TSK-10): zero-token readiness checks,
     // all local, all before any spawn (AC5 holds for every failure) ----
     if (preflightError === null) {
@@ -435,6 +439,84 @@ export async function startRun(
         workspaceRoot: task.workspace_root,
         ...(opts.globalBudgets !== undefined ? { globalBudgets: opts.globalBudgets } : {}),
       });
+    }
+
+    // ---- per-run worktree isolation (novaflow-v030 W1 R1.3, DEBT-007) ----
+    // BEFORE dispatch: every `git_repo` read_write target gets its own tree
+    // under .novaflow/worktrees/<run_id>/<target_alias>/; read_only git and
+    // directory targets run in place (worktree_root stays NULL). A creation
+    // failure is a PREFLIGHT failure — the run is refused with the git
+    // reason and never falls back to the shared tree.
+    let worktree: ProvisionOutcome | null = null;
+    if (preflightError === null) {
+      try {
+        worktree = provisionRunWorktrees(db, taskId, task.workspace_root, runId);
+      } catch (err) {
+        worktree = {
+          ok: false,
+          error: `worktree provisioning failed: ${(err as Error).message}; no fallback to the shared tree (novaflow-v030 W1 R1.3)`,
+          root: null,
+          cwd: null,
+          branch: null,
+          targets: [],
+        };
+      }
+      // a successful report is only meaningful when the task HAS scoped
+      // targets (it names the class each one got); a refusal is always
+      // recorded, it is the evidence for the refused run
+      if (contextPath !== null && (!worktree.ok || worktree.targets.length > 0)) {
+        try {
+          appendWorktreeReport(runDir, runId, worktree);
+        } catch (err) {
+          preflightError = `worktree report: ${(err as Error).message}`;
+        }
+      }
+      if (preflightError === null) {
+        if (!worktree.ok) {
+          preflightError = worktree.error;
+        } else {
+          // pre-run protected-digest snapshot (FR-TSK-11, architecture 5.8
+          // Post-Run Verifier) — taken AFTER provisioning, re-rooted to the
+          // run's EXECUTION roots (P9 re-judge CRITICAL): the snapshot's
+          // target root is the WORKTREE path for worktree-placed targets,
+          // so the pi extension's scope roots, the protected-digest walk,
+          // and the post-run `git status` all govern the tree the agent
+          // actually works in. The digests themselves stay sourced from the
+          // base (each target's recorded root_path, proven clean at the
+          // base ref by the AC2 check above) — protected paths relative to
+          // the root remain enforceable inside the worktree.
+          try {
+            const executionRoots: Record<string, string> = {};
+            for (const t of worktree.targets) {
+              if (t.path !== null) executionRoots[t.target_id] = t.path;
+            }
+            writeProtectedDigests(db, taskId, runDir, runId, executionRoots);
+          } catch (err) {
+            preflightError = `protected digests: ${(err as Error).message}`;
+            // the run is refused pre-dispatch: a never-dispatched tree is
+            // not persisted work — roll this attempt's trees back so the
+            // refusal leaves no orphan `nova chain clean` cannot find
+            try {
+              const warnings = rollbackProvisionedOutcome(db, taskId, worktree);
+              if (warnings.length > 0) {
+                appendRunEngineFrame(runDir, {
+                  type: "novaflow_worktree_rollback_warning",
+                  run_id: runId,
+                  warnings,
+                });
+              }
+            } catch {
+              /* the refusal is already recorded; best-effort rollback */
+            }
+          }
+          if (preflightError === null && worktree.root !== null) {
+            // the ROOT is recorded only once the run is fully dispatchable
+            // (data §3 field reference); migration 0004's column describes
+            // a 1..N target run — a refused run records no root
+            db.prepare("UPDATE task_runs SET worktree_root = ? WHERE id = ?").run(worktree.root, runId);
+          }
+        }
+      }
     }
 
     if (preflightError !== null || prompt === null || contextPath === null) {
@@ -482,6 +564,9 @@ export async function startRun(
     const child = spawn(opts.piBin ?? "pi", argv, {
       stdio: ["pipe", "pipe", "pipe"],
       detached: true,
+      // the run's cwd is its worktree subdir when it owns one (the FIRST
+      // read_write target's tree); in-place runs inherit the engine's cwd
+      ...(worktree !== null && worktree.ok && worktree.cwd !== null ? { cwd: worktree.cwd } : {}),
       env: {
         ...process.env,
         NOVAFLOW_RUN_CONTEXT: contextPath,
@@ -659,6 +744,33 @@ export async function startRun(
     }
     pump.flushPartial(buf); // a trailing partial line still belongs in the raw file
 
+    // ---- persist, never auto-delete (data §3: worktrees are cleaned only
+    // when the chain run is terminal AND the operator confirms). The run's
+    // diff + its own commits are recorded whatever the outcome: a failed or
+    // aborted attempt's diff is the evidence root-cause analysis needs.
+    if (worktree !== null && worktree.ok && worktree.root !== null) {
+      try {
+        const recorded = recordRunWorktreeArtifacts(
+          db,
+          runId,
+          runDir,
+          worktree.targets
+            .filter((t) => t.placement === "worktree" && t.path !== null)
+            .map((t) => ({ alias: t.alias, path: t.path!, base_sha: t.base_sha })),
+        );
+        for (const warning of recorded.warnings) {
+          pump.appendEngineLine(JSON.stringify({ type: "novaflow_worktree_warning", message: warning }));
+        }
+      } catch (err) {
+        pump.appendEngineLine(
+          JSON.stringify({
+            type: "novaflow_worktree_warning",
+            message: `artifact recording failed: ${(err as Error).message}`,
+          }),
+        );
+      }
+    }
+
     const cost = costUsdTokens(priceTable, profile.model, {
       input: pump.inputTokens,
       cacheRead: pump.cacheReadTokens,
@@ -800,6 +912,19 @@ export async function startRun(
       });
       attemptKind = "repair";
       repairFeedback = error;
+      // DEBT-014: a repair starts from a FRESH tree, so point it at the
+      // previous attempt's work: its persisted `worktree_root` (migration
+      // 0004, the just-settled run's row — NULL for an in-place run) and its
+      // run dir's `workspace_diff.patch`. The tree is read-only evidence.
+      const previousRun = db
+        .prepare("SELECT worktree_root FROM task_runs WHERE id = ?")
+        .get(runId) as { worktree_root: string | null } | undefined;
+      if (previousRun !== undefined && previousRun.worktree_root !== null) {
+        repairWorktree = {
+          worktreeRoot: previousRun.worktree_root,
+          patchPath: runWorkspacePatchPath(runDir),
+        };
+      }
       continue;
     }
 

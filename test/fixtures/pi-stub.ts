@@ -16,6 +16,10 @@
  *   run-ok         message_update/tool pair/message_end with usage, a valid
  *                  result.json written into --session-dir, then agent_end +
  *                  agent_settled
+ *   run-commit     like run-ok, but first commits WORKTREE.md in the process
+ *                  cwd (one commit of "the agent's own work") and leaves
+ *                  SCRATCH.md uncommitted — exercises the per-run worktree
+ *                  isolation, workspace_diff.patch and git_commits_json
  *   run-cache      same stream, but the message_end usage carries the
  *                  cache-aware shape pi reports (input = FRESH prompt tokens,
  *                  plus cacheRead/cacheWrite) — the cache-accounting fixture
@@ -59,7 +63,7 @@
 
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 const GET_STATE_MODES = new Set(["ok", "silent", "garbage", "wrongid"]);
 const RUN_MODES = new Set([
@@ -67,6 +71,7 @@ const RUN_MODES = new Set([
   "run-hang", "run-overspend", "run-crash", "run-repair-ok",
   "run-crash-stderr", "run-fork-grandchild",
   "run-hang-ignore-term", "run-settle-linger", "run-review", "run-cache",
+  "run-commit",
 ]);
 
 const mode: string | undefined = process.argv[2];
@@ -174,9 +179,13 @@ if (RUN_MODES.has(mode)) {
     }
   }
 
+  // run-commit is run-ok preceded by one commit in the process cwd (the
+  // per-run worktree, when the engine provisioned one).
+  const commits = mode === "run-commit";
   // run-repair-ok is run-ok only on the repair attempt; the execution
   // attempt behaves like run-missing (exercises FR-TSK-06 end to end).
   let effective = mode;
+  if (commits) effective = "run-ok";
   if (mode === "run-repair-ok") {
     effective = context?.["attempt_kind"] === "repair" ? "run-ok" : "run-missing";
   }
@@ -298,6 +307,7 @@ if (RUN_MODES.has(mode)) {
       JSON.stringify(
         {
           prompt: frame["message"] ?? null,
+          cwd: process.cwd(),
           context,
           novflow_run_context: contextPath ?? null,
           argv: process.argv.slice(2),
@@ -307,6 +317,18 @@ if (RUN_MODES.has(mode)) {
         2,
       ) + "\n",
     );
+
+    if (commits) {
+      // the agent's own work lands in ITS cwd (the run's worktree subdir)
+      const cwd = process.cwd();
+      writeFileSync(join(cwd, "WORKTREE.md"), `# worktree ${sessionId}\n`);
+      spawnSync("git", ["add", "WORKTREE.md"], { cwd });
+      const commit = spawnSync("git", ["commit", "-q", "-m", "worktree commit"], { cwd, encoding: "utf8" });
+      if (commit.status !== 0) {
+        process.stderr.write(`pi-stub: run-commit failed: ${String(commit.stderr)}\n`);
+      }
+      writeFileSync(join(cwd, "SCRATCH.md"), "uncommitted work in progress\n");
+    }
 
     if (effective === "run-ok" || effective === "run-blocked" || effective === "run-review" || effective === "run-cache") {
       // result.json is written before the settle signal, like the real extension

@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { connect } from "node:net";
 import { dirname, join } from "node:path";
@@ -6,6 +6,8 @@ import { parseArgs, UsageError, type ArgSpec } from "../args.ts";
 import { daemonRequest, defaultDbPath, novaHome, socketPath } from "../client.ts";
 import { renderKv } from "../format.ts";
 import { EXIT_NOT_FOUND, EXIT_OK, EXIT_OPERATION_FAILED } from "../exitcode.ts";
+import { reapGroup, sleep, tailFile } from "../procs.ts";
+import { withFixHint } from "../../fixhint.ts";
 import type { CommandOpts } from "../opts.ts";
 
 /**
@@ -105,7 +107,12 @@ async function start(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promis
   }
 
   if (existsSync(sock) && (await liveDaemonAnswers(sock))) {
-    console.error(`nova: a live daemon already answers at ${sock} — refusing to start a second one`);
+    console.error(
+      withFixHint(
+        `nova: a live daemon already answers at ${sock} — refusing to start a second one`,
+        "check it with `nova daemon status`, or stop it with `nova daemon stop`",
+      ),
+    );
     return EXIT_OPERATION_FAILED;
   }
   // a stale socket file without a live daemon: the daemon's own bind
@@ -135,7 +142,13 @@ async function start(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promis
     if (existsSync(sock) && (await liveDaemonAnswers(sock))) break;
     if (Date.now() > deadline) {
       await reapGroup(child.pid);
-      console.error(`nova: the daemon did not answer at ${sock} within ${START_BOUND_MS / 1000} s — tail of ${logPath}:`);
+      console.error(
+        withFixHint(
+          `nova: the daemon did not answer at ${sock} within ${START_BOUND_MS / 1000} s`,
+          "read the log tail below, fix the cause it names, then re-run `nova daemon start`",
+        ) +
+          ` — tail of ${logPath}:`,
+      );
       console.error(tailFile(logPath, 10));
       return EXIT_OPERATION_FAILED;
     }
@@ -151,30 +164,7 @@ async function start(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promis
   return EXIT_OK;
 }
 
-/** SIGTERM → bounded grace → SIGKILL on the child's process group. */
-async function reapGroup(pid: number | undefined): Promise<void> {
-  if (pid === undefined) return;
-  const signal = (sig: "SIGTERM" | "SIGKILL"): void => {
-    try {
-      process.kill(-pid, sig);
-      process.kill(pid, sig);
-    } catch {
-      // already gone
-    }
-  };
-  signal("SIGTERM");
-  const deadline = Date.now() + 3000;
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return; // reaped
-    }
-    await sleep(100);
-  }
-  signal("SIGKILL");
-  await sleep(200);
-}
+/* the process-group reaper is ../procs.ts's reapGroup (shared with `nova web stop`) */
 
 async function runForeground(sock: string, home: string, json: boolean): Promise<number> {
   const dbPath = defaultDbPath();
@@ -348,7 +338,12 @@ async function prune(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promis
   if (daysFlag !== undefined) {
     const n = Number(daysFlag);
     if (!Number.isInteger(n) || n < 0) {
-      throw new UsageError("--retention-days must be a non-negative integer (days)");
+      throw new UsageError(
+        withFixHint(
+          "--retention-days must be a non-negative integer (days)",
+          "pass a non-negative whole number of days, e.g. `--retention-days 30`",
+        ),
+      );
     }
     args["retention_days"] = n;
   }
@@ -389,7 +384,12 @@ async function logs(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise
   if (linesFlag !== undefined) {
     const parsed = Number(linesFlag);
     if (!Number.isInteger(parsed) || parsed < 1 || parsed > 1000) {
-      throw new UsageError("--lines must be an integer 1..1000");
+      throw new UsageError(
+        withFixHint(
+          "--lines must be an integer 1..1000",
+          "pass an integer between 1 and 1000, e.g. `--lines 100`",
+        ),
+      );
     }
     n = parsed;
   }
@@ -400,13 +400,4 @@ async function logs(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise
   }
   if (tail !== "") console.log(tail);
   return EXIT_OK;
-}
-
-function tailFile(path: string, n: number): string {
-  const lines = readFileSync(path, "utf8").split("\n").filter((l) => l !== "");
-  return lines.slice(-n).join("\n");
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }

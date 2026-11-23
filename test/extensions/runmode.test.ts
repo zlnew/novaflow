@@ -842,6 +842,99 @@ test("run mode: the tool_call hook enforces scopes without terminate on refusal"
   }
 });
 
+test("run mode: an unanalyzable bash command warns exactly ONCE, naming the command verbatim, and still runs", async () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    const { pi } = buildRunMode(base);
+    await pi.handlers.get("session_start")!({ type: "session_start", reason: "startup" } as SessionStartEvent, fakeCtx(base).ctx);
+
+    // a script body: the syntactic scan finds no write target it can judge
+    const command = "python -c 'open(\"x\",\"w\")()'";
+    const first = await fireToolCall(pi.handlers, "bash", { command }, base);
+    assert.equal(first.result, undefined, "the fallback stays permissible: an unanalyzable command is allowed best-effort");
+    const warnings = first.notes.filter((n) => n.severity === "warning");
+    assert.equal(warnings.length, 1, `exactly one warning, got ${JSON.stringify(first.notes)}`);
+    assert.ok(warnings[0]!.message.includes(command), "the warning names the command verbatim");
+    assert.match(
+      warnings[0]!.message,
+      /not provably within scope — allowed as best-effort/,
+      "the warning names the scope mechanism in one clause",
+    );
+  } finally {
+    delete process.env["NOVAFLOW_RUN_CONTEXT"];
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("run mode: a SECOND unanalyzable bash command in the same session is silent", async () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    const { pi } = buildRunMode(base);
+    await pi.handlers.get("session_start")!({ type: "session_start", reason: "startup" } as SessionStartEvent, fakeCtx(base).ctx);
+
+    const first = await fireToolCall(pi.handlers, "bash", { command: "cat alpha/src/a.ts" }, base);
+    assert.equal(first.notes.filter((n) => n.severity === "warning").length, 1, "the first one warns");
+
+    // the pin: not per-command noise — the second occurrence says nothing
+    const second = await fireToolCall(pi.handlers, "bash", { command: "git diff --stat" }, base);
+    assert.equal(second.result, undefined);
+    assert.deepEqual(second.notes, [], "one warning per session — never per-command noise");
+  } finally {
+    delete process.env["NOVAFLOW_RUN_CONTEXT"];
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("run mode: a destructive bash command BLOCKS and never also warns (block wins over warn)", async () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    const { pi } = buildRunMode(base);
+    await pi.handlers.get("session_start")!({ type: "session_start", reason: "startup" } as SessionStartEvent, fakeCtx(base).ctx);
+
+    const blocked = await fireToolCall(pi.handlers, "bash", { command: "rm -rf alpha/golden" }, base);
+    assert.equal((blocked.result as { block?: boolean }).block, true, "the destructive path keeps its BLOCK");
+    assert.equal((blocked.result as { terminate?: boolean }).terminate, undefined);
+    assert.match((blocked.result as { reason: string }).reason, /protected/);
+    assert.deepEqual(
+      blocked.notes.filter((n) => n.severity === "warning"),
+      [],
+      "a blocked command never also warns — the block IS the operator-visible signal",
+    );
+
+    // the block did not consume the session's one warning
+    const unanalyzable = await fireToolCall(pi.handlers, "bash", { command: "cat alpha/src/a.ts" }, base);
+    assert.equal(unanalyzable.result, undefined);
+    assert.equal(unanalyzable.notes.filter((n) => n.severity === "warning").length, 1);
+  } finally {
+    delete process.env["NOVAFLOW_RUN_CONTEXT"];
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("run mode: a classifiable in-scope bash command neither warns nor blocks — and leaves the one warning unused", async () => {
+  const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
+  try {
+    const { pi } = buildRunMode(base);
+    await pi.handlers.get("session_start")!({ type: "session_start", reason: "startup" } as SessionStartEvent, fakeCtx(base).ctx);
+
+    const inScope = await fireToolCall(pi.handlers, "bash", { command: "echo x > alpha/src/log.txt" }, base);
+    assert.equal(inScope.result, undefined, "an analyzed in-scope write passes");
+    assert.deepEqual(inScope.notes, [], "a classifiable command is not a fallback: no warn, no block");
+
+    // a device sink is adjudicated too (exempt, not unanalyzable)
+    const device = await fireToolCall(pi.handlers, "bash", { command: "echo done > /dev/null" }, base);
+    assert.equal(device.result, undefined);
+    assert.deepEqual(device.notes, [], "the documented device exemption is a verdict, not a fallback");
+
+    // and the session's single warning is still available afterwards
+    const unanalyzable = await fireToolCall(pi.handlers, "bash", { command: "git diff --stat" }, base);
+    assert.equal(unanalyzable.notes.filter((n) => n.severity === "warning").length, 1);
+  } finally {
+    delete process.env["NOVAFLOW_RUN_CONTEXT"];
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test("run mode: submit_result valid → file written + {block, terminate, reason: 'artifact accepted'}", async () => {
   const base = mkdtempSync(join(tmpdir(), "novaflow-ext-"));
   try {

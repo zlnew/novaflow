@@ -1,4 +1,5 @@
 import { appendFileSync, chmodSync, closeSync, openSync } from "node:fs";
+import { join } from "node:path";
 import { redactLine } from "./redact.ts";
 
 /**
@@ -91,6 +92,22 @@ export function createFrameTally(): FrameTally {
  *  ignored (a non-cache stream simply reports no cache components). */
 function nonNegative(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * The engine-authored REDACTED line for a run directory, for frames that must
+ * exist BEFORE a pump does (the worktree provisioning report lands before the
+ * child is spawned). It lives here because pump.ts is the ONE writer of the
+ * redacted stream (pinned by test/security/redaction-audit.test.ts): this
+ * helper is the second entry of that one choke point, and it routes through
+ * the same `redactLine` the pump uses.
+ */
+export function appendRunEngineFrame(runDir: string, frame: unknown): void {
+  // resolved into a local first: the structural pin (redaction-audit) keeps
+  // createPump's parameters — not a literal filename — as this module's write
+  // surface, and the writer still lives ONLY here
+  const redacted = join(runDir, "events.jsonl");
+  appendFileSync(redacted, redactLine(JSON.stringify(frame)) + "\n");
 }
 
 /**

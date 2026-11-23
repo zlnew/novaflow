@@ -1,10 +1,19 @@
 import { connect, createServer, type Socket } from "node:net";
-import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmdirSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import type { Db } from "../store/db.ts";
 import { ulid } from "../store/ids.ts";
 import { applyTransition, InvalidTransitionError } from "../fsm/engine.ts";
+import { withFixHint, IMPORT_GRAPH_FIX } from "../fixhint.ts";
 import {
   createTask,
   enqueueTask,
@@ -78,6 +87,7 @@ import {
   ChainValidationError,
 } from "../chain/import.ts";
 import { memberReadiness, type ChainEvaluator } from "../chain/readiness.ts";
+import { chainVerificationReport } from "../chain/verify.ts";
 import { deliveredFeedbackPaths, driveSelfPathRequeue, type RoutingEvaluator } from "../chain/routing.ts";
 import { parseYaml, YamlParseError } from "../chain/yaml.ts";
 import {
@@ -93,6 +103,13 @@ import {
   workspaceList as readWorkspaceList,
   runLogsSince as readRunLogsSince,
 } from "./readops.ts";
+import {
+  invalidTargetAlias,
+  pruneWorktrees,
+  removeWorktree,
+  runWorktreeTargets,
+  worktreeIsDirty,
+} from "../runs/worktrees.ts";
 import {
   OpError,
   optBoolean,
@@ -229,6 +246,11 @@ export type ControlServer = {
  * (repo_alias + access_mode, optional string-array fields; column
  * defaults apply when omitted).
  */
+function failImport(message: string): never {
+  // W4 R4.3: the graph-import refusal names the operator's next move.
+  throw new OpError("schema_invalid", withFixHint(message, IMPORT_GRAPH_FIX));
+}
+
 function parseOverridesArg(args: Record<string, unknown>): Record<string, unknown> | undefined {
   const v = args["overrides"];
   if (v === undefined) return undefined;
@@ -394,6 +416,13 @@ function parseTargetsArg(args: Record<string, unknown>): ProjectTargetInput[] | 
       }
     }
     const alias = reqString(o, "alias");
+    const badAlias = invalidTargetAlias(alias);
+    if (badAlias !== null) {
+      throw new OpError(
+        "schema_invalid",
+        `args.targets alias is invalid: ${badAlias}`,
+      );
+    }
     const rootPath = reqString(o, "root_path");
     const targetType = o["target_type"];
     if (targetType !== "git_repo" && targetType !== "directory") {
@@ -447,7 +476,13 @@ function resolveProfileByName(db: Db, projectId: string, name: string): string {
   // lifecycle verbs resolve through the very same statement.
   const row = resolveProfileRow(db, name, project.workspace_id);
   if (!row) {
-    throw new OpError("not_found", `no profile named "${name}" in the project's workspace`);
+    throw new OpError(
+      "not_found",
+      withFixHint(
+        `no profile named "${name}" in the project's workspace`,
+        "list the workspace and global profiles with `nova profile list --workspace <slug>` and use an exact name",
+      ),
+    );
   }
   if (process.env["NF_DEBUG_PROFILE"] === "1") {
   }
@@ -512,7 +547,7 @@ export function buildOpTable(): Map<string, OpHandler> {
       : null;
     if (bare !== null) {
       const task = getTask(deps.db, bare);
-      if (!task) throw new OpError("not_found", `no such task: ${ident}`);
+      if (!task) throw new OpError("not_found", withFixHint(`no such task: ${ident}`, "list tasks with `nova task list`"));
       return { task };
     }
     // the human key: resolved within the workspace context — the CLI's
@@ -534,7 +569,7 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (rows.length === 0) {
       throw new OpError(
         "not_found",
-        `no task with key "${ident}" in workspace "${workspace.slug}"`,
+        withFixHint(`no task with key "${ident}" in workspace "${workspace.slug}"`, "list tasks with `nova task list`"),
       );
     }
     if (rows.length > 1) {
@@ -544,7 +579,7 @@ export function buildOpTable(): Map<string, OpHandler> {
       );
     }
     const task = getTask(deps.db, rows[0]!.id);
-    if (!task) throw new OpError("not_found", `no such task: ${rows[0]!.id}`);
+    if (!task) throw new OpError("not_found", withFixHint(`no such task: ${rows[0]!.id}`, "list tasks with `nova task list`"));
     return { task };
   });
 
@@ -721,14 +756,20 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (!WORKSPACE_NAME_PATTERN.test(name)) {
       throw new OpError(
         "schema_invalid",
-        `workspace name must be lower-case kebab-case (${WORKSPACE_NAME_PATTERN}), got "${name}"`,
+        withFixHint(
+          `workspace name must be lower-case kebab-case (${WORKSPACE_NAME_PATTERN}), got "${name}"`,
+          'use lower-case letters, digits and hyphens, e.g. "my-workspace"',
+        ),
       );
     }
     const rootPath = resolve(reqString(args, "root_path"));
     if (!isWritableDirectory(rootPath)) {
       throw new OpError(
         "schema_invalid",
-        `root_path is not an existing writable directory: ${rootPath}`,
+        withFixHint(
+          `root_path is not an existing writable directory: ${rootPath}`,
+          "create the directory (`mkdir -p <path>`), make it writable, then re-run `nova workspace create`",
+        ),
       );
     }
     if (deps.db.prepare("SELECT id FROM workspaces WHERE slug = ?").get(name) !== undefined) {
@@ -812,7 +853,10 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (!PROJECT_NAME_PATTERN.test(name)) {
       throw new OpError(
         "schema_invalid",
-        `project name must be lower-case kebab-case (${PROJECT_NAME_PATTERN}), got "${name}"`,
+        withFixHint(
+          `project name must be lower-case kebab-case (${PROJECT_NAME_PATTERN}), got "${name}"`,
+          'use lower-case letters, digits and hyphens, e.g. "my-project"',
+        ),
       );
     }
     const objective = reqString(args, "objective");
@@ -991,7 +1035,10 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (!row) {
       throw new OpError(
         "not_found",
-        `no profile named "${name}" in ${workspace ? `workspace "${workspace.slug}" or the global scope` : "the global scope"}`,
+        withFixHint(
+          `no profile named "${name}" in ${workspace ? `workspace "${workspace.slug}" or the global scope` : "the global scope"}`,
+          "list the profiles in scope with `nova profile list`",
+        ),
       );
     }
     // the scope actually acted on comes from the ROW, not the request
@@ -1057,7 +1104,10 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (!row) {
       throw new OpError(
         "not_found",
-        `no profile named "${name}" in ${workspace ? `workspace "${workspace.slug}" or the global scope` : "the global scope"}`,
+        withFixHint(
+          `no profile named "${name}" in ${workspace ? `workspace "${workspace.slug}" or the global scope` : "the global scope"}`,
+          "list the profiles in scope with `nova profile list`",
+        ),
       );
     }
     const scope = row.workspace_id === null ? "global" : "workspace";
@@ -1066,7 +1116,10 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (pins > 0) {
       throw new OpError(
         "schema_invalid",
-        `profile "${name}" (${scopeLabel}) is pinned by ${pins} task${pins === 1 ? "" : "s"} — a pinned profile is never deleted (tasks.profile_id is ON DELETE RESTRICT); reassign or delete those tasks first`,
+        withFixHint(
+          `profile "${name}" (${scopeLabel}) is pinned by ${pins} task${pins === 1 ? "" : "s"} — a pinned profile is never deleted (tasks.profile_id is ON DELETE RESTRICT)`,
+          "pin new tasks to a different profile (`nova task create … --profile <other>`), since v1 has no task reassign or delete",
+        ),
       );
     }
     const canonicalPath =
@@ -1167,12 +1220,15 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
          JOIN workspaces w ON w.id = p.workspace_id WHERE t.id = ?`,
     )
     .get(taskId) as { status: string; slug: string } | undefined;
-  if (row === undefined) throw new OpError("not_found", `no such task: ${taskId}`);
+  if (row === undefined) throw new OpError("not_found", withFixHint(`no such task: ${taskId}`, "list tasks with `nova task list`"));
   if (row.status !== "active") {
     throw new OpError(
       "aborted",
-      `workspace "${row.slug}" is ${row.status} — task execution is disabled (FR-WS-03); ` +
-        "dispatch will never admit this task. Unarchive is not a v1 surface.",
+      withFixHint(
+        `workspace "${row.slug}" is ${row.status} — task execution is disabled (FR-WS-03); ` +
+          "dispatch will never admit this task. Unarchive is not a v1 surface.",
+        "create a new workspace with `nova workspace create <name> --path <dir>` and re-create the task there",
+      ),
     );
   }
 }
@@ -1200,7 +1256,7 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
       actor: optString(args, "actor", "operator"),
     });
     if (decision.kind === "not-failed") {
-      throw new OpError("not_found", `no such task: ${taskId}`);
+      throw new OpError("not_found", withFixHint(`no such task: ${taskId}`, "list tasks with `nova task list`"));
     }
     deps.dispatcher.requestDispatch();
     return { decision };
@@ -1362,12 +1418,18 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
    * never retargets the import. Without `workspace_id`, the graph's
    * project_slug must resolve unambiguously across workspaces (a slug
    * repeated in N workspaces is a truthful duplicate refusal).
+   *
+   * Every member REQUIRES `target_scopes` (v0.3.0 amendment row 5,
+   * DEBT-011): the validator refuses a scopeless member as
+   * `schema_invalid`, naming the member key and the fix, BEFORE any
+   * write — a member without scopes could only ever produce a chain the
+   * enqueue guard refuses (a chain row stuck `active`).
    */
   ops.set("nova_project_import_dag", (args, { deps }) => {
     const graphText = reqString(args, "graph_text");
     const format = args["format"];
     if (format !== undefined && format !== "json" && format !== "yaml") {
-      throw new OpError("schema_invalid", 'args.format must be "json" or "yaml"');
+      failImport('args.format must be "json" or "yaml"');
     }
     // YamlParseError propagates to toErrorPayload (schema_invalid, line named)
     const graph: unknown =
@@ -1378,29 +1440,24 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
               return JSON.parse(graphText) as unknown;
             } catch (jsonErr) {
               if (format === "json") {
-                throw new OpError(
-                  "schema_invalid",
-                  `graph_text is not valid JSON: ${(jsonErr as Error).message}`,
-                );
+                failImport(`graph_text is not valid JSON: ${(jsonErr as Error).message}`);
               }
               // auto (documented): JSON first, then the YAML subset
               return parseYaml(graphText);
             }
           })();
     if (typeof graph !== "object" || graph === null || Array.isArray(graph)) {
-      throw new OpError("schema_invalid", "the chain graph must be a JSON/YAML object");
+      failImport("the chain graph must be a JSON/YAML object");
     }
     const obj = graph as Record<string, unknown>;
     if (typeof obj["project_slug"] !== "string" || obj["project_slug"] === "") {
-      throw new OpError(
-        "schema_invalid",
+      failImport(
         'the chain graph must declare a non-empty string "project_slug" (§4.3 required key)',
       );
     }
     const slug = obj["project_slug"];
     if (args["project_slug"] !== undefined && args["project_slug"] !== slug) {
-      throw new OpError(
-        "schema_invalid",
+      failImport(
         `the graph declares project_slug "${slug}" but "${String(args["project_slug"])}" was given — mismatch refused (the schema carries project_slug)`,
       );
     }
@@ -1412,14 +1469,23 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
         .prepare("SELECT id, workspace_id, slug FROM projects WHERE workspace_id = ? AND slug = ?")
         .get(workspace.id, slug) as { id: string; workspace_id: string; slug: string } | undefined;
       if (project === undefined) {
-        throw new OpError("not_found", `no project "${slug}" in workspace "${workspace.slug}"`);
+        throw new OpError(
+          "not_found",
+          withFixHint(
+            `no project "${slug}" in workspace "${workspace.slug}"`,
+            "list projects with `nova project list --workspace <slug>` and use an exact slug",
+          ),
+        );
       }
     } else {
       const rows = deps.db
         .prepare("SELECT id, workspace_id, slug FROM projects WHERE slug = ?")
         .all(slug) as Array<{ id: string; workspace_id: string; slug: string }>;
       if (rows.length === 0) {
-        throw new OpError("not_found", `no project "${slug}" in any workspace`);
+        throw new OpError(
+          "not_found",
+          withFixHint(`no project "${slug}" in any workspace`, "list projects with `nova project list` and use an exact slug"),
+        );
       }
       if (rows.length > 1) {
         throw new OpError(
@@ -1494,6 +1560,24 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
       feedback: deliveredFeedbackPaths(deps.db, m.id),
     }));
     return { chain, members, paused: deps.pausedChains.has(chainRunId) };
+  });
+
+  /**
+   * `nova chain verify <chain-run-id>` (srs 4.1.1 + novaflow-v030 amendments
+   * row 4 — DEBT-006): per member, over its NEWEST run, the verification
+   * commands configured at run time versus the commands the engine actually
+   * executed with their exit status. READ-ONLY: the body only reads the
+   * chain/task/run rows and the run's own artifacts (events frame,
+   * engine-context snapshot, §4.1 block) — never the task's current config,
+   * which is not evidence about a run that already happened. The UNEXECUTED
+   * verdict is the CLI's exit contract (engine-state, exit 3), not an error
+   * frame: the report itself always answers `ok`, so `--json` stays parseable.
+   */
+  ops.set("nova_chain_verify", (args, { deps }) => {
+    const chainRunId = reqString(args, "chain_run_id");
+    const report = chainVerificationReport(deps.db, chainRunId);
+    if (report === undefined) throw new OpError("not_found", `no such chain run: ${chainRunId}`);
+    return report;
   });
 
   /**
@@ -1606,6 +1690,138 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
     deps.pausedChains.delete(chainRunId);
     const propagation = await deps.chains.propagateChain(chainRunId);
     return { chain_run_id: chainRunId, paused: false, enqueued: propagation.enqueued };
+  });
+
+  /**
+   * `nova chain clean <chain-run-id> [--force]` (srs 4.1.1 "Chain clean";
+   * novaflow-v030 amendments row 2) — the operator confirmation `data` 3.x
+   * presupposes for worktree cleanup.
+   *
+   * RULES (the contract, verbatim): refuses a chain whose row is not
+   * terminal (naming the state); refuses a member run whose worktree has
+   * uncommitted changes unless `--force`, NAMING THE RUN; removes the
+   * worktrees and prunes; reports every removed tree; NEVER deletes a run
+   * row or its artifacts — `task_runs.worktree_root` is history.
+   *
+   * The refusal is planned BEFORE anything is removed, so a refused clean
+   * leaves every tree exactly as it was.
+   */
+  ops.set("nova_chain_clean", (args, { deps }) => {
+    const chainRunId = reqString(args, "chain_run_id");
+    const force = optBoolean(args, "force") === true;
+    const chain = getChainRun(deps.db, chainRunId);
+    if (chain === undefined) throw new OpError("not_found", `no such chain run: ${chainRunId}`);
+    if (chain.state === "active") {
+      throw new OpError(
+        "invalid_transition",
+        `chain run ${chainRunId} is active — worktree cleanup is the post-terminal confirmation (data §3): wait for completed/failed/aborted, or abort the chain first`,
+      );
+    }
+    const rows = deps.db
+      .prepare(
+        `SELECT r.id AS run_id, r.task_id, r.worktree_root, t.key
+           FROM task_runs r JOIN tasks t ON t.id = r.task_id
+          WHERE t.chain_run_id = ? AND r.worktree_root IS NOT NULL
+          ORDER BY r.started_at, r.id`,
+      )
+      .all(chainRunId) as Array<{
+      run_id: string;
+      task_id: string;
+      worktree_root: string;
+      key: string;
+    }>;
+
+    type Removal = { run_id: string; task_id: string; key: string; path: string; repoRoot: string; dirty: boolean; exists: boolean; error: string | null };
+    const planned: Removal[] = [];
+    for (const row of rows) {
+      for (const target of runWorktreeTargets(deps.db, row.task_id, row.worktree_root)) {
+        const exists = existsSync(target.path);
+        const state = exists ? worktreeIsDirty(target.path) : { dirty: false, error: null };
+        planned.push({
+          run_id: row.run_id,
+          task_id: row.task_id,
+          key: row.key,
+          path: target.path,
+          repoRoot: target.repoRoot,
+          dirty: state.dirty,
+          exists,
+          error: exists ? state.error : null,
+        });
+      }
+    }
+
+    const dirty = planned.filter((p) => p.exists && p.dirty);
+    // FAIL CLOSED (must-fix): a worktree whose dirtiness CANNOT be assessed
+    // (broken .git, missing main repo) is treated as holding work — an
+    // unassessable tree must never be silently removed as "clean"
+    const unassessable = planned.filter((p) => p.exists && p.error !== null);
+    if ((dirty.length > 0 || unassessable.length > 0) && !force) {
+      const first = dirty[0] ?? unassessable[0]!;
+      const why =
+        dirty.length > 0
+          ? `has uncommitted changes in ${first.path}`
+          : `could not be assessed in ${first.path} — ${first.error}`;
+      throw new OpError(
+        "invalid_transition",
+        `chain run ${chainRunId}: run ${first.run_id} (task ${first.key}) ${why}` +
+          `${dirty.length + unassessable.length > 1 ? ` (+${dirty.length + unassessable.length - 1} more)` : ""} — refusing to remove a worktree that holds (or may hold) work; commit or discard it, or re-run with --force`,
+      );
+    }
+
+    const removed: Array<{ run_id: string; task_id: string; key: string; path: string; forced: boolean }> = [];
+    const missing: string[] = [];
+    const failed: Array<{ path: string; error: string }> = [];
+    const repos = new Set<string>();
+    for (const item of planned) {
+      if (!item.exists) {
+        missing.push(item.path);
+        if (existsSync(item.repoRoot)) repos.add(item.repoRoot);
+        continue;
+      }
+      const res = removeWorktree(item.repoRoot, item.path, force && (item.dirty || item.error !== null));
+      if (!res.ok) {
+        failed.push({ path: item.path, error: res.error ?? "git worktree remove failed" });
+        continue;
+      }
+      removed.push({
+        run_id: item.run_id,
+        task_id: item.task_id,
+        key: item.key,
+        path: item.path,
+        forced: force && (item.dirty || item.error !== null),
+      });
+      repos.add(item.repoRoot);
+    }
+    // the run's ROOT is the engine's own container: when its last subdirectory
+    // is gone it is removed too (rmdir only — an occupied directory is never
+    // touched, so nothing outside the root can be lost)
+    for (const row of rows) {
+      try {
+        if (existsSync(row.worktree_root) && readdirSync(row.worktree_root).length === 0) {
+          rmdirSync(row.worktree_root);
+        }
+      } catch {
+        // a concurrently written entry wins: leave the root alone
+      }
+    }
+    const pruned: string[] = [];
+    for (const repoRoot of repos) {
+      const res = pruneWorktrees(repoRoot);
+      if (res.ok) pruned.push(repoRoot);
+      else failed.push({ path: repoRoot, error: res.error ?? "git worktree prune failed" });
+    }
+
+    return {
+      chain_run_id: chainRunId,
+      state: chain.state,
+      forced: force,
+      removed,
+      missing,
+      pruned,
+      failed,
+      // the rows and their artifacts are history: reported, never touched
+      runs_kept: rows.length,
+    };
   });
 
   /* ------------------------ schedule ops (FR-SCH-01/03) ----------------------- */

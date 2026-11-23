@@ -100,10 +100,13 @@ function notifierFor(db: Db, taskId: string, opts: RecoveryOptions): HaltNotifie
 function withPricesNoteFactory(
   source: "file" | "missing" | "invalid",
   maxCostUsd: number,
+  pricesPath: string,
 ): (summary: string | null) => string | null {
   return (summary: string | null): string | null => {
     if (source !== "file" && maxCostUsd > 0) {
-      return summary === null ? inertPricesNote(source) : summary + "\n" + inertPricesNote(source);
+      return summary === null
+        ? inertPricesNote(source, pricesPath)
+        : summary + "\n" + inertPricesNote(source, pricesPath);
     }
     return summary;
   };
@@ -119,7 +122,8 @@ function withPricesNoteFactory(
 export function recoverOrphanedRuns(db: Db, opts: RecoveryOptions = {}): RecoveryReport {
   const report: RecoveryReport = { replayed: [], failedIntake: [], crashed: [] };
 
-  const priceLoad = loadPricesDetailed(opts.pricesPath ?? defaultPricesPath());
+  const pricesPath = opts.pricesPath ?? defaultPricesPath();
+  const priceLoad = loadPricesDetailed(pricesPath);
   const priceTable: PriceTable = priceLoad.table;
   const notify: Array<Promise<NotifyResult>> = [];
 
@@ -157,7 +161,7 @@ export function recoverOrphanedRuns(db: Db, opts: RecoveryOptions = {}): Recover
             .get(row.profile_id) as { max_cost_usd: number } | undefined
         )?.max_cost_usd ?? 0
       : 0;
-    const pricesNote = withPricesNoteFactory(priceLoad.source, profileMaxCost);
+    const pricesNote = withPricesNoteFactory(priceLoad.source, profileMaxCost, pricesPath);
     const parsedWall = Date.parse(row.started_at);
     const wall = Number.isFinite(parsedWall) ? parsedWall : Date.now();
     const crashNotify = notifierFor(db, row.task_id, opts);
