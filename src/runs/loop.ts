@@ -311,7 +311,8 @@ export async function startRun(
     throw new InvalidTransitionError(task.state, START_TRIGGER);
   }
 
-  const priceLoad = loadPricesDetailed(opts.pricesPath ?? defaultPricesPath());
+  const pricesPath = opts.pricesPath ?? defaultPricesPath();
+  const priceLoad = loadPricesDetailed(pricesPath);
   const priceTable: PriceTable = priceLoad.table;
   const extensionPath = opts.extensionPath ?? defaultExtensionPath();
 
@@ -348,8 +349,8 @@ export async function startRun(
     const withPricesNote = (summary: string | null): string | null =>
       priceLoad.source !== "file" && effective.maxCostUsd > 0
         ? summary === null
-          ? inertPricesNote(priceLoad.source)
-          : summary + "\n" + inertPricesNote(priceLoad.source)
+          ? inertPricesNote(priceLoad.source, pricesPath)
+          : summary + "\n" + inertPricesNote(priceLoad.source, pricesPath)
         : summary;
 
     insertRunRow(db, {

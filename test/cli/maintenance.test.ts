@@ -235,8 +235,16 @@ test("nova daemon prune: a bad --retention-days is a usage error (exit 2), never
 });
 
 test("nova help names the new verbs: daemon backup/prune and docs list (the 4.1.1 amendment)", () => {
+  // P12 (R4.1): an EXPLICIT `nova help` is a request, not a mistake — the
+  // overview on stdout, exit 0. The mistake (bare `nova`) keeps the v1 usage
+  // semantics, which is the assertion below it.
   const res = runNova(["help"], {});
-  assert.equal(res.code, 2);
-  assert.match(res.stderr, /nova daemon start.*backup.*prune/s);
-  assert.match(res.stderr, /nova docs list/);
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /nova daemon start.*backup.*prune/s);
+  assert.match(res.stdout, /nova docs list/);
+
+  const bare = runNova([], {});
+  assert.equal(bare.code, 2);
+  assert.match(bare.stderr, /nova daemon start.*backup.*prune/s);
+  assert.match(bare.stderr, /nova docs list/);
 });

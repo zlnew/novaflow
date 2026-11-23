@@ -1,4 +1,5 @@
 import { EXIT_OK } from "../exitcode.ts";
+import { parseArgs, UsageError } from "../args.ts";
 import { socketPath as defaultSocketPath, defaultDbPath } from "../client.ts";
 import type { CommandOpts } from "../opts.ts";
 
@@ -38,11 +39,11 @@ import type { CommandOpts } from "../opts.ts";
  */
 export async function mcpCommand(argv: string[], opts: CommandOpts): Promise<number> {
   // A stray positional would silently be ignored — refuse instead of
-  // pretending `nova mcp something` means `nova mcp`.
-  const positionals = argv.filter((t) => !t.startsWith("--"));
-  if (positionals.length > 0) {
-    console.error(`nova: mcp takes no arguments (got "${positionals.join(" ")}")`);
-    return 2;
+  // pretending `nova mcp something` means `nova mcp`. An unknown FLAG is the
+  // parser's usage error (exit 2 + this verb's usage block, W4 R4.1).
+  const p = parseArgs(argv, {});
+  if (p.positionals.length > 0) {
+    throw new UsageError(`nova mcp takes no arguments (got "${p.positionals.join(" ")}")`);
   }
   void opts;
   try {

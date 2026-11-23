@@ -4,6 +4,7 @@ import { applyTransition, canTransition, InvalidTransitionError } from "./fsm/en
 import { ROWS } from "./fsm/matrix.ts";
 import { ProfileValidationError, validateProfile } from "./profiles.ts";
 import { OpError } from "./opcodes.ts";
+import { withFixHint } from "./fixhint.ts";
 import {
   probeCatalog,
   ProfileUnresolvedError,
@@ -255,7 +256,10 @@ export async function enqueueTask(
   if (scopeCount === 0) {
     throw new OpError(
       "schema_invalid",
-      `task ${taskId} carries no target_scopes — an unscoped run would execute unconfined in the daemon process's cwd (DEBT-010); the guarded draft→queued transition refuses. Add target_scopes (mcp.md §3.2) and retry.`,
+      withFixHint(
+        `task ${taskId} carries no target_scopes — an unscoped run would execute unconfined in the daemon process's cwd (DEBT-010); the guarded draft→queued transition refuses`,
+        "add a scope to the task (nova task create … --scope <repo_alias>[:read_only|read_write]) and re-run `nova task run <id|key>`",
+      ),
     );
   }
 

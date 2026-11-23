@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { withFixHint } from "../fixhint.ts";
 
 /**
  * Cost attribution per novaflow-v1/data 4.4: `task_runs.cost_usd` is
@@ -44,10 +45,19 @@ export function defaultPricesPath(): string {
 
 /** One-line finalization note when the cost breaker is running inert —
  *  derived from the actual failure source so an operator with a CORRUPT
- *  prices.json is not told the file is missing (re-judge finding 2). */
-export function inertPricesNote(source: PricesSource): string {
+ *  prices.json is not told the file is missing (re-judge finding 2).
+ *
+ *  W4 R4.3: an unarmed breaker names the fix, every time it is reported —
+ *  the path to write and the rates an armed row needs. */
+export function inertPricesNote(
+  source: PricesSource,
+  pricesPath: string = defaultPricesPath(),
+): string {
   const why = source === "missing" ? "missing" : "unparseable";
-  return `prices.json ${why} — cost budget enforcement inert`;
+  return withFixHint(
+    `prices.json ${why} — cost budget enforcement inert`,
+    `write ${pricesPath} with this model's per-1M-token rates (input, output, cacheRead, cacheWrite) — every later run re-reads it — then re-run the task (nova task retry <id|key>)`,
+  );
 }
 
 export type PricesSource = "file" | "missing" | "invalid";

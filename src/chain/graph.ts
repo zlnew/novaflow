@@ -1,3 +1,4 @@
+import { withFixHint, IMPORT_GRAPH_FIX } from "../fixhint.ts";
 import type { Db } from "../store/db.ts";
 
 /**
@@ -233,7 +234,13 @@ function typeLabel(v: unknown): string {
 }
 
 function fail(code: ChainErrorCode, message: string): never {
-  throw new ChainValidationError(code, message);
+  // W4 R4.3: an import refusal names the operator's next move. The graph file
+  // is the only input of this validator, so every schema_invalid refusal ends
+  // with the same fix (edit the file, re-run the import).
+  throw new ChainValidationError(
+    code,
+    code === "schema_invalid" ? withFixHint(message, IMPORT_GRAPH_FIX) : message,
+  );
 }
 
 function expectObject(
