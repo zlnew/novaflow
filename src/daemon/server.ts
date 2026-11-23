@@ -77,6 +77,7 @@ import {
   runLogs as readRunLogs,
   taskList as readTaskList,
   taskStatus as readTaskStatus,
+  transitionsSince as readTransitionsSince,
   workspaceList as readWorkspaceList,
 } from "./readops.ts";
 import {
@@ -606,6 +607,23 @@ export function buildOpTable(): Map<string, OpHandler> {
   });
 
   ops.set("nova_daemon_status", (_args, { deps }) => deps.daemonStatus());
+
+  /**
+   * `nova_transitions_since` (novaflow-v02/events.md — the v0.2.0 transition
+   * stream). The cursor rules, the head semantics and the read-only pledge
+   * live in the shared body (src/daemon/readops.ts) so every surface serves
+   * the identical page; the op table only routes.
+   *
+   * Argument validation happens in that body (it validates `cursor`,
+   * `limit`, the four scope ids uniformly), so the op passes the args
+   * through rather than pre-validating a subset here.
+   *
+   * Daemon-down rule (events.md rule 6): this op has NO SQLite fallback —
+   * src/mcp/server.ts keeps it out of the store-backed read path, because a
+   * liveness feed served from a store whose writer just died would report a
+   * frozen world as current.
+   */
+  ops.set("nova_transitions_since", (args, { deps }) => readTransitionsSince(deps.db, args));
 
   /* -------------------- storage maintenance (p7; data.md 1.1/1.2) -------------------- */
 

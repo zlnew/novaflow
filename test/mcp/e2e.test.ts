@@ -117,7 +117,8 @@ test("e2e over stdio: nova mcp drives create → run → gate approve against a 
     const connected = client;
 
     const tools = await withBound(t.signal, BOUND_MS, connected.listTools());
-    assert.equal(tools.tools.length, 16, "the catalog is served over the real stdio wiring");
+    // 17 = the 16 v1 catalog rows + v0.2.0's nova_events_since (amendments.md row 2)
+    assert.equal(tools.tools.length, 17, "the catalog is served over the real stdio wiring");
     for (const tool of tools.tools) {
       assert.match(tool.name, /^nova_/);
       assert.equal(tool.inputSchema.type, "object");

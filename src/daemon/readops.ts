@@ -24,7 +24,7 @@ import { listTasks } from "../tasks.ts";
 import { getWorkspace, listWorkspaces } from "../workspaces.ts";
 import { getProject, listProjects } from "../projects.ts";
 import { validateArtifact, type TaskHandoffArtifact } from "../runs/artifact.ts";
-import { OpError } from "../opcodes.ts";
+import { OpError, optNonEmptyString } from "../opcodes.ts";
 
 export type RunRow = {
   id: string;
@@ -202,4 +202,183 @@ export function taskList(db: Db, args: Record<string, unknown>): Record<string, 
 /** Kept for symmetry with the op table's project lookup (read-only). */
 export function projectExists(db: Db, projectId: string): boolean {
   return getProject(db, projectId) !== undefined;
+}
+
+/* ---------------- nova_transitions_since (novaflow-v02/events.md) ---------------- */
+
+/**
+ * The public projection of one `state_transition_logs` row, exactly as
+ * events.md lists it, plus the joined readability fields.
+ *
+ * Two projection rulings the spec leaves to the implementation (both
+ * documented here rather than hidden in the SQL):
+ *   - `chain_run_id` is the TASK's chain membership (`tasks.chain_run_id`
+ *     — the transition table has no chain column), so a chain member's
+ *     rows are attributable to its chain run without a second join table.
+ *   - `chain_slug` is the chain run's PROJECT slug: `chain_runs` carries
+ *     no slug column (data.md DDL), so the readable name of a chain run
+ *     can only be the project it was imported into.
+ */
+export type TransitionEvent = {
+  cursor: number;
+  task_id: string;
+  run_id: string | null;
+  chain_run_id: string | null;
+  task_key: string;
+  chain_slug: string | null;
+  from_state: string;
+  to_state: string;
+  trigger_type: string;
+  actor: string;
+  reason: string | null;
+  created_at: string;
+};
+
+export type TransitionsPage = {
+  transitions: TransitionEvent[];
+  next_cursor: number;
+  has_more: boolean;
+};
+
+const DEFAULT_TRANSITION_LIMIT = 100;
+const MAX_TRANSITION_LIMIT = 1000;
+
+/** An optional integer arg with a documented range, else `schema_invalid`. */
+function intArg(
+  args: Record<string, unknown>,
+  key: string,
+  min: number,
+  max: number,
+): number | undefined {
+  const v = args[key];
+  if (v === undefined) return undefined;
+  if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) {
+    throw new OpError(
+      "schema_invalid",
+      max === Number.MAX_SAFE_INTEGER
+        ? `args.${key} must be an integer >= ${min}`
+        : `args.${key} must be an integer ${min}..${max}`,
+    );
+  }
+  return v;
+}
+
+/**
+ * `nova_transitions_since` — the v0.2.0 transition stream (frozen contract:
+ * novaflow-v02/events.md). Every consumer (wake, `--watch`/`--follow`, the
+ * v0.2.1 panel) polls it; there is no push and no protocol change.
+ *
+ * CURSOR INVARIANT (pinned by events.md rule 1, MUST be read before ever
+ * adding a delete verb): the cursor is `state_transition_logs.rowid`,
+ * compared strictly as `rowid > cursor`. That is sound ONLY while
+ * transition rows are never deleted — the table's `id TEXT` PRIMARY KEY
+ * carries no AUTOINCREMENT, so SQLite may REUSE the rowid of a deleted
+ * maximum row, which would silently re-deliver or skip transitions to a
+ * caller holding the old cursor. v0.2.0 ships no transition-delete
+ * surface (and `workspace unregister` removes registry entries without
+ * deleting rows). If a task-delete surface (and its ON DELETE CASCADE)
+ * ever lands, this contract must FIRST gain a monotonic sequence column;
+ * a delete verb without it is a defect, not an enhancement.
+ *
+ * Head semantics (rule 2): `cursor: 0` means "start at head" — the most
+ * recent `limit` rows in ASCENDING rowid order, `next_cursor` the highest
+ * returned rowid, `has_more: false`. Older history is not observable by
+ * design: this feed is for liveness, the store remains the audit truth.
+ *
+ * Paging (rule 3): `rowid > cursor` ordered ascending, at most `limit`
+ * rows, `has_more` true iff a greater rowid exists beyond the page. Scope
+ * filters are part of the WHERE clause, so they apply BEFORE the limit:
+ * a busy workspace can never crowd a filtered task's rows out of a page.
+ * An empty page echoes the cursor (nothing to advance to) — the drain
+ * loop terminates because `next_cursor` advances strictly on every page
+ * that carries rows and the store is finite.
+ *
+ * Read-only (rule 4): SELECTs only — it serves from WAL-safe SQLite and
+ * writes nothing.
+ *
+ * A NOTE ON THE "ACTIVE WORKSPACE" DEFAULT (rule table: `workspace_id`
+ * "default the active workspace"): the daemon holds NO active-workspace
+ * marker — the active workspace is CLI-local state (no switch op exists,
+ * documented in src/daemon/server.ts). An absent `workspace_id` therefore
+ * scopes to every workspace, exactly like the other list ops.
+ */
+export function transitionsSince(
+  db: Db,
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  const cursor = intArg(args, "cursor", 0, Number.MAX_SAFE_INTEGER) ?? 0;
+  const limit = intArg(args, "limit", 1, MAX_TRANSITION_LIMIT) ?? DEFAULT_TRANSITION_LIMIT;
+  const workspaceId = optNonEmptyString(args, "workspace_id");
+  const projectId = optNonEmptyString(args, "project_id");
+  const taskId = optNonEmptyString(args, "task_id");
+  const chainRunId = optNonEmptyString(args, "chain_run_id");
+  // events.md rule 5: not_found for unknown workspace/project ids. task_id
+  // and chain_run_id are SCOPE, not lookups: an unknown one is an honest
+  // empty page (the spec names only the two registry scopes).
+  if (workspaceId !== undefined && getWorkspace(db, workspaceId) === undefined) {
+    throw new OpError("not_found", `no such workspace: ${workspaceId}`);
+  }
+  if (projectId !== undefined && getProject(db, projectId) === undefined) {
+    throw new OpError("not_found", `no such project: ${projectId}`);
+  }
+
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (workspaceId !== undefined) {
+    where.push("tp.workspace_id = ?");
+    params.push(workspaceId);
+  }
+  if (projectId !== undefined) {
+    where.push("tp.id = ?");
+    params.push(projectId);
+  }
+  if (taskId !== undefined) {
+    where.push("t.id = ?");
+    params.push(taskId);
+  }
+  if (chainRunId !== undefined) {
+    where.push("t.chain_run_id = ?");
+    params.push(chainRunId);
+  }
+
+  // the joins supply the readability fields; FKs forbid true orphans, so a
+  // deleted-ish reference still resolves (rule 4)
+  const SELECT = `SELECT l.rowid AS cursor, l.task_id AS task_id, l.run_id AS run_id,
+         t.chain_run_id AS chain_run_id, t.key AS task_key, cp.slug AS chain_slug,
+         l.from_state AS from_state, l.to_state AS to_state,
+         l.trigger_type AS trigger_type, l.actor AS actor, l.reason AS reason,
+         l.created_at AS created_at
+    FROM state_transition_logs l
+    JOIN tasks t ON t.id = l.task_id
+    JOIN projects tp ON tp.id = t.project_id
+    LEFT JOIN chain_runs cr ON cr.id = t.chain_run_id
+    LEFT JOIN projects cp ON cp.id = cr.project_id`;
+
+  if (cursor === 0) {
+    // head: the most recent `limit` rows, read backwards then presented
+    // ascending. has_more is false by definition — there is no "after the
+    // head" to offer, and older history is deliberately not observable.
+    const sql =
+      SELECT +
+      (where.length === 0 ? "" : ` WHERE ${where.join(" AND ")}`) +
+      " ORDER BY l.rowid DESC LIMIT ?";
+    const rows = (db.prepare(sql).all(...params, limit) as TransitionEvent[]).reverse();
+    const highest = rows.length === 0 ? 0 : rows[rows.length - 1]!.cursor;
+    const page: TransitionsPage = { transitions: rows, next_cursor: highest, has_more: false };
+    return page;
+  }
+
+  // one row past the page tells us whether more exists — never a COUNT(*),
+  // so a page costs one bounded index walk
+  const sql = `${SELECT} WHERE ${[...where, "l.rowid > ?"].join(" AND ")} ORDER BY l.rowid ASC LIMIT ?`;
+  const rows = db.prepare(sql).all(...params, cursor, limit + 1) as TransitionEvent[];
+  const hasMore = rows.length > limit;
+  const transitions = hasMore ? rows.slice(0, limit) : rows;
+  const page: TransitionsPage = {
+    transitions,
+    next_cursor:
+      transitions.length === 0 ? cursor : transitions[transitions.length - 1]!.cursor,
+    has_more: hasMore,
+  };
+  return page;
 }
