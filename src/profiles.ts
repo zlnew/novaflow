@@ -1,10 +1,20 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import type { Db } from "./store/db.ts";
+import { novaflowDir } from "./workspaces.ts";
 
 /**
  * Agent profile load + validation per the frozen §4.2 schema
  * (novaflow-v1/data 4.2, "AgentProfileConfiguration"). Golden tests
  * re-parse the spec block live and fail the build on any drift — the
  * required-key list and every constraint here mirror the schema verbatim.
+ *
+ * It is also the profile LIFECYCLE service (v0.2.0 P5, DEBT-008): the
+ * daemon's `nova_profile_update` / `nova_profile_delete` op bodies route
+ * here so the resolution rule, the canonical file home and the
+ * row+file transaction are written once, beside the validator that
+ * guards them. The daemon still owns the store: nothing here opens a
+ * connection.
  */
 
 export type ProfileLimits = {
@@ -220,4 +230,188 @@ export function validateProfile(input: unknown): Profile {
 /** Load and validate a `profiles/<name>.json` file (data.md §4.2). */
 export function loadProfile(path: string): Profile {
   return validateProfile(JSON.parse(readFileSync(path, "utf8")));
+}
+
+/* ------------------------- lifecycle (v0.2.0 P5, DEBT-008) ------------------------- */
+
+/** The `agent_profiles` row (data.md DDL columns; the §4.2 fields + scoping). */
+export type ProfileRow = {
+  id: string;
+  workspace_id: string | null;
+  name: string;
+  role: string | null;
+  provider: string;
+  model: string;
+  thinking_level: string;
+  tools_allowlist_json: string;
+  system_prompt_path: string;
+  max_timeout_sec: number;
+  max_cost_usd: number;
+  created_at: string;
+};
+
+/**
+ * The canonical profile home (data.md 5.2):
+ * `<workspace_root>/.novaflow/profiles/<name>.json`. ONE definition —
+ * create writes it, update rewrites it, delete removes it.
+ */
+export function canonicalProfilePath(workspaceRoot: string, name: string): string {
+  return join(novaflowDir(workspaceRoot), "profiles", `${name}.json`);
+}
+
+/**
+ * The engine's name-resolution rule, verbatim (the enqueue path's
+ * `resolveProfileByName`): a WORKSPACE-scoped row wins over a global row
+ * of the same name — NULLS-last on the workspace column — so a stale
+ * global row can never shadow the workspace's own profile. With no
+ * workspace context only a global row is addressable (a workspace-scoped
+ * profile is reached by naming its workspace).
+ *
+ * Both lifecycle verbs resolve through THIS function, so the verb acts on
+ * exactly the row the engine would pick for a task in that workspace.
+ */
+export function resolveProfileRow(
+  db: Db,
+  name: string,
+  workspaceId: string | undefined,
+): ProfileRow | undefined {
+  if (workspaceId === undefined) {
+    return db
+      .prepare("SELECT * FROM agent_profiles WHERE name = ? AND workspace_id IS NULL")
+      .get(name) as ProfileRow | undefined;
+  }
+  return db
+    .prepare(
+      "SELECT * FROM agent_profiles WHERE name = ? AND (workspace_id IS NULL OR workspace_id = ?) ORDER BY workspace_id IS NULL LIMIT 1",
+    )
+    .get(name, workspaceId) as ProfileRow | undefined;
+}
+
+export function getProfileRow(db: Db, id: string): ProfileRow | undefined {
+  return db.prepare("SELECT * FROM agent_profiles WHERE id = ?").get(id) as
+    | ProfileRow
+    | undefined;
+}
+
+/**
+ * How many tasks pin a profile. `tasks.profile_id` is the store's only
+ * ON DELETE RESTRICT reference to `agent_profiles`, and it is counted
+ * EXPLICITLY (the card's risk note): a refusal must name the count, and a
+ * nullable/absent FK must never let a pinned profile slip through. Run
+ * rows snapshot the profile id WITHOUT a foreign key (FR-TSK-09: the
+ * attempt's profile is history, not a live reference), so a run is not a
+ * pin.
+ */
+export function countProfilePins(db: Db, profileId: string): number {
+  return (
+    db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE profile_id = ?").get(profileId) as {
+      n: number;
+    }
+  ).n;
+}
+
+/** The writable column projection of a validated §4.2 profile. */
+function profileColumns(profile: Profile): {
+  role: string | null;
+  provider: string;
+  model: string;
+  thinking_level: string;
+  tools_allowlist_json: string;
+  system_prompt_path: string;
+  max_timeout_sec: number;
+  max_cost_usd: number;
+} {
+  return {
+    role: profile.role ?? null,
+    provider: profile.provider,
+    model: profile.model,
+    thinking_level: profile.thinking_level,
+    tools_allowlist_json: JSON.stringify(profile.tools_allowlist),
+    system_prompt_path: profile.system_prompt_path,
+    max_timeout_sec: profile.limits.max_timeout_sec,
+    max_cost_usd: profile.limits.max_cost_usd,
+  };
+}
+
+/** True when the validated profile carries nothing the stored row lacks. */
+export function profileMatchesRow(row: ProfileRow, profile: Profile): boolean {
+  const c = profileColumns(profile);
+  return (
+    row.role === c.role &&
+    row.provider === c.provider &&
+    row.model === c.model &&
+    row.thinking_level === c.thinking_level &&
+    row.tools_allowlist_json === c.tools_allowlist_json &&
+    row.system_prompt_path === c.system_prompt_path &&
+    row.max_timeout_sec === c.max_timeout_sec &&
+    row.max_cost_usd === c.max_cost_usd
+  );
+}
+
+/**
+ * Rewrite the row and (workspace-scoped only) the canonical file in ONE
+ * transaction: the file write runs INSIDE it, so a write failure rolls
+ * the row back — the row is never updated without its canonical copy.
+ * Global profiles have no canonical home in v1 (create wrote none), so
+ * `canonicalPath` is null there.
+ */
+export function updateProfile(
+  db: Db,
+  input: { row: ProfileRow; profile: Profile; raw: unknown; canonicalPath: string | null },
+): ProfileRow {
+  const c = profileColumns(input.profile);
+  db.transaction((): void => {
+    db.prepare(
+      `UPDATE agent_profiles
+          SET role = ?, provider = ?, model = ?, thinking_level = ?,
+              tools_allowlist_json = ?, system_prompt_path = ?,
+              max_timeout_sec = ?, max_cost_usd = ?
+        WHERE id = ?`,
+    ).run(
+      c.role,
+      c.provider,
+      c.model,
+      c.thinking_level,
+      c.tools_allowlist_json,
+      c.system_prompt_path,
+      c.max_timeout_sec,
+      c.max_cost_usd,
+      input.row.id,
+    );
+    if (input.canonicalPath !== null) {
+      writeFileSync(input.canonicalPath, JSON.stringify(input.raw, null, 2) + "\n");
+    }
+  })();
+  const updated = getProfileRow(db, input.row.id);
+  if (!updated) throw new Error(`updated profile ${input.row.id} is missing from the store`);
+  return updated;
+}
+
+/**
+ * Delete the row inside a transaction, THEN remove the canonical file (the
+ * row is the authoritative record — never the file first). A removal
+ * failure is RETURNED, never swallowed: the caller reports it, so an
+ * operator never believes the canonical copy is gone when it is not. An
+ * already-absent file is not a failure (nothing to remove).
+ */
+export function deleteProfile(
+  db: Db,
+  input: { row: ProfileRow; canonicalPath: string | null },
+): { file_removed: boolean; file_removal_error: string | null } {
+  const remove = db.transaction(
+    (): number => db.prepare("DELETE FROM agent_profiles WHERE id = ?").run(input.row.id).changes,
+  );
+  const changes = remove();
+  if (changes !== 1) {
+    throw new Error(`profile ${input.row.id} vanished before the delete (${changes} rows)`);
+  }
+  if (input.canonicalPath === null) return { file_removed: false, file_removal_error: null };
+  try {
+    unlinkSync(input.canonicalPath);
+    return { file_removed: true, file_removal_error: null };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return { file_removed: false, file_removal_error: null };
+    return { file_removed: false, file_removal_error: e.message };
+  }
 }

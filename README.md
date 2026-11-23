@@ -123,6 +123,11 @@ cat > dev.json <<'JSON'
 }
 JSON
 bin/nova profile create --file dev.json
+# change the profile later: the canonical file and the stored row move together
+# (a renamed profile file, an invalid one or an unresolvable model is refused)
+bin/nova profile update dev --file dev.json
+# delete it -- refused, naming the count, while any task still pins it
+bin/nova profile delete dev
 
 # 3. a task, run to completion -- --scope names a project target the run
 #    is confined to (DEBT-010: the run refuses a task with no scopes)

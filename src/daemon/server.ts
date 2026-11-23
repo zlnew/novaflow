@@ -20,7 +20,19 @@ import {
   type GateSurface,
 } from "../gates.ts";
 import { validateProfile, ProfileValidationError } from "../profiles.ts";
-import { ProfileUnresolvedError } from "../catalog.ts";
+import {
+  canonicalProfilePath,
+  countProfilePins,
+  deleteProfile,
+  profileMatchesRow,
+  resolveProfileRow,
+  updateProfile,
+} from "../profiles.ts";
+import {
+  ProfileUnresolvedError,
+  probeCatalog,
+  type ProbeOptions,
+} from "../catalog.ts";
 import {
   createWorkspace,
   getWorkspace,
@@ -427,21 +439,32 @@ function resolveProfileByName(db: Db, projectId: string, name: string): string {
     .prepare("SELECT workspace_id FROM projects WHERE id = ?")
     .get(projectId) as { workspace_id: string } | undefined;
   if (!project) throw new OpError("not_found", `no such project: ${projectId}`);
-  const row = db
-    // workspace-scoped FIRST (NULLS-last on the workspace column): a stale
-    // global row must never shadow the workspace's own profile — found in
-    // real use when a trial-era global "worker" (with a prompt path that no
-    // longer resolved) silently beat the workspace fleet on rowid order
-    .prepare(
-      "SELECT id FROM agent_profiles WHERE name = ? AND (workspace_id IS NULL OR workspace_id = ?) ORDER BY workspace_id IS NULL LIMIT 1",
-    )
-    .get(name, project.workspace_id) as { id: string } | undefined;
+  // workspace-scoped FIRST (NULLS-last on the workspace column): a stale
+  // global row must never shadow the workspace's own profile — found in
+  // real use when a trial-era global "worker" (with a prompt path that no
+  // longer resolved) silently beat the workspace fleet on rowid order.
+  // The rule lives in src/profiles.ts's resolveProfileRow so the p5
+  // lifecycle verbs resolve through the very same statement.
+  const row = resolveProfileRow(db, name, project.workspace_id);
   if (!row) {
     throw new OpError("not_found", `no profile named "${name}" in the project's workspace`);
   }
   if (process.env["NF_DEBUG_PROFILE"] === "1") {
   }
   return row.id;
+}
+
+/**
+ * The catalog-probe injection seam (tests point it at the stub): the
+ * enqueue gate and the p5 profile lifecycle verbs probe through the SAME
+ * options, so an injected stub covers both paths.
+ */
+function probeOptions(injection: EnqueueInjection | undefined): ProbeOptions {
+  return {
+    ...(injection?.piBin !== undefined ? { piBin: injection.piBin } : {}),
+    ...(injection?.args !== undefined ? { args: injection.args } : {}),
+    ...(injection?.timeoutMs !== undefined ? { timeoutMs: injection.timeoutMs } : {}),
+  };
 }
 
 /* --------------------------------- op table --------------------------------- */
@@ -888,7 +911,7 @@ export function buildOpTable(): Map<string, OpHandler> {
     }
     let canonicalPath: string | null = null;
     if (workspace !== undefined) {
-      canonicalPath = join(workspace.root_path, ".novaflow", "profiles", `${profile.name}.json`);
+      canonicalPath = canonicalProfilePath(workspace.root_path, profile.name);
       writeFileSync(canonicalPath, JSON.stringify(raw, null, 2) + "\n");
     }
     const id = ulid();
@@ -921,6 +944,145 @@ export function buildOpTable(): Map<string, OpHandler> {
     }
     const row = deps.db.prepare("SELECT * FROM agent_profiles WHERE id = ?").get(id) as Record<string, unknown>;
     return { profile: row, canonical_path: canonicalPath };
+  });
+
+  /**
+   * DEBT-008 (v0.2.0 P5): change a stored profile in place. The verb is
+   * `update`, NOT the frozen roadmap's `archive` — `agent_profiles` has no
+   * archived column and v0.2.0 is pinned to one migration (the deviation
+   * is recorded in the v0.2 amendments by the parent).
+   *
+   * Contract:
+   *   - the file's `name` MUST equal `<name>`: renaming is not an update
+   *     (schema_invalid; delete + create is the rename path);
+   *   - the SAME §4.2 validator and the SAME live catalog probe the enqueue
+   *     gate spends run BEFORE any write, so an invalid profile or an
+   *     unresolvable model leaves the store and the file untouched;
+   *   - then the row and the canonical `<ws>/.novaflow/profiles/<name>.json`
+   *     are rewritten in ONE transaction (src/profiles.ts updateProfile);
+   *   - a file identical to the stored profile is REFUSED as `duplicate`
+   *     ("no change") — this verb never rewrites identical state.
+   *
+   * Scope: resolved exactly as the engine resolves a task's profile
+   * (workspace-scoped first, then global), and the answer REPORTS the scope
+   * it acted on — never a silent pick.
+   */
+  ops.set("nova_profile_update", async (args, { deps }) => {
+    const name = reqString(args, "name");
+    const raw = args["profile"];
+    if (raw === undefined) {
+      throw new OpError(
+        "schema_invalid",
+        'args.profile is required — it carries the profile file\'s raw JSON document ({"name", "provider", "model", …}, data.md 4.2)',
+      );
+    }
+    const profile = validateProfile(raw); // ProfileValidationError -> schema_invalid
+    if (profile.name !== name) {
+      throw new OpError(
+        "schema_invalid",
+        `profile file names "${profile.name}" but the update targets "${name}" — renaming is not an update (delete + create instead)`,
+      );
+    }
+    const workspace =
+      args["workspace_id"] === undefined
+        ? undefined
+        : requireWorkspaceById(deps.db, reqString(args, "workspace_id"));
+    const row = resolveProfileRow(deps.db, name, workspace?.id);
+    if (!row) {
+      throw new OpError(
+        "not_found",
+        `no profile named "${name}" in ${workspace ? `workspace "${workspace.slug}" or the global scope` : "the global scope"}`,
+      );
+    }
+    // the scope actually acted on comes from the ROW, not the request
+    const scope = row.workspace_id === null ? "global" : "workspace";
+    const scopeLabel = scope === "global" ? "global" : "workspace-scoped";
+    // the live catalog probe (architecture 8.1), before any write: a model
+    // the catalog cannot resolve is profile_unresolved, nothing written
+    const probe = await probeCatalog(
+      {
+        provider: profile.provider,
+        model: profile.model,
+        thinking_level: profile.thinking_level,
+      },
+      probeOptions(deps.enqueueOptions),
+    );
+    if (!probe.ok) throw new ProfileUnresolvedError(probe.reason);
+    if (profileMatchesRow(row, profile)) {
+      throw new OpError(
+        "duplicate",
+        `no change: profile "${name}" (${scopeLabel}) already matches the file — nothing was written`,
+      );
+    }
+    const canonicalPath =
+      row.workspace_id === null
+        ? null
+        : canonicalProfilePath(requireWorkspaceById(deps.db, row.workspace_id).root_path, name);
+    let updated: ReturnType<typeof updateProfile>;
+    try {
+      updated = updateProfile(deps.db, { row, profile, raw, canonicalPath });
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      // the row update rolls back with the file write (one transaction); the
+      // message names the canonical path so the operator can repair it. A
+      // store failure (no fs errno) is not a payload violation — rethrow.
+      if (typeof e.code !== "string" || !/^E[A-Z]+$/.test(e.code)) throw err;
+      throw new OpError(
+        "schema_invalid",
+        `canonical profile file write failed for "${name}" (${canonicalPath ?? "no file for a global profile"}): ${e.message}`,
+      );
+    }
+    return { profile: updated, scope, workspace_id: row.workspace_id, canonical_path: canonicalPath, changed: true };
+  });
+
+  /**
+   * DEBT-008 (v0.2.0 P5): delete an UNPINNED profile. FK-safe by explicit
+   * count, not by hopeful FK: `tasks.profile_id` is ON DELETE RESTRICT, but
+   * the check is counted here so the refusal NAMES the count and the
+   * profile ("schema_invalid", the card's code). A pinned profile is never
+   * deleted. `task_runs.profile_id` is a FK-less historical snapshot
+   * (FR-TSK-09), so a run does not pin.
+   *
+   * Order (the card's risk note): the row first, inside a transaction; the
+   * canonical file second; a file-removal failure is RETURNED and printed
+   * by the CLI — never silent.
+   */
+  ops.set("nova_profile_delete", (args, { deps }) => {
+    const name = reqString(args, "name");
+    const workspace =
+      args["workspace_id"] === undefined
+        ? undefined
+        : requireWorkspaceById(deps.db, reqString(args, "workspace_id"));
+    const row = resolveProfileRow(deps.db, name, workspace?.id);
+    if (!row) {
+      throw new OpError(
+        "not_found",
+        `no profile named "${name}" in ${workspace ? `workspace "${workspace.slug}" or the global scope` : "the global scope"}`,
+      );
+    }
+    const scope = row.workspace_id === null ? "global" : "workspace";
+    const scopeLabel = scope === "global" ? "global" : "workspace-scoped";
+    const pins = countProfilePins(deps.db, row.id);
+    if (pins > 0) {
+      throw new OpError(
+        "schema_invalid",
+        `profile "${name}" (${scopeLabel}) is pinned by ${pins} task${pins === 1 ? "" : "s"} — a pinned profile is never deleted (tasks.profile_id is ON DELETE RESTRICT); reassign or delete those tasks first`,
+      );
+    }
+    const canonicalPath =
+      row.workspace_id === null
+        ? null
+        : canonicalProfilePath(requireWorkspaceById(deps.db, row.workspace_id).root_path, name);
+    const removal = deleteProfile(deps.db, { row, canonicalPath });
+    return {
+      deleted: true,
+      name,
+      scope,
+      workspace_id: row.workspace_id,
+      canonical_path: canonicalPath,
+      file_removed: removal.file_removed,
+      file_removal_error: removal.file_removal_error,
+    };
   });
 
   /* ------------------------------- mutating ops ------------------------------ */
@@ -1023,9 +1185,7 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
     // schema_invalid naming DEBT-010, and the task stays draft
     const actor = optString(args, "actor", "operator");
     const task = await enqueueTask(deps.db, taskId, actor, {
-      ...(deps.enqueueOptions?.piBin !== undefined ? { piBin: deps.enqueueOptions.piBin } : {}),
-      ...(deps.enqueueOptions?.args !== undefined ? { args: deps.enqueueOptions.args } : {}),
-      ...(deps.enqueueOptions?.timeoutMs !== undefined ? { timeoutMs: deps.enqueueOptions.timeoutMs } : {}),
+      ...probeOptions(deps.enqueueOptions),
       triggerType: surface,
     });
     deps.dispatcher.requestDispatch(); // admission changed
