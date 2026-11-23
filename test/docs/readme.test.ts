@@ -46,6 +46,10 @@ test("README's quickstart references only verbs the CLI actually has", () => {
     ["task result", /bin\/nova task result FEAT-1/],
     ["project import-dag", /bin\/nova project import-dag chain\.yaml/],
     ["chain status", /bin\/nova chain status/],
+    ["status --watch (tier C)", /bin\/nova status --watch/],
+    ["web sync --all (tier D)", /bin\/nova web sync --all/],
+    ["web start", /bin\/nova web start/],
+    ["web stop", /bin\/nova web stop/],
   ];
   for (const [what, re] of must) assert.match(README, re, `README must show ${what}`);
   // and the exact verb lists the help prints

@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { connect } from "node:net";
 import { dirname, join } from "node:path";
@@ -6,6 +6,7 @@ import { parseArgs, UsageError, type ArgSpec } from "../args.ts";
 import { daemonRequest, defaultDbPath, novaHome, socketPath } from "../client.ts";
 import { renderKv } from "../format.ts";
 import { EXIT_NOT_FOUND, EXIT_OK, EXIT_OPERATION_FAILED } from "../exitcode.ts";
+import { reapGroup, sleep, tailFile } from "../procs.ts";
 import type { CommandOpts } from "../opts.ts";
 
 /**
@@ -151,30 +152,7 @@ async function start(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promis
   return EXIT_OK;
 }
 
-/** SIGTERM → bounded grace → SIGKILL on the child's process group. */
-async function reapGroup(pid: number | undefined): Promise<void> {
-  if (pid === undefined) return;
-  const signal = (sig: "SIGTERM" | "SIGKILL"): void => {
-    try {
-      process.kill(-pid, sig);
-      process.kill(pid, sig);
-    } catch {
-      // already gone
-    }
-  };
-  signal("SIGTERM");
-  const deadline = Date.now() + 3000;
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return; // reaped
-    }
-    await sleep(100);
-  }
-  signal("SIGKILL");
-  await sleep(200);
-}
+/* the process-group reaper is ../procs.ts's reapGroup (shared with `nova web stop`) */
 
 async function runForeground(sock: string, home: string, json: boolean): Promise<number> {
   const dbPath = defaultDbPath();
@@ -400,13 +378,4 @@ async function logs(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise
   }
   if (tail !== "") console.log(tail);
   return EXIT_OK;
-}
-
-function tailFile(path: string, n: number): string {
-  const lines = readFileSync(path, "utf8").split("\n").filter((l) => l !== "");
-  return lines.slice(-n).join("\n");
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }
