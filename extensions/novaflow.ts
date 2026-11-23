@@ -40,7 +40,12 @@
  *       that root's writable scope is refused up front (the
  *       create-then-write window). Blocked calls
  *       return {block, reason} WITHOUT terminate — the agent retries
- *       with the reason as feedback.
+ *       with the reason as feedback. The scan is best-effort: a bash
+ *       command it cannot classify (no write operand it can judge —
+ *       reads, script bodies, heredocs, git internals) is ALLOWED, but
+ *       the fallback is LOUD — ONE `warning` per session naming the
+ *       command verbatim (DEBT-005: silence was the defect). A blocked
+ *       command never also warns: the block is the signal.
  *     - `novaflow_submit_result` is the completion signal: it
  *       validates the §4.1 artifact in-process, writes
  *       <run_dir>/result.json (the ONLY thing this extension ever
@@ -634,7 +639,10 @@ export function checkWritePath(scopes: RunScope[], absPath: string): CheckResult
  * diff, test runners) and script bodies (python -c, heredocs, git
  * internals) are NOT analyzable here — the engine's post-run
  * verification (protected digests + git status) remains the
- * authority for everything this scan cannot see.
+ * authority for everything this scan cannot see. A command whose
+ * scan yields no write operand is therefore UNCLASSIFIED, and
+ * analyzeBashWriteScope reports that to the hook so the fallback can
+ * be made loud once per session (DEBT-005).
  */
 
 /**
@@ -878,10 +886,27 @@ const DEVICE_EXEMPT: ReadonlySet<string> = new Set([
   "/dev/tty",
 ]);
 
+/**
+ * The bash-analysis verdict, plus whether the command was CLASSIFIED at
+ * all: `classified: false` means the syntactic scan found no write
+ * operand it could judge, so the command was allowed as best-effort
+ * rather than proven in scope. UNCLASSIFIABLE cases (the analyzer's
+ * documented blind spots): reads and test runners (cat, grep, npm
+ * test), script bodies (`python -c`, `node -e`, …), heredocs, and git
+ * internals (git commit/checkout write through the git store, not a
+ * path operand); an unknown head with no mutator semantics and no
+ * redirect is unclassifiable too. Zero mapped scopes report
+ * `classified: true`: the engine enforces nothing, so no fallback is in
+ * play. Device sinks (`> /dev/null`) ARE classified — an exempt target
+ * is a verdict, not a blind spot.
+ */
+export type BashAnalysis = { ok: true; classified: boolean } | { ok: false; reason: string };
+
 /** The write-scope verdict for a bash command, per the syntactic scan. */
-export function checkBashWriteScope(scopes: RunScope[], cwd: string, command: string): CheckResult {
-  if (scopes.length === 0) return { ok: true };
-  for (const t of scanBashWriteTargets(command, cwd)) {
+export function analyzeBashWriteScope(scopes: RunScope[], cwd: string, command: string): BashAnalysis {
+  if (scopes.length === 0) return { ok: true, classified: true };
+  const targets = scanBashWriteTargets(command, cwd);
+  for (const t of targets) {
     const abs = resolveToolPath(t.base, t.raw);
     if (DEVICE_EXEMPT.has(abs)) continue;
     const res = checkWritePath(scopes, abs);
@@ -894,7 +919,13 @@ export function checkBashWriteScope(scopes: RunScope[], cwd: string, command: st
         : { ok: false, reason: `bash command writes ${t.raw}: ${res.reason}` };
     }
   }
-  return { ok: true };
+  return { ok: true, classified: targets.length > 0 };
+}
+
+/** The write-scope verdict alone — the block path's shape, unchanged. */
+export function checkBashWriteScope(scopes: RunScope[], cwd: string, command: string): CheckResult {
+  const res = analyzeBashWriteScope(scopes, cwd, command);
+  return res.ok ? { ok: true } : res;
 }
 
 /* ------------------------------ submit (result.json) ------------------------------ */
@@ -2180,8 +2211,12 @@ function submitToolDefinition(getRun: () => RunContext | null, state: { accepted
 
 function registerRunMode(pi: ExtensionAPI, contextPath: string): void {
   let run: RunContext | null = null;
-  /** The acceptance latch: set once result.json is written for this run. */
-  const state = { accepted: false };
+  /**
+   * The acceptance latch (set once result.json is written for this run)
+   * and the DEBT-005 warn latch (set once an unclassifiable bash command
+   * has been named): the fallback is loud ONCE, never per-command noise.
+   */
+  const state = { accepted: false, warnedUnclassifiable: false };
 
   pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
     run = loadRunContext(contextPath);
@@ -2263,8 +2298,18 @@ function registerRunMode(pi: ExtensionAPI, contextPath: string): void {
     if (event.toolName === "bash" || event.toolName === "powershell") {
       const raw = (event.input as { command?: unknown })["command"];
       if (typeof raw !== "string") return undefined;
-      const res = checkBashWriteScope(run.scopes, ctx.cwd, raw);
+      const res = analyzeBashWriteScope(run.scopes, ctx.cwd, raw);
       if (!res.ok) return { block: true, reason: `novaflow: ${res.reason}` };
+      // the fallback is allowed (best-effort) but LOUD: one warning per
+      // session naming the command — the block path returned above, so a
+      // blocked command never also warns
+      if (!res.classified && !state.warnedUnclassifiable) {
+        state.warnedUnclassifiable = true;
+        ctx.ui.notify(
+          `novaflow: bash command \`${raw}\` is not analyzable by the hook's syntactic write scan — not provably within scope — allowed as best-effort. This is the session's one such warning; reads, script bodies, heredocs and git internals are the analyzer's documented blind spots.`,
+          "warning",
+        );
+      }
       return undefined;
     }
     // read/grep/find/ls: reads are unrestricted in v1

@@ -64,7 +64,9 @@ NovaFlow — no gate can be approved from it, and nothing in it is a control sur
 - **Docs indexing**: `.md`/`.txt`/`.rst` files in a workspace's `docs/` are listable
   (`nova docs list`) and injectable into a task's prompt (`--context docs/spec.md`).
 - **The Pi extension**: blocks writes outside the task's scope and protected test files,
-  and accepts the validated `result.json` handoff as the run's completion signal.
+  and accepts the validated `result.json` handoff as the run's completion signal. Its bash
+  scan is best-effort: a command it cannot classify (reads, script bodies, heredocs, git
+  internals) is allowed with one warning per session naming the command.
 
 Deliberately **not** in v1: a web UI, a REST/SSE engine, webhooks, remote control planes,
 token streaming to a dashboard, and any second orchestration path.
