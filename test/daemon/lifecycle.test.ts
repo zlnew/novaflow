@@ -76,6 +76,15 @@ test("boot: store opened + migrated, socket bound 0600 (TB-1), status data, clea
     assert.deepEqual(status.recovery, { replayed: 0, failedIntake: 0, crashed: 0 });
     assert.equal(status.budgets.daily_usd, null); // no daemon config file → defaults
     assert.equal(status.budgets.monthly_usd, null);
+    // novaflow-v02/spend.md: the spend block is additive to the v1 payload.
+    // No store rows and no price file → inert (never a zero as if free).
+    assert.deepEqual(status.spend, {
+      prices_armed: false,
+      inert_models: [],
+      today: { cost_usd: 0, runs: 0 },
+      month: { cost_usd: 0, runs: 0 },
+      by_model: [],
+    });
     await handle.stop();
     // stop discipline: socket gone, store closed (a fresh connection works)
     assert.equal(existsSync(handle.socketPath), false);

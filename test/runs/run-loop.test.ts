@@ -26,8 +26,10 @@ const STUB = join(import.meta.dirname, "..", "fixtures", "pi-stub.ts");
 const BOUND_MS = 15000;
 const MODEL = "claude-3-5-sonnet-20241022";
 
-/** prices fixture: $3 / $15 per 1M in/out (cost math asserted exactly). */
-const PRICES = { [MODEL]: { input: 3, output: 15 } };
+/** prices fixture: $3 / $15 per 1M in/out, plus the cache rates the
+ *  cache-aware contract adds ($0.30 cache read / $3.75 cache write per 1M).
+ *  The non-cache stubs report no cache tokens, so their costs are unchanged. */
+const PRICES = { [MODEL]: { input: 3, cacheRead: 0.3, cacheWrite: 3.75, output: 15 } };
 
 type Seed = {
   db: Database.Database;
@@ -182,6 +184,9 @@ test("run-ok: settle → validating, full run record, api.md §1 argv, FR-TSK-04
     assert.ok(existsSync(row.artifact_path!));
     assert.equal(row.input_tokens, 4500);
     assert.equal(row.output_tokens, 620);
+    // the non-cache stream reports no cache components (fresh input only)
+    assert.equal(row.cache_read_tokens, 0);
+    assert.equal(row.cache_write_tokens, 0);
     // exact cost math: 4500/1M × $3 + 620/1M × $15 = 0.0228
     assert.ok(Math.abs(row.cost_usd - 0.0228) < 1e-9, `cost ${row.cost_usd}`);
     assert.equal(typeof row.pid, "number");
@@ -264,6 +269,61 @@ test("run-ok: settle → validating, full run record, api.md §1 argv, FR-TSK-04
     );
     assert.equal(tr[2]?.["run_id"], row.id);
     assert.equal(tr[2]?.["actor"], "engine-worker");
+  } finally {
+    s.db.close();
+    rmSync(s.wsRoot, { recursive: true, force: true });
+    rmSync(join(s.pidfile, ".."), { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------- cache-aware accounting ------------------------------ */
+
+test("run-cache: fresh input, cache read and cache write are stored separately and priced; the sums reconcile with the raw stream", async (t) => {
+  const s = seed();
+  try {
+    const outcome = await withBound(t.signal, BOUND_MS, run(s, "run-cache"));
+    assert.equal(outcome.finalState, "validating");
+    const row = runRow(s, 1);
+
+    // the stub's cache-aware message_end: input 10_000 (FRESH prompt tokens),
+    // cacheRead 500_000, cacheWrite 80_000, output 2_000
+    assert.equal(row.input_tokens, 10_000); // fresh only — never the conflated total
+    assert.equal(row.cache_read_tokens, 500_000);
+    assert.equal(row.cache_write_tokens, 80_000);
+    assert.equal(row.output_tokens, 2_000);
+
+    // exact cost: 10_000×$3 + 500_000×$0.30 + 80_000×$3.75 + 2_000×$15 per 1M
+    //             = 0.03 + 0.15 + 0.30 + 0.03 = $0.51
+    assert.equal(row.cost_usd.toFixed(2), "0.51");
+    assert.ok(Math.abs(row.cost_usd - 0.51) < 1e-9, `cost ${row.cost_usd}`);
+
+    // reconciliation with the run's own streams: both files carry the same
+    // usage frames, and the stored columns are exactly their per-column sums
+    const streams = ["events.raw.jsonl", "events.jsonl"];
+    for (const name of streams) {
+      const lines = readFileSync(join(row.pi_session_dir, name), "utf8")
+        .split("\n")
+        .filter((l) => l !== "");
+      let input = 0;
+      let cacheRead = 0;
+      let cacheWrite = 0;
+      for (const line of lines) {
+        const frame = JSON.parse(line) as {
+          usage?: { input?: number; cacheRead?: number; cacheWrite?: number };
+        };
+        input += frame.usage?.input ?? 0;
+        cacheRead += frame.usage?.cacheRead ?? 0;
+        cacheWrite += frame.usage?.cacheWrite ?? 0;
+      }
+      assert.equal(input, row.input_tokens, `${name}: fresh input sum`);
+      assert.equal(cacheRead, row.cache_read_tokens, `${name}: cache read sum`);
+      assert.equal(cacheWrite, row.cache_write_tokens, `${name}: cache write sum`);
+      assert.equal(
+        input + cacheRead + cacheWrite,
+        row.input_tokens + row.cache_read_tokens + row.cache_write_tokens,
+        `${name}: the prompt side reconciles as one sum of three components`,
+      );
+    }
   } finally {
     s.db.close();
     rmSync(s.wsRoot, { recursive: true, force: true });

@@ -9,8 +9,13 @@ import { redactLine } from "./redact.ts";
  * logic the live stream used — never a reimplementation.
  */
 export type FrameTally = {
+  /** FRESH prompt tokens only (pi's `usage.input` excludes the cache side). */
   readonly inputTokens: number;
   readonly outputTokens: number;
+  /** `usage.cacheRead` summed over the run's frames. */
+  readonly cacheReadTokens: number;
+  /** `usage.cacheWrite` summed over the run's frames. */
+  readonly cacheWriteTokens: number;
   readonly settled: boolean;
   /** Observe one stdout line (CR stripped per api.md §2 rule 2). */
   observe(line: string): void;
@@ -19,6 +24,8 @@ export type FrameTally = {
 export function createFrameTally(): FrameTally {
   let inputTokens = 0;
   let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheWriteTokens = 0;
   let settled = false;
 
   function observe(line: string): void {
@@ -36,15 +43,27 @@ export function createFrameTally(): FrameTally {
     // (message_update usage is 0) with the cumulative totals arriving on
     // message_end — a running sum over all frames reproduces the trace's
     // message_end totals, which is the basis for tallying this way.
+    //
+    // novaflow-v02/spend.md: the prompt side arrives as THREE separate
+    // components — `input` (fresh), `cacheRead`, `cacheWrite` — and they are
+    // summed into their own counters, never conflated (the measured failure:
+    // 498,562 stored input vs 167,885 fresh + 13.65M cache read).
     const usage = f.usage;
     if (usage !== null && typeof usage === "object" && !Array.isArray(usage)) {
-      const u = usage as { input?: unknown; output?: unknown };
-      if (typeof u.input === "number" && Number.isFinite(u.input) && u.input >= 0) {
-        inputTokens += u.input;
-      }
-      if (typeof u.output === "number" && Number.isFinite(u.output) && u.output >= 0) {
-        outputTokens += u.output;
-      }
+      const u = usage as {
+        input?: unknown;
+        output?: unknown;
+        cacheRead?: unknown;
+        cacheWrite?: unknown;
+      };
+      const input = nonNegative(u.input);
+      if (input !== undefined) inputTokens += input;
+      const output = nonNegative(u.output);
+      if (output !== undefined) outputTokens += output;
+      const cacheRead = nonNegative(u.cacheRead);
+      if (cacheRead !== undefined) cacheReadTokens += cacheRead;
+      const cacheWrite = nonNegative(u.cacheWrite);
+      if (cacheWrite !== undefined) cacheWriteTokens += cacheWrite;
     }
   }
 
@@ -56,10 +75,22 @@ export function createFrameTally(): FrameTally {
     get outputTokens(): number {
       return outputTokens;
     },
+    get cacheReadTokens(): number {
+      return cacheReadTokens;
+    },
+    get cacheWriteTokens(): number {
+      return cacheWriteTokens;
+    },
     get settled(): boolean {
       return settled;
     },
   };
+}
+
+/** A tally-able token count: a finite, non-negative number; anything else is
+ *  ignored (a non-cache stream simply reports no cache components). */
+function nonNegative(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 /**
@@ -70,8 +101,10 @@ export function createFrameTally(): FrameTally {
  * surface. Appends are synchronous, so no buffered line can be lost on
  * termination.
  *
- * Usage frames are tallied per api.md §4 (top-level usage.input /
- * usage.output); `agent_settled` is the completion signal (FR-TSK-05).
+ * Usage frames are tallied per api.md §4 (top-level usage.input / usage.output)
+ * plus the cache components pi reports alongside them (usage.cacheRead /
+ * usage.cacheWrite — novaflow-v02/spend.md keeps the prompt side's three
+ * components apart); `agent_settled` is the completion signal (FR-TSK-05).
  */
 export function createPump(rawPath: string, redactedPath: string) {
   // 0600 from the first byte: create (append-only, never truncate) with
@@ -115,6 +148,12 @@ export function createPump(rawPath: string, redactedPath: string) {
     },
     get outputTokens(): number {
       return tally.outputTokens;
+    },
+    get cacheReadTokens(): number {
+      return tally.cacheReadTokens;
+    },
+    get cacheWriteTokens(): number {
+      return tally.cacheWriteTokens;
     },
     get settled(): boolean {
       return tally.settled;

@@ -16,6 +16,9 @@
  *   run-ok         message_update/tool pair/message_end with usage, a valid
  *                  result.json written into --session-dir, then agent_end +
  *                  agent_settled
+ *   run-cache      same stream, but the message_end usage carries the
+ *                  cache-aware shape pi reports (input = FRESH prompt tokens,
+ *                  plus cacheRead/cacheWrite) — the cache-accounting fixture
  *   run-blocked    same stream, result.json with status "blocked"
  *   run-review     same stream, result.json with status "changes_requested"
  *                  (a reviewer-shaped emitter — exercises the p4b feedback
@@ -63,7 +66,7 @@ const RUN_MODES = new Set([
   "run-ok", "run-blocked", "run-missing", "run-invalid",
   "run-hang", "run-overspend", "run-crash", "run-repair-ok",
   "run-crash-stderr", "run-fork-grandchild",
-  "run-hang-ignore-term", "run-settle-linger", "run-review",
+  "run-hang-ignore-term", "run-settle-linger", "run-review", "run-cache",
 ]);
 
 const mode: string | undefined = process.argv[2];
@@ -199,7 +202,12 @@ if (RUN_MODES.has(mode)) {
     isError: false,
     durationMs: 8,
   });
-  const messageEnd = (usage: { input: number; output: number }) =>
+  const messageEnd = (usage: {
+    input: number;
+    output: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+  }) =>
     JSON.stringify({
       type: "message_end",
       message: { role: "assistant", content: [{ type: "text", text: "Refactoring completed per spec." }] },
@@ -207,6 +215,19 @@ if (RUN_MODES.has(mode)) {
     });
   const agentEnd = JSON.stringify({ type: "agent_end", willRetry: false });
   const agentSettled = JSON.stringify({ type: "agent_settled", aborted: false });
+
+  // The cache-aware usage pi reports (docs/message-types.md: `input` is the
+  // FRESH prompt side; cacheRead/cacheWrite are the cached components and are
+  // NOT included in `input`). Priced with input $3 / cacheRead $0.30 /
+  // cacheWrite $3.75 / output $15 per 1M: 0.03 + 0.15 + 0.30 + 0.03 = $0.51.
+  const cacheStream = (): string[] => [
+    messageUpdate,
+    toolStart,
+    toolEnd,
+    messageEnd({ input: 10_000, output: 2_000, cacheRead: 500_000, cacheWrite: 80_000 }),
+    agentEnd,
+    agentSettled,
+  ];
 
   const fullStream = (): string[] => [
     messageUpdate,
@@ -224,12 +245,14 @@ if (RUN_MODES.has(mode)) {
       ? [messageUpdate]
       : effective === "run-overspend"
         ? [messageUpdate, messageEnd({ input: 2_000_000, output: 1_000_000 })]
-        : fullStream();
+        : effective === "run-cache"
+          ? cacheStream()
+          : fullStream();
 
   const taskId = sessionDir.split("/").filter(Boolean).slice(-2, -1)[0] ?? "";
 
   function writeResult(): void {
-    if (effective === "run-ok" || effective === "run-blocked" || effective === "run-settle-linger" || effective === "run-review") {
+    if (effective === "run-ok" || effective === "run-blocked" || effective === "run-settle-linger" || effective === "run-review" || effective === "run-cache") {
       const artifact = {
         schema_version: "1.0.0",
         task_id: taskId,
@@ -285,7 +308,7 @@ if (RUN_MODES.has(mode)) {
       ) + "\n",
     );
 
-    if (effective === "run-ok" || effective === "run-blocked" || effective === "run-review") {
+    if (effective === "run-ok" || effective === "run-blocked" || effective === "run-review" || effective === "run-cache") {
       // result.json is written before the settle signal, like the real extension
       writeResult();
       for (const line of emitted.slice(0, 4)) process.stdout.write(line + "\n");

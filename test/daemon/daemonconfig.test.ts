@@ -53,10 +53,15 @@ test("golden pin: the documented defaults (global 4, delay_sec 300) come from th
 });
 
 test("golden pin: the key set is exactly the data.md 4.4 global-scope keys", () => {
+  // v0.2-P4: `wake` is added by the frozen v0.2 set (wake.md) and mirrored in
+  // data.md 4.4 — the census grows with the documented schema, never silently
+  const text = specFile("data.md");
+  assert.match(text, /`wake: \{enabled, workspace\}`/);
   assert.deepEqual(Object.keys(DAEMON_CONFIG_SECTION_KEYS).sort(), [
     "budgets",
     "concurrency",
     "retry",
+    "wake",
   ]);
   assert.deepEqual(
     [...DAEMON_CONFIG_SECTION_KEYS["budgets"]!].sort(),
@@ -83,6 +88,9 @@ test("a complete valid file parses every key", () => {
       "  global: 8",
       "retry:",
       "  delay_sec: 60",
+      "wake:",
+      "  enabled: true",
+      "  workspace: personal",
     ].join("\n"),
   );
   assert.ok(res.ok);
@@ -90,6 +98,8 @@ test("a complete valid file parses every key", () => {
     budgets: { dailyUsd: 12.5, monthlyUsd: 300 },
     concurrency: { global: 8 },
     retry: { delaySec: 60 },
+    // v0.2-P4: the extension reads this section; the daemon validates it
+    wake: { enabled: true, workspace: "personal" },
   });
 });
 

@@ -94,12 +94,30 @@ async function callDaemon(
 }
 
 /**
- * The read-only tools' daemon-down path. `nova_daemon_status` is excluded:
- * its payload is live scheduler/recovery/budget state that exists only in
- * the daemon's memory — there is no store table to serve, so it reports
- * `daemon_unreachable` honestly rather than inventing an empty answer.
+ * The read-only tools' daemon-down path. Three tools are excluded:
+ *   - `nova_daemon_status`: its payload is live scheduler/recovery/budget
+ *     state that exists only in the daemon's memory — there is no store
+ *     table to serve, so it reports `daemon_unreachable` honestly rather
+ *     than inventing an empty answer.
+ *   - `nova_events_since`: novaflow-v02/events.md rule 6 — the transition
+ *     feed answers `daemon_unreachable` with NO SQLite fallback, because a
+ *     liveness feed served from a store whose writer just died reports a
+ *     frozen world as current. The justification is liveness, not
+ *     ownership: the projection is pure store joins, and that is exactly
+ *     why the temptation to serve it must be refused here.
+ *   - `nova_run_logs_since`: the same rule for the run-log follow
+ *     (amendments.md row 3, watch.md). Its v1 sibling `nova_run_logs` KEEPS
+ *     serving from the store — a one-shot tail of an immutable run directory
+ *     is a snapshot, not a live feed. A FOLLOW is different in kind: with the
+ *     writer dead the followed run can never advance, so a store-served
+ *     answer would sit at `done: false` forever and report a dead run as
+ *     live. The card's liveness rationale applies exactly.
  */
-const NO_STORE_ANSWER = new Set(["nova_daemon_status"]);
+const NO_STORE_ANSWER = new Set([
+  "nova_daemon_status",
+  "nova_events_since",
+  "nova_run_logs_since",
+]);
 
 /** Open the store read-only for one tool call, always closing it. */
 function withStore<T>(dbPath: string, fn: (db: Database.Database) => T): T {
@@ -182,7 +200,7 @@ export function createNovaMcpServer(options: McpServerOptions = {}): Server {
     {
       capabilities: { tools: {} },
       instructions:
-        "NovaFlow control surface. Tools mirror the `nova` CLI: 7 read-only, 9 mutating. " +
+        "NovaFlow control surface. Tools mirror the `nova` CLI: 9 read-only, 9 mutating. " +
         "Every state transition is validated by the deterministic FSM — a rejection is the engine's " +
         "structured error code (invalid_transition, schema_invalid, not_found, duplicate, aborted, " +
         "profile_unresolved, preflight_failed, budget_exceeded), or daemon_unreachable when the daemon " +

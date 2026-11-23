@@ -34,6 +34,8 @@ export type DaemonConfig = {
   budgets: { dailyUsd: number | null; monthlyUsd: number | null };
   /** FR-SCH-02 AC1: global concurrent running-task limit. */
   concurrency: { global: number };
+  /** wake.md: the extension reads this; the daemon validates the scalars. */
+  wake: { enabled: boolean; workspace: string | null };
   /**
    * The auto-retry timer (the 8.1 matrix's failed→queued row names
    * `retry.delay_sec`, default 300 s). Fractional values are accepted so
@@ -51,6 +53,7 @@ export function defaultDaemonConfig(): DaemonConfig {
   return {
     budgets: { dailyUsd: null, monthlyUsd: null },
     concurrency: { global: DEFAULT_CONCURRENCY_GLOBAL },
+    wake: { enabled: true, workspace: null },
     retry: { delaySec: DEFAULT_RETRY_DELAY_SEC },
   };
 }
@@ -77,6 +80,10 @@ export const DAEMON_CONFIG_SECTION_KEYS: Readonly<Record<string, ReadonlySet<str
   budgets: new Set(["daily_usd", "monthly_usd"]),
   concurrency: new Set(["global"]),
   retry: new Set(["delay_sec"]),
+  // v0.2.0 P4 (novaflow-v02/wake.md): the extension's watcher reads this
+  // section itself; the daemon only VALIDATES it, so an operator's config
+  // with a wake block boots instead of being refused as an unknown key.
+  wake: new Set(["enabled", "workspace"]),
 };
 
 function unquote(value: string): string {
@@ -167,6 +174,16 @@ export function parseDaemonConfig(text: string): DaemonConfigParse {
           return fail(where, `"delay_sec" must be a number >= 0 (got ${JSON.stringify(value)})`);
         }
         cfg.retry.delaySec = n;
+      } else if (section === "wake") {
+        if (key === "enabled") {
+          if (value !== "true" && value !== "false") {
+            return fail(where, `"enabled" must be true or false (got ${JSON.stringify(value)})`);
+          }
+          cfg.wake.enabled = value === "true";
+        } else if (key === "workspace") {
+          // `workspace: null` / empty → every workspace
+          cfg.wake.workspace = value === "" || value === "null" || value === "~" ? null : value;
+        }
       }
       continue;
     }

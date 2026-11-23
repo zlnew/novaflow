@@ -27,7 +27,7 @@ import {
   type GlobalBudgets,
 } from "./preflight.ts";
 import {
-  costUsd,
+  costUsdTokens,
   defaultPricesPath,
   loadPricesDetailed,
   inertPricesNote,
@@ -119,8 +119,11 @@ export type TaskRunRecord = {
   preflight_status: string;
   engine_verification_passed: number;
   model_used: string;
+  /** FRESH prompt tokens (spend.md: cache lives in its own two columns). */
   input_tokens: number;
   output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
   cost_usd: number;
   exit_code: number | null;
   artifact_path: string | null;
@@ -441,6 +444,8 @@ export async function startRun(
         preflightStatus: "failed",
         inputTokens: 0,
         outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
         costUsd: 0,
         exitCode: null,
         artifactPath: null,
@@ -584,8 +589,16 @@ export async function startRun(
         pump.onLine(line);
 
         // real-time budget breaker (architecture 8.4): cumulative tokens
-        // vs the price table, checked on every usage-bearing frame
-        const cost = costUsd(priceTable, profile.model, pump.inputTokens, pump.outputTokens);
+        // vs the price table, checked on every usage-bearing frame. The
+        // cache components are priced too (novaflow-v02/spend.md): 88% of a
+        // real run's cost is cache reads, so an input/output-only breaker
+        // cannot fire.
+        const cost = costUsdTokens(priceTable, profile.model, {
+          input: pump.inputTokens,
+          cacheRead: pump.cacheReadTokens,
+          cacheWrite: pump.cacheWriteTokens,
+          output: pump.outputTokens,
+        });
         if (killed === null && cost > effective.maxCostUsd) {
           breachCost = cost;
           killChild("budget");
@@ -646,7 +659,12 @@ export async function startRun(
     }
     pump.flushPartial(buf); // a trailing partial line still belongs in the raw file
 
-    const cost = costUsd(priceTable, profile.model, pump.inputTokens, pump.outputTokens);
+    const cost = costUsdTokens(priceTable, profile.model, {
+      input: pump.inputTokens,
+      cacheRead: pump.cacheReadTokens,
+      cacheWrite: pump.cacheWriteTokens,
+      output: pump.outputTokens,
+    });
 
     if (outcome.kind === "spawn-error" || outcome.kind === "crash") {
       // crash path: run failed with exit_code; same matrix row either way
@@ -673,6 +691,8 @@ export async function startRun(
         preflightStatus: "passed",
         inputTokens: pump.inputTokens,
         outputTokens: pump.outputTokens,
+        cacheReadTokens: pump.cacheReadTokens,
+        cacheWriteTokens: pump.cacheWriteTokens,
         costUsd: cost,
         exitCode: outcome.kind === "spawn-error" ? null : outcome.code,
         artifactPath: null,
@@ -699,6 +719,8 @@ export async function startRun(
         preflightStatus: "passed",
         inputTokens: pump.inputTokens,
         outputTokens: pump.outputTokens,
+        cacheReadTokens: pump.cacheReadTokens,
+        cacheWriteTokens: pump.cacheWriteTokens,
         costUsd: cost,
         exitCode: outcome.code,
         artifactPath: null,
@@ -725,6 +747,8 @@ export async function startRun(
         preflightStatus: "passed",
         inputTokens: pump.inputTokens,
         outputTokens: pump.outputTokens,
+        cacheReadTokens: pump.cacheReadTokens,
+        cacheWriteTokens: pump.cacheWriteTokens,
         costUsd: cost,
         exitCode: outcome.code,
         artifactPath: null,
@@ -754,6 +778,8 @@ export async function startRun(
       exitCode: outcome.code,
       inputTokens: pump.inputTokens,
       outputTokens: pump.outputTokens,
+      cacheReadTokens: pump.cacheReadTokens,
+      cacheWriteTokens: pump.cacheWriteTokens,
       startedWall,
       pricesNote: withPricesNote,
       actor,

@@ -3,6 +3,7 @@ import { parseArgs, UsageError, type ArgSpec } from "../args.ts";
 import { renderKv, renderTable } from "../format.ts";
 import { operatorActor, resolveTaskIdent, workspaceContext } from "../context.ts";
 import { EXIT_OK, EXIT_OPERATION_FAILED } from "../exitcode.ts";
+import { drainTransitions, FOLLOW_INTERVAL_MS, isTerminalState, pollIntervalMs, sleep } from "../watch.ts";
 import type { CommandOpts } from "../opts.ts";
 
 /**
@@ -16,16 +17,28 @@ import type { CommandOpts } from "../opts.ts";
  * is REQUIRED on create (spec-silent, documented: there is no active-
  * project marker in v1).
  *
- * `--watch` (run/status): v1 POLLING — no stream op exists on the wire,
- * so the client polls nova_task_status at a documented interval
- * (default 1000 ms, NOVAFLOW_WATCH_MS override) until a terminal
- * state, printing each observed transition. Exit: completed → 0;
- * failed/cancelled → 1 (operation failure — the srs's "task failed"
- * row; budget/preflight failures land here through the run record).
+ * `--watch` (run/status) was v1 SNAPSHOT POLLING: no stream op existed on
+ * the wire, so the client polled nova_task_status at a documented interval
+ * (default 1000 ms, NOVAFLOW_WATCH_MS override) until a terminal state. The
+ * three live surfaces are now SPLIT (novaflow-v02/watch.md, v0.2.0 P3):
+ *   - `status --watch` AMENDS the v1 semantics — one line per transition
+ *     from `nova_transitions_since` (task-filtered, cursor held here) until
+ *     the task is terminal, then the unchanged v1 status block. It no longer
+ *     polls whole snapshots for output (it reads the status op only to learn
+ *     terminality and to render that final block).
+ *   - `logs --follow` is NEW — the fixed-1 s `nova_run_logs_since` poll of the
+ *     run's REDACTED events.jsonl, following the CURRENT run only (a retry is
+ *     a NEW run: the follow says so and exits rather than switching).
+ *   - `run --watch` keeps the v1 snapshot poll verbatim: watch.md's table
+ *     names `task status --watch`, not `run --watch` (reported, not guessed).
+ *
+ * Exit codes for a watch: completed → 0; failed/cancelled → 1 (operation
+ * failure — the srs's "task failed" row; budget/preflight failures land here
+ * through the run record).
  */
 
 const SPEC: ArgSpec = {
-  booleanFlags: ["gate"],
+  booleanFlags: ["gate", "follow"],
   valueFlags: ["title", "objective", "profile", "project", "workspace", "run", "by", "note", "lines", "state"],
   repeatableFlags: ["context", "scope"],
 };
@@ -199,16 +212,30 @@ async function run(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<
 
 async function status(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
   const taskId = await identOrThrow(p, opts);
-  if (opts.watch) return watchTask(taskId, opts.json);
-  const data = (await daemonRequest("nova_task_status", { task_id: taskId })) as {
-    task: Record<string, unknown>;
-    current_run: Record<string, unknown> | null;
-    elapsed_ms: number | null;
-  };
+  if (opts.watch) return watchTaskTransitions(taskId, opts.json);
+  const data = (await daemonRequest("nova_task_status", { task_id: taskId })) as TaskStatusData;
   if (opts.json) {
     console.log(JSON.stringify(data));
     return EXIT_OK;
   }
+  console.log(statusBlock(data));
+  return EXIT_OK;
+}
+
+/** The `nova_task_status` envelope the status surfaces read. */
+type TaskStatusData = {
+  task: Record<string, unknown>;
+  current_run: Record<string, unknown> | null;
+  elapsed_ms: number | null;
+  workspace?: { status: string; slug: string };
+};
+
+/**
+ * The v1 status block — ONE renderer for `status` and for every watch's
+ * closing output, so `--watch` can never print a different "final status"
+ * than the plain verb (watch.md: "the v1 final status block unchanged").
+ */
+function statusBlock(data: TaskStatusData): string {
   const lines: Array<[string, string]> = [
     ["id", `tsk_${String(data.task["id"])}`],
     ["key", String(data.task["key"])],
@@ -222,8 +249,58 @@ async function status(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
     lines.push(["verification", String(data.current_run["engine_verification_passed"]) === "1" ? "passed" : "not passed"]);
   }
   if (data.elapsed_ms !== null) lines.push(["elapsed_ms", String(data.elapsed_ms)]);
-  console.log(renderKv(lines));
-  return EXIT_OK;
+  return renderKv(lines);
+}
+
+/**
+ * `nova task status --watch` (watch.md, frozen 2026-11-23 — AMENDS v1): print
+ * ONE line per transition, task-filtered, until the task is terminal, then the
+ * unchanged v1 status block.
+ *
+ * The cursor is process-local and starts at 0 = "head" (events.md rule 2): a
+ * watch is a liveness view of the live edge, and the audit history beyond that
+ * page stays reachable through the plain `status`/store reads. State is read
+ * from the status op only to decide terminality (and for the FR-WS-03
+ * workspace guard) — the OUTPUT is transitions, never snapshots.
+ */
+async function watchTaskTransitions(taskId: string, json: boolean): Promise<number> {
+  const intervalMs = pollIntervalMs();
+  let cursor = 0;
+  for (;;) {
+    const data = (await daemonRequest("nova_task_status", { task_id: taskId })) as TaskStatusData;
+    // FR-WS-03 (v1 rule, carried over): a task in a non-active workspace never
+    // reaches a terminal state — poll forever would be a silent hang.
+    if (data.workspace !== undefined && data.workspace.status !== "active") {
+      if (json) console.log(JSON.stringify({ task_id: taskId, error: "workspace_not_active", workspace: data.workspace }));
+      else console.error(`workspace ${data.workspace.slug} is ${data.workspace.status} — this task will never dispatch (exit 1)`);
+      return EXIT_OPERATION_FAILED;
+    }
+    cursor = await drainTransitions(cursor, { task_id: taskId }, json);
+    if (isTerminalState(String(data.task["state"]))) break;
+    await sleep(intervalMs);
+  }
+  return finishWatch(taskId, json);
+}
+
+/** The watch's closing output: the v1 status block plus v1's exit line. */
+async function finishWatch(taskId: string, json: boolean): Promise<number> {
+  const data = (await daemonRequest("nova_task_status", { task_id: taskId })) as TaskStatusData;
+  const state = String(data.task["state"]);
+  if (json) {
+    console.log(JSON.stringify(data));
+    return state === "completed" ? EXIT_OK : EXIT_OPERATION_FAILED;
+  }
+  console.log(statusBlock(data));
+  if (state === "completed") {
+    console.log("SUCCESS task completed");
+    return EXIT_OK;
+  }
+  console.log(`task ended in ${state} (exit 1)`);
+  // surface the run's recorded failure detail (preflight/budget messages live
+  // here — the v1 review-round behaviour, unchanged)
+  const summary = data.current_run === null ? null : data.current_run["error_summary"];
+  if (typeof summary === "string" && summary !== "") console.log(`  detail: ${summary}`);
+  return EXIT_OPERATION_FAILED;
 }
 
 /** The --watch loop: poll nova_task_status until a terminal state. */
@@ -293,15 +370,19 @@ async function result(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
 
 async function logs(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
   const taskId = await identOrThrow(p, opts);
-  const args: Record<string, unknown> = { task_id: taskId };
+  let tailLines: number | undefined;
   const linesFlag = p.values.get("lines");
   if (linesFlag !== undefined) {
     const n = Number(linesFlag);
     if (!Number.isInteger(n) || n < 1 || n > 1000) {
       throw new UsageError("--lines must be an integer 1..1000");
     }
-    args["tail_lines"] = n;
+    tailLines = n;
   }
+  // --follow: the v0.2 live tail (watch.md), not a bigger `--lines`
+  if (p.flags.has("follow")) return followLogs(taskId, opts.json, tailLines);
+  const args: Record<string, unknown> = { task_id: taskId };
+  if (tailLines !== undefined) args["tail_lines"] = tailLines;
   const data = (await daemonRequest("nova_run_logs", args)) as {
     run_id: string;
     lines: string[];
@@ -312,6 +393,85 @@ async function logs(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise
   }
   for (const line of data.lines) console.log(line);
   return 0;
+}
+
+/**
+ * `nova task logs <id> --follow` (watch.md, NEW in v0.2.0): poll
+ * `nova_run_logs_since` on the pinned FIXED 1 s interval and print each new
+ * line of the run's REDACTED events.jsonl.
+ *
+ * WHY THE RUN IS PINNED: a retry attempt is a NEW run with its own directory
+ * and its own line offsets. Re-resolving "the task's latest run" every poll
+ * would interleave two logs under one offset and silently switch what the
+ * operator is watching. So the first poll fixes `run_id`; when THAT run's log
+ * closes the follow says so and exits.
+ *
+ * `--lines <n>` is the way to start at the tail (watch.md: "a caller that
+ * wants the tail asks tail_lines"); without it the follow starts at the head
+ * of the file, which is what an operator watching a run from its start wants.
+ *
+ * Exit: 0 when the followed run's log closes (a read verb — the TASK's
+ * outcome is `status`/`result`'s business), Ctrl-C at any time.
+ */
+async function followLogs(
+  taskId: string,
+  json: boolean,
+  tailLines: number | undefined,
+): Promise<number> {
+  let runId: string | undefined;
+  let offset = 0;
+  let firstPoll = true;
+  for (;;) {
+    const args: Record<string, unknown> = { task_id: taskId };
+    if (runId !== undefined) args["run_id"] = runId;
+    if (firstPoll && tailLines !== undefined) args["tail_lines"] = tailLines;
+    else if (!firstPoll) args["offset"] = offset;
+    const page = (await daemonRequest("nova_run_logs_since", args)) as {
+      run_id: string;
+      lines: string[];
+      offset: number;
+      has_more: boolean;
+      done: boolean;
+    };
+    runId = page.run_id;
+    firstPoll = false;
+    if (json) {
+      // the raw rows, one page per line — and nothing at all on a silent poll
+      if (page.lines.length > 0 || page.done) console.log(JSON.stringify(page));
+    } else {
+      for (const line of page.lines) console.log(line);
+    }
+    // the op's offset is the window START, so offset + len is the next window
+    offset = page.offset + page.lines.length;
+    if (page.has_more) continue; // a backlog drains immediately, never 1 s/line
+    if (page.done) {
+      await announceFollowEnd(taskId, runId, json);
+      return EXIT_OK;
+    }
+    await sleep(FOLLOW_INTERVAL_MS);
+  }
+}
+
+/**
+ * Say why the follow stopped. On stderr: stdout is the log pipe and must stay
+ * greppable/redirectable. Best-effort by design — the follow's job is done, so
+ * a status probe that fails never turns this into an error.
+ */
+async function announceFollowEnd(taskId: string, runId: string, json: boolean): Promise<void> {
+  if (json) return; // the final JSON page already carried done: true
+  let notice = `run ${runId} is closed — no further lines will arrive (follow ends here)`;
+  try {
+    const st = (await daemonRequest("nova_task_status", { task_id: taskId })) as {
+      current_run: { id: string } | null;
+    };
+    const live = st.current_run;
+    if (live !== null && live.id !== runId) {
+      notice = `run ${runId} is closed — resolution: a retry is a NEW run (now ${live.id}); run \`nova task logs ${taskId} --follow\` again to follow it`;
+    }
+  } catch {
+    // the notice is best-effort: the follow's job is done already
+  }
+  console.error(notice);
 }
 
 async function abort(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {

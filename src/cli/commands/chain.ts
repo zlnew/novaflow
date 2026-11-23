@@ -2,6 +2,8 @@ import { daemonRequest } from "../client.ts";
 import { parseArgs, UsageError, type ArgSpec } from "../args.ts";
 import { renderKv, renderTable } from "../format.ts";
 import { operatorActor, workspaceContext } from "../context.ts";
+import { EXIT_OK } from "../exitcode.ts";
+import { drainTransitions, isTerminalState, pollIntervalMs, sleep } from "../watch.ts";
 import type { CommandOpts } from "../opts.ts";
 
 /**
@@ -21,6 +23,13 @@ import type { CommandOpts } from "../opts.ts";
  * taxonomy: cycles/invalid graphs → schema_invalid (3); unknown
  * chain → not_found (4); pausing a terminal chain →
  * invalid_transition (3).
+ *
+ * `status --watch` (v0.2.0 P3, novaflow-v02/watch.md): member transitions
+ * from `nova_transitions_since` (`chain_run_id`-scoped — the scope filter
+ * rides `tasks.chain_run_id`, since chain runs have NO transition rows of
+ * their own), then the unchanged v1 chain block. Completion is therefore
+ * INFERRED from the member rows plus the chain row, never captured as a
+ * chain transition the store does not have.
  */
 
 const SPEC: ArgSpec = {
@@ -95,31 +104,33 @@ async function list(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise
   return 0;
 }
 
-async function status(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  void opts;
-  const chainRunId = chainIdArg(p);
-  const data = (await daemonRequest("nova_chain_status", { chain_run_id: chainRunId })) as {
-    chain: {
-      id: string;
-      project_id: string;
-      state: string;
-      started_at: string;
-      completed_at: string | null;
-    };
-    members: Array<{
-      id: string;
-      key: string;
-      state: string;
-      ready: boolean;
-      root: boolean;
-      feedback?: string[];
-    }>;
-    paused: boolean;
+type ChainStatusData = {
+  chain: {
+    id: string;
+    project_id: string;
+    state: string;
+    started_at: string;
+    completed_at: string | null;
   };
-  if (opts.json) {
-    console.log(JSON.stringify(data));
-    return 0;
-  }
+  members: Array<{
+    id: string;
+    key: string;
+    state: string;
+    ready: boolean;
+    root: boolean;
+    feedback?: string[];
+  }>;
+  paused: boolean;
+};
+
+async function fetchChainStatus(chainRunId: string): Promise<ChainStatusData> {
+  return (await daemonRequest("nova_chain_status", {
+    chain_run_id: chainRunId,
+  })) as ChainStatusData;
+}
+
+/** The v1 chain block — ONE renderer for `status` and for `--watch`'s close. */
+function printChainStatus(data: ChainStatusData): void {
   console.log(
     renderKv([
       ["id", data.chain.id],
@@ -150,7 +161,48 @@ async function status(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
       ],
     ),
   );
-  return 0;
+}
+
+async function status(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
+  const chainRunId = chainIdArg(p);
+  if (opts.watch) return watchChainStatus(chainRunId, opts.json);
+  const data = await fetchChainStatus(chainRunId);
+  if (opts.json) {
+    console.log(JSON.stringify(data));
+    return EXIT_OK;
+  }
+  printChainStatus(data);
+  return EXIT_OK;
+}
+
+/**
+ * `nova chain status <id> --watch` (watch.md): print one line per MEMBER
+ * transition until every member is terminal AND the chain row reports a
+ * terminal state, then the v1 block.
+ *
+ * THE AND IS THE POINT. A chain completes by inference — the readiness
+ * evaluator moves `chain_runs.state` on the member rows' outcomes — so the
+ * member states alone are not the chain's verdict, and the chain row alone
+ * does not say the work stopped. Both, or the watch keeps watching.
+ *
+ * Terminal, per side: members use the CLI's task-terminal set
+ * (completed/failed/cancelled); the chain row is terminal at anything but
+ * `active` (data.md: active | completed | failed | aborted).
+ */
+async function watchChainStatus(chainRunId: string, json: boolean): Promise<number> {
+  const intervalMs = pollIntervalMs();
+  let cursor = 0;
+  for (;;) {
+    const data = await fetchChainStatus(chainRunId);
+    cursor = await drainTransitions(cursor, { chain_run_id: chainRunId }, json);
+    const membersTerminal = data.members.every((m) => isTerminalState(m.state));
+    if (membersTerminal && data.chain.state !== "active") break;
+    await sleep(intervalMs);
+  }
+  const final = await fetchChainStatus(chainRunId);
+  if (json) console.log(JSON.stringify(final));
+  else printChainStatus(final);
+  return EXIT_OK;
 }
 
 async function abort(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {

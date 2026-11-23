@@ -3,7 +3,7 @@ import type { Db } from "../store/db.ts";
 import { applyTransition } from "../fsm/engine.ts";
 import { planSettleTransition } from "./settle.ts";
 import { readArtifactFile } from "./artifact.ts";
-import { costUsd, type PriceTable } from "./prices.ts";
+import { costUsdTokens, type PriceTable } from "./prices.ts";
 
 /**
  * The post-stream settlement, refactored out of src/runs/loop.ts so the
@@ -19,8 +19,13 @@ import { costUsd, type PriceTable } from "./prices.ts";
 export type RunFinalizeFields = {
   status: string;
   preflightStatus: "passed" | "failed";
+  /** FRESH prompt tokens only (cache is recorded in its own columns). */
   inputTokens: number;
   outputTokens: number;
+  /** `usage.cacheRead` sum — novaflow-v02/spend.md column. */
+  cacheReadTokens: number;
+  /** `usage.cacheWrite` sum — novaflow-v02/spend.md column. */
+  cacheWriteTokens: number;
   costUsd: number;
   exitCode: number | null;
   artifactPath: string | null;
@@ -31,12 +36,14 @@ export type RunFinalizeFields = {
 /**
  * Finalize one task_runs row (FR-TSK-09): status, preflight, token/cost
  * attribution, exit code, artifact pointer, error summary, ended_at and
- * duration. Moved verbatim from src/runs/loop.ts.
+ * duration. Moved verbatim from src/runs/loop.ts; the cache counters are
+ * novaflow-v02/spend.md's two added columns.
  */
 export function finalizeRunRecord(db: Db, runId: string, fields: RunFinalizeFields): void {
   db.prepare(
     `UPDATE task_runs
         SET status = ?, preflight_status = ?, input_tokens = ?, output_tokens = ?,
+            cache_read_tokens = ?, cache_write_tokens = ?,
             cost_usd = ?, exit_code = ?, artifact_path = ?, error_summary = ?,
             ended_at = ?, duration_ms = ?
       WHERE id = ?`,
@@ -45,6 +52,8 @@ export function finalizeRunRecord(db: Db, runId: string, fields: RunFinalizeFiel
     fields.preflightStatus,
     fields.inputTokens,
     fields.outputTokens,
+    fields.cacheReadTokens,
+    fields.cacheWriteTokens,
     fields.costUsd,
     fields.exitCode,
     fields.artifactPath,
@@ -69,6 +78,9 @@ export type SettledIntakeInput = {
   exitCode: number | null;
   inputTokens: number;
   outputTokens: number;
+  /** The tallied cache components (spend.md: the prompt side stays split). */
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   /** Wall-clock ms at attempt start (duration_ms attribution). */
   startedWall: number;
   /**
@@ -102,7 +114,14 @@ export type SettledIntake =
 export function intakeSettledRun(input: SettledIntakeInput): SettledIntake {
   const pricesNote = input.pricesNote ?? ((s: string | null) => s);
   const artifactPath = join(input.runDir, "result.json");
-  const cost = costUsd(input.priceTable, input.model, input.inputTokens, input.outputTokens);
+  // cache-aware costing (novaflow-v02/spend.md): fresh input + cache read +
+  // cache write + output, each at its own per-1M rate
+  const cost = costUsdTokens(input.priceTable, input.model, {
+    input: input.inputTokens,
+    cacheRead: input.cacheReadTokens,
+    cacheWrite: input.cacheWriteTokens,
+    output: input.outputTokens,
+  });
   const artifact = readArtifactFile(artifactPath);
 
   if (artifact.ok) {
@@ -115,6 +134,8 @@ export function intakeSettledRun(input: SettledIntakeInput): SettledIntake {
       preflightStatus: "passed",
       inputTokens: input.inputTokens,
       outputTokens: input.outputTokens,
+      cacheReadTokens: input.cacheReadTokens,
+      cacheWriteTokens: input.cacheWriteTokens,
       costUsd: cost,
       exitCode: input.exitCode,
       artifactPath,
@@ -150,6 +171,8 @@ export function intakeSettledRun(input: SettledIntakeInput): SettledIntake {
     preflightStatus: "passed",
     inputTokens: input.inputTokens,
     outputTokens: input.outputTokens,
+    cacheReadTokens: input.cacheReadTokens,
+    cacheWriteTokens: input.cacheWriteTokens,
     costUsd: cost,
     exitCode: input.exitCode,
     artifactPath: null,
