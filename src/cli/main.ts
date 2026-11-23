@@ -54,7 +54,7 @@ const USAGE = `USAGE: nova <noun> <sub> [args] [flags]
   nova project create <name> --objective <text> [--target alias=path[:git_repo|directory]]...
   nova project list | status <id|slug> | phase <id|slug> <label...>
   nova project import-dag <file> [--project <slug>]
-  nova profile create --file <path> | list | validate <name>
+  nova profile create --file <path> | update <name> --file <path> | delete <name> | list | validate <name>
   nova task create <key> --title <t> --objective <o> --profile <name> --project <slug|id> [--gate] [--context <path>]...
   nova task run <id|key> [--watch] | status <id|key> [--watch] | list
   nova task result <id|key> | logs <id|key> [--lines <n>] [--follow] | abort | retry <id|key>
