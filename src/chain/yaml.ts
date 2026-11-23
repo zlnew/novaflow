@@ -10,6 +10,9 @@
  *   - one document, a top-level BLOCK MAP at indent 0;
  *   - block maps: `key: value` and `key:` followed by a nested block;
  *     keys are plain identifiers ([A-Za-z0-9_.-]+), never quoted;
+ *     a bare `key:` with no value and no nested block is an EMPTY LIST
+ *     for the §4.3 array-typed keys ONLY (amendment row 8); for any
+ *     other key it refuses as an empty value;
  *   - block sequences: `- scalar` and `- key: value …` items (the
  *     item's further keys align at the dash column + 2); a sequence
  *     may sit at its key's indent or 2 deeper;
@@ -27,6 +30,18 @@
  * literals (`~`/`null` — quote a string if a string is meant), and any
  * line shape the grammar above does not cover.
  */
+
+import { CHAIN_ARRAY_KEYS } from "./graph.ts";
+
+export type YamlParseOptions = {
+  /**
+   * Keys whose empty value (no nested block) parses as an empty array.
+   * Defaults to the §4.3 array-typed keys (CHAIN_ARRAY_KEYS); the
+   * option exists so the rule is provably set-driven, never a guess
+   * about a key's name.
+   */
+  emptyListKeys?: ReadonlySet<string>;
+};
 
 /** A parse failure carrying the 1-based line number. */
 export class YamlParseError extends Error {
@@ -127,11 +142,20 @@ function isListItem(text: string): boolean {
   return text === "-" || text.startsWith("- ");
 }
 
-function parseScalar(text: string, lineNo: number): unknown {
+function parseScalar(text: string, lineNo: number, emptyListKey?: string): unknown {
   if (text === "") fail(lineNo, "empty value");
   const head = text[0]!;
   if (head === "{") fail(lineNo, "flow maps ({…}) are not part of the subset — use block maps");
-  if (head === "[") fail(lineNo, "flow lists ([…]) are not part of the subset — use block lists");
+  if (head === "[") {
+    // a refusal that TEACHES: the empty list IS expressible in the
+    // subset, as the bare key — but only for the §4.3 array-typed keys,
+    // so the suffix names the key the caller actually wrote (DEBT-013)
+    const teach =
+      text === "[]" && emptyListKey !== undefined
+        ? ` — write \`${emptyListKey}:\` with no items for an empty list`
+        : "";
+    fail(lineNo, `flow lists ([…]) are not part of the subset — use block lists${teach}`);
+  }
   if (head === "&") fail(lineNo, "anchors (&) are not part of the subset");
   if (head === "*") fail(lineNo, "aliases (*) are not part of the subset");
   if (head === "!") fail(lineNo, "tags (!) are not part of the subset");
@@ -250,6 +274,7 @@ function parseMapAt(
   lines: Line[],
   i: number,
   indent: number,
+  emptyListKeys: ReadonlySet<string>,
 ): { map: Record<string, unknown>; next: number } {
   const map: Record<string, unknown> = {};
   let idx = i;
@@ -268,34 +293,57 @@ function parseMapAt(
       fail(line.lineNo, `duplicate key "${pair.key}" — the subset refuses silently-overwritten maps`);
     }
     if (pair.value !== "") {
-      map[pair.key] = parseScalar(pair.value, line.lineNo);
+      map[pair.key] = parseScalar(
+        pair.value,
+        line.lineNo,
+        emptyListKeys.has(pair.key) ? pair.key : undefined,
+      );
       idx += 1;
       continue;
     }
-    // empty value: a nested block (indent + 2) or a same-indent list
+    // empty value: a nested block (indent + 2), a same-indent list — or,
+    // for a §4.3 array-typed key with NEITHER, an EMPTY LIST (amendment
+    // row 8: the schema puts no minItems on edges, so a one-task graph
+    // is legal). Every other key keeps the empty-value refusal: an empty
+    // block value is ambiguous YAML, so `wake:` with nothing under it
+    // must never silently mean [].
     const next = lines[idx + 1];
-    if (next === undefined) {
+    const emptyValue = (): never =>
       fail(line.lineNo, `key "${pair.key}" has no value and no nested block`);
+    if (next === undefined) {
+      if (!emptyListKeys.has(pair.key)) emptyValue();
+      map[pair.key] = [];
+      idx += 1;
+      continue;
     }
     if (next.indent === indent) {
       if (!isListItem(next.text)) {
-        fail(line.lineNo, `key "${pair.key}" has no value and no nested block`);
+        if (!emptyListKeys.has(pair.key)) emptyValue();
+        map[pair.key] = [];
+        idx += 1;
+        continue;
       }
-      const list = parseListAt(lines, idx + 1, indent);
+      const list = parseListAt(lines, idx + 1, indent, emptyListKeys);
       map[pair.key] = list.items;
       idx = list.next;
       continue;
     }
     if (next.indent === indent + 2) {
       if (isListItem(next.text)) {
-        const list = parseListAt(lines, idx + 1, indent + 2);
+        const list = parseListAt(lines, idx + 1, indent + 2, emptyListKeys);
         map[pair.key] = list.items;
         idx = list.next;
       } else {
-        const nested = parseMapAt(lines, idx + 1, indent + 2);
+        const nested = parseMapAt(lines, idx + 1, indent + 2, emptyListKeys);
         map[pair.key] = nested.map;
         idx = nested.next;
       }
+      continue;
+    }
+    // a dedent leaves the key with no nested block either
+    if (next.indent < indent && emptyListKeys.has(pair.key)) {
+      map[pair.key] = [];
+      idx += 1;
       continue;
     }
     fail(next.lineNo, `unsupported indentation of ${next.indent} spaces — the subset nests by exactly 2`);
@@ -307,6 +355,7 @@ function parseListAt(
   lines: Line[],
   i: number,
   indent: number,
+  emptyListKeys: ReadonlySet<string>,
 ): { items: unknown[]; next: number } {
   const items: unknown[] = [];
   let idx = i;
@@ -320,11 +369,11 @@ function parseListAt(
         fail(line.lineNo, "a bare '-' item requires a nested block indented 2 more spaces");
       }
       if (isListItem(next.text)) {
-        const list = parseListAt(lines, idx + 1, indent + 2);
+        const list = parseListAt(lines, idx + 1, indent + 2, emptyListKeys);
         items.push(list.items);
         idx = list.next;
       } else {
-        const nested = parseMapAt(lines, idx + 1, indent + 2);
+        const nested = parseMapAt(lines, idx + 1, indent + 2, emptyListKeys);
         items.push(nested.map);
         idx = nested.next;
       }
@@ -336,7 +385,7 @@ function parseListAt(
       // column (dash + 2) and parse the map from there — the array is
       // parser-local, so the one-entry rewrite is safe
       lines[idx] = { indent: indent + 2, text: content, lineNo: line.lineNo };
-      const nested = parseMapAt(lines, idx, indent + 2);
+      const nested = parseMapAt(lines, idx, indent + 2, emptyListKeys);
       items.push(nested.map);
       idx = nested.next;
       continue;
@@ -355,7 +404,8 @@ function parseListAt(
  * YamlParseError (with the 1-based line) for anything outside the
  * documented subset — never a guess, never a silent fallback.
  */
-export function parseYaml(text: string): unknown {
+export function parseYaml(text: string, options: YamlParseOptions = {}): unknown {
+  const emptyListKeys = options.emptyListKeys ?? CHAIN_ARRAY_KEYS;
   const kept = intake(text);
   if (kept.length === 0) fail(1, "the document is empty");
   if (kept[0]!.indent !== 0) {
@@ -364,7 +414,7 @@ export function parseYaml(text: string): unknown {
   if (isListItem(kept[0]!.text)) {
     fail(kept[0]!.lineNo, "the document root must be a map, not a list");
   }
-  const root = parseMapAt(kept, 0, 0);
+  const root = parseMapAt(kept, 0, 0, emptyListKeys);
   if (root.next < kept.length) {
     const leftover = kept[root.next]!;
     fail(leftover.lineNo, `unexpected content outside the document root: ${JSON.stringify(leftover.text)}`);

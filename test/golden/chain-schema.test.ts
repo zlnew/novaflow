@@ -4,6 +4,7 @@ import { extractChainSchema } from "../helpers/spec.ts";
 import {
   CHAIN_REQUIRED_KEYS,
   CHAIN_KNOWN_KEYS,
+  CHAIN_ARRAY_KEYS,
   TASK_REQUIRED_KEYS,
   TASK_KNOWN_KEYS,
   SCOPE_KNOWN_KEYS,
@@ -139,6 +140,26 @@ test("golden: every constraint the validator mirrors equals the live §4.3 block
   const eProps = edges.items.properties ?? {};
   assert.deepEqual(eProps["edge_type"]?.enum, ["depends_on", "on_changes_requested", "on_failure"]);
   assert.equal(eProps["condition_expr"]?.type, "string");
+});
+
+test("golden: the empty-block-list keys are exactly the §4.3 array-typed keys (amendment row 8)", () => {
+  const schema = extractChainSchema() as unknown as ChainSchema;
+  const tasks = schema.properties["tasks"] as SchemaProp & {
+    items: SchemaProp;
+  };
+  const scopes = tasks.items.properties?.["target_scopes"] as SchemaProp & {
+    items: SchemaProp;
+  };
+  const arrayKeys = [
+    ...Object.entries(schema.properties),
+    ...Object.entries(tasks.items.properties ?? {}),
+    ...Object.entries(scopes.items.properties ?? {}),
+  ]
+    .filter(([, prop]) => prop.type === "array")
+    .map(([key]) => key);
+  // the subset's empty-block-list rule covers every array-typed key and
+  // no others: a non-array key (`wake:`) still refuses the empty value
+  assert.deepEqual([...CHAIN_ARRAY_KEYS].sort(), arrayKeys.sort());
 });
 
 test("golden: the validator's patterns equal the live spec patterns (source-identical regexes)", () => {
