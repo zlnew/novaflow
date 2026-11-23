@@ -49,11 +49,11 @@ function specFields(input: string): string[] {
     .filter((f) => f !== "");
 }
 
-test("the mcp.md §3 catalog parses to exactly 17 rows (8 read-only + 9 mutating)", () => {
+test("the mcp.md §3 catalog parses to exactly 18 rows (9 read-only + 9 mutating)", () => {
   const rows = parseCatalogRows();
-  assert.equal(rows.filter((r) => r.kind === "read").length, 8);
+  assert.equal(rows.filter((r) => r.kind === "read").length, 9);
   assert.equal(rows.filter((r) => r.kind === "mutate").length, 9);
-  assert.equal(rows.length, 17);
+  assert.equal(rows.length, 18);
   for (const row of rows) {
     assert.notEqual(row.input, "", `${row.name}: the spec row must carry an input schema`);
   }

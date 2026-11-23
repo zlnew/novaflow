@@ -30,7 +30,10 @@ import { OpError, reqString } from "../opcodes.ts";
 /**
  * Serve one read-only tool from the store. Only the six store-backed
  * read tools are reachable here — `nova_daemon_status` is live daemon
- * state and is refused before this point (src/mcp/server.ts).
+ * state, and `nova_events_since` / `nova_run_logs_since` are liveness
+ * feeds (amendments.md row 3), all three refused before this point
+ * (src/mcp/server.ts). Adding a `case` for either feed here would be
+ * the defect the footer comment below describes, not a feature.
  */
 export function serveReadOnly(
   toolName: string,
