@@ -382,6 +382,47 @@ test("base branch: a recorded, resolvable base_branch is the branch point (HEAD 
   }
 });
 
+/* ------------------- DEBT-014: the repair points at attempt 1 ------------------- */
+
+test("DEBT-014: a worktree repair's feedback names attempt 1's tree and its workspace_diff.patch as read-only evidence", async (t) => {
+  const s = seed();
+  const repo = gitRepo();
+  s.repos.push(repo);
+  const task = newTask(s, "TASK-REPAIR");
+  addTarget(s, task, { alias: "app", type: "git_repo", root: repo, access: "read_write" });
+  try {
+    // run-repair-ok: the execution attempt settles with no result.json, the
+    // repair attempt succeeds — FR-TSK-06's bounded repair, end to end
+    const outcome = await withBound(t.signal, BOUND_MS, run(s, task, "run-repair-ok"));
+    assert.equal(outcome.finalState, "validating");
+    const [first, repair] = runRows(s, task);
+    assert.equal(first!.attempt_kind, "execution");
+    assert.equal(repair!.attempt_kind, "repair");
+
+    // attempt 1 really ran in a worktree, and the repair got a FRESH one
+    assert.equal(first!.worktree_root, join(s.wsRoot, ".novaflow", "worktrees", first!.id));
+    assert.ok(repair!.worktree_root !== null);
+    assert.notEqual(repair!.worktree_root, first!.worktree_root);
+
+    // its persisted diff exists where the pointer says it is
+    const patchPath = join(first!.pi_session_dir, "workspace_diff.patch");
+    assert.ok(existsSync(patchPath));
+
+    // the repair prompt carries the one pointer sentence, verbatim
+    const prompt = String(receipt(repair!.pi_session_dir).prompt);
+    const clause =
+      `The previous attempt's worktree is ${first!.worktree_root}, ` +
+      `its workspace_diff.patch is ${patchPath}; ` +
+      "that tree is read-only evidence — inspect it; do not write to it.";
+    assert.ok(prompt.includes(clause), `missing repair pointer in:\n${prompt}`);
+
+    // attempt 1's own prompt carries no pointer (nothing precedes it)
+    assert.equal(String(receipt(first!.pi_session_dir).prompt).includes("read-only evidence"), false);
+  } finally {
+    cleanup(s);
+  }
+});
+
 /* ------------- P9 re-judge round: re-rooting, rollback, alias backstop ------------- */
 
 test("the preflight snapshot re-roots worktree-placed targets to the worktree path (in-place targets keep the shared root)", async (t) => {

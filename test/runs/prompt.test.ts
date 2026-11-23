@@ -127,6 +127,40 @@ test("composePrompt: a mapped context file escaping the workspace root is a hard
   }
 });
 
+test("composePrompt: a repair from a worktree attempt names the tree, its patch, and that the tree is read-only (DEBT-014)", () => {
+  const root = workspace();
+  try {
+    const runId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const taskId = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    const worktreeRoot = join(root, ".novaflow", "worktrees", runId);
+    const patchPath = join(root, ".novaflow", "runs", taskId, runId, "workspace_diff.patch");
+    const { message } = composePrompt({
+      objective: "Implement PKCE.",
+      contextFiles: [],
+      workspaceRoot: root,
+      repairFeedback: "result.json was missing after agent_settled.",
+      repairWorktree: { worktreeRoot, patchPath },
+    });
+    assert.equal(
+      message,
+      [
+        "Objective:",
+        "Implement PKCE.",
+        "",
+        "Context files:",
+        "(none)",
+        "",
+        "Repair feedback from the previous attempt:",
+        "result.json was missing after agent_settled.",
+        "",
+        `The previous attempt's worktree is ${worktreeRoot}, its workspace_diff.patch is ${patchPath}; that tree is read-only evidence — inspect it; do not write to it.`,
+      ].join("\n"),
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("composePrompt: the repair attempt additionally carries the failure feedback (FR-TSK-06)", () => {
   const root = workspace();
   try {
