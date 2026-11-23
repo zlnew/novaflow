@@ -57,7 +57,8 @@ const USAGE = `USAGE: nova <noun> <sub> [args] [flags]
   nova profile create --file <path> | list | validate <name>
   nova task create <key> --title <t> --objective <o> --profile <name> --project <slug|id> [--gate] [--context <path>]...
   nova task run <id|key> [--watch] | status <id|key> [--watch] | list
-  nova task result | logs | abort | retry <id|key>   steer <id|key> <message...>
+  nova task result <id|key> | logs <id|key> [--lines <n>] [--follow] | abort | retry <id|key>
+  nova task steer <id|key> <message...>
   nova task gate-approve <id|key> [--run <id>] [--by <name>] [--note <text>]
   nova task gate-reject <id|key> <feedback...>
   nova daemon start [--foreground] | stop | status | pause | resume | kill-all
@@ -68,7 +69,7 @@ const USAGE = `USAGE: nova <noun> <sub> [args] [flags]
   nova schedule attach <id|key> [--cron '<expr>' | --at <iso>] [--missed skip|run_immediately]
   nova schedule list [--task <id|key>] [--workspace <slug|id>]
   nova schedule pause <schedule-id> | resume <schedule-id>
-  nova chain list | status <chain-run-id>
+  nova chain list | status <chain-run-id> [--watch]
   nova chain abort | pause | resume <chain-run-id>
   nova mcp            (MCP server on stdio; runs until its client disconnects)`;
 

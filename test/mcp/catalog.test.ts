@@ -10,12 +10,12 @@ import {
 import { buildOpTable } from "../../src/daemon/server.ts";
 
 /**
- * The MCP tool catalog (mcp.md §3) as DATA: the 17 tools (16 v1 rows plus
- * v0.2.0's `nova_events_since`, amendments.md row 2), the two halves
- * (8 read-only / 9 mutating), the op each one translates to, and the
- * translation itself. Golden drift against the live spec is pinned
- * separately in test/golden/mcp-catalog.test.ts; this file pins the
- * mechanics.
+ * The MCP tool catalog (mcp.md §3) as DATA: the 18 tools (16 v1 rows plus
+ * v0.2.0's `nova_events_since` and `nova_run_logs_since`, amendments.md
+ * rows 2/3), the two halves (9 read-only / 9 mutating), the op each one
+ * translates to, and the translation itself. Golden drift against the live
+ * spec is pinned separately in test/golden/mcp-catalog.test.ts; this file
+ * pins the mechanics.
  */
 
 /** mcp.md §3.1 + §3.2, table order verbatim. */
@@ -26,6 +26,7 @@ const EXPECTED_NAMES = [
   "nova_task_list",
   "nova_task_status",
   "nova_run_logs",
+  "nova_run_logs_since",
   "nova_result_get",
   "nova_daemon_status",
   "nova_events_since",
@@ -41,12 +42,12 @@ const EXPECTED_NAMES = [
   "nova_kill_all",
 ];
 
-test("the catalog is exactly the 17 spec tools, 8 read-only + 9 mutating, in §3 order", () => {
+test("the catalog is exactly the 18 spec tools, 9 read-only + 9 mutating, in §3 order", () => {
   assert.deepEqual(
     MCP_TOOLS.map((t) => t.name),
     EXPECTED_NAMES,
   );
-  assert.equal(READ_ONLY_TOOL_NAMES.length, 8);
+  assert.equal(READ_ONLY_TOOL_NAMES.length, 9);
   assert.equal(MUTATING_TOOL_NAMES.length, 9);
   assert.deepEqual([...READ_ONLY_TOOL_NAMES, ...MUTATING_TOOL_NAMES], EXPECTED_NAMES);
   for (const tool of MCP_TOOLS) {
@@ -69,6 +70,7 @@ test("input schemas declare the spec's fields and never close the object (engine
     nova_task_list: ["project_id", "state"],
     nova_task_status: ["task_id"],
     nova_run_logs: ["task_id", "run_id", "tail_lines"],
+    nova_run_logs_since: ["task_id", "run_id", "offset", "limit", "tail_lines"],
     nova_result_get: ["task_id", "run_id"],
     nova_daemon_status: [],
     nova_events_since: ["cursor", "workspace_id", "project_id", "limit"],

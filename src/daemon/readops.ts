@@ -117,11 +117,37 @@ export function taskStatus(db: Db, args: Record<string, unknown>): Record<string
 }
 
 /**
- * `nova_run_logs` — the tail of the run's REDACTED `events.jsonl`
- * (FR-LOG-02: the run's log pointer IS the read surface; the verbatim
- * `events.raw.jsonl` is never opened by any surface).
+ * THE run-log read path — one function, both run-log ops.
+ *
+ * FR-LOG-02: the run's log pointer IS the read surface, and that pointer is
+ * `events.jsonl`, the file src/runs/pump.ts writes through the NFR-SE-04
+ * scrubber. `events.raw.jsonl` (0600, verbatim) is never opened anywhere in
+ * this module. `nova_run_logs` (the v1 tail) and `nova_run_logs_since` (the
+ * v0.2 follow window) both read through here, so neither can drift onto the
+ * raw file or grow a second, differently-scrubbed read path.
  */
-export function runLogs(db: Db, args: Record<string, unknown>): Record<string, unknown> {
+function redactedLogLines(run: RunRow): string[] {
+  let text = "";
+  try {
+    text = readFileSync(run.events_log_path, "utf8");
+  } catch {
+    throw new OpError("not_found", `no events.jsonl for run ${run.id}`);
+  }
+  return text.split("\n").filter((l) => l !== "");
+}
+
+/** The v1 bound on `tail_lines` (an integer 1..1000), shared by both ops. */
+function tailLinesArg(args: Record<string, unknown>): number | undefined {
+  const n = args["tail_lines"];
+  if (n === undefined) return undefined;
+  if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || n > 1000) {
+    throw new OpError("schema_invalid", "args.tail_lines must be an integer 1..1000");
+  }
+  return n;
+}
+
+/** The run a run-log op reads: `run_id` when named, else the task's latest. */
+function requireLogRun(db: Db, args: Record<string, unknown>): RunRow {
   const taskId = String(args["task_id"]);
   requireTask(db, taskId);
   const run =
@@ -129,21 +155,78 @@ export function runLogs(db: Db, args: Record<string, unknown>): Record<string, u
       ? latestRun(db, taskId)
       : runById(db, String(args["run_id"]));
   if (!run) throw new OpError("not_found", `no run for task ${taskId}`);
-  let text = "";
-  try {
-    text = readFileSync(run.events_log_path, "utf8");
-  } catch {
-    throw new OpError("not_found", `no events.jsonl for run ${run.id}`);
-  }
-  const tailLines = args["tail_lines"] === undefined ? 100 : (() => {
-    const n = args["tail_lines"];
-    if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || n > 1000) {
-      throw new OpError("schema_invalid", "args.tail_lines must be an integer 1..1000");
-    }
-    return n;
-  })();
-  const lines = text.split("\n").filter((l) => l !== "");
+  return run;
+}
+
+/**
+ * `nova_run_logs` — the tail of the run's REDACTED `events.jsonl`
+ * (FR-LOG-02: the run's log pointer IS the read surface; the verbatim
+ * `events.raw.jsonl` is never opened by any surface).
+ */
+export function runLogs(db: Db, args: Record<string, unknown>): Record<string, unknown> {
+  const run = requireLogRun(db, args);
+  const lines = redactedLogLines(run);
+  // read before validating, exactly as v1 does: a missing file is not_found
+  // even when tail_lines was also wrong
+  const tailLines = tailLinesArg(args) ?? 100;
   return { run_id: run.id, lines: lines.slice(-tailLines) };
+}
+
+const DEFAULT_LOG_LIMIT = 200;
+const MAX_LOG_LIMIT = 1000;
+
+/**
+ * `nova_run_logs_since` (novaflow-v02/watch.md, frozen 2026-11-23) — the
+ * cursor-pull window over a run's REDACTED `events.jsonl`, the op both
+ * `nova task logs --follow` and the MCP tool poll.
+ *
+ * The body is `nova_run_logs`'s, verbatim (same run resolution, same
+ * `requireLogRun`/`redactedLogLines` pair, same redacted file, same
+ * taxonomy); this op adds ONLY the offset windowing. Nothing here may open
+ * `events.raw.jsonl` or re-derive the scrubber — "live" is exactly where
+ * redaction gets forgotten.
+ *
+ * Rules pinned by the spec, restated where they are enforced:
+ *   - `offset` is a LINE COUNT and `offset: 0` means the HEAD of the file
+ *     (line 0). It is NOT a tail cursor: a caller that wants the tail asks
+ *     `tail_lines`, exactly like the v1 op's `--lines`.
+ *   - The returned `offset` is the window's START INDEX, so
+ *     `has_more: true` means "more lines exist past `offset + lines.length`"
+ *     and the caller re-polls with that sum. When `tail_lines` floors the
+ *     window forward, the returned offset reports where the window really
+ *     started — which is why the envelope carries it at all.
+ *   - `tail_lines` is a FLOOR on the start (never earlier than the last N
+ *     lines) and a later `offset` wins, so a follow that began at the tail
+ *     keeps advancing by absolute line index.
+ *   - Line offsets are stable because a run directory is immutable (data
+ *     1.2) and a retry writes a NEW run directory.
+ *   - `limit` above the max CLAMPS (the events.md rule-3 discipline): a
+ *     drain loop asking for 5000 gets a full 1000-line page, never a refusal.
+ *   - `done` means the run's log is closed: the run row is terminal. The
+ *     row — not a file-size guess — is the single source, because the pump
+ *     and the run record are finalized by the same engine loop.
+ */
+export function runLogsSince(db: Db, args: Record<string, unknown>): Record<string, unknown> {
+  const run = requireLogRun(db, args);
+  const offset = intArg(args, "offset", 0, Number.MAX_SAFE_INTEGER) ?? 0;
+  const limit = Math.min(
+    intArg(args, "limit", 1, Number.MAX_SAFE_INTEGER) ?? DEFAULT_LOG_LIMIT,
+    MAX_LOG_LIMIT,
+  );
+  const tailLines = tailLinesArg(args);
+  const lines = redactedLogLines(run);
+  const floor = tailLines === undefined ? 0 : Math.max(0, lines.length - tailLines);
+  const start = Math.min(Math.max(offset, floor), lines.length);
+  const window = lines.slice(start, start + limit);
+  return {
+    run_id: run.id,
+    lines: window,
+    offset: start,
+    has_more: start + window.length < lines.length,
+    // task_runs.status: 'running' is the only non-terminal value (succeeded /
+    // failed / timed_out / cancelled all close the log)
+    done: run.status !== "running",
+  };
 }
 
 /** `nova_result_get` — the validated §4.1 handoff artifact of a run. */

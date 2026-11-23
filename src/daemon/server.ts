@@ -79,6 +79,7 @@ import {
   taskStatus as readTaskStatus,
   transitionsSince as readTransitionsSince,
   workspaceList as readWorkspaceList,
+  runLogsSince as readRunLogsSince,
 } from "./readops.ts";
 import {
   OpError,
@@ -553,6 +554,24 @@ export function buildOpTable(): Map<string, OpHandler> {
     readRunLogs(deps.db, {
       task_id: reqString(args, "task_id"),
       ...(args["run_id"] === undefined ? {} : { run_id: reqString(args, "run_id") }),
+      ...(args["tail_lines"] === undefined ? {} : { tail_lines: args["tail_lines"] }),
+    }),
+  );
+
+  /**
+   * `nova_run_logs_since` (novaflow-v02/watch.md) — the run-log follow window.
+   * The body lives beside `runLogs` in src/daemon/readops.ts and reads through
+   * the SAME redacted-file path (never `events.raw.jsonl`, never a second
+   * scrubber); the op table only routes. `offset`, `limit` and `tail_lines`
+   * pass through unvalidated so the body stays the one rejection surface
+   * (schema_invalid), exactly like `nova_transitions_since` below.
+   */
+  ops.set("nova_run_logs_since", (args, { deps }) =>
+    readRunLogsSince(deps.db, {
+      task_id: reqString(args, "task_id"),
+      ...(args["run_id"] === undefined ? {} : { run_id: reqString(args, "run_id") }),
+      ...(args["offset"] === undefined ? {} : { offset: args["offset"] }),
+      ...(args["limit"] === undefined ? {} : { limit: args["limit"] }),
       ...(args["tail_lines"] === undefined ? {} : { tail_lines: args["tail_lines"] }),
     }),
   );

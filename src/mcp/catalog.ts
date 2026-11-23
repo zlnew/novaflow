@@ -65,12 +65,13 @@ const strArray = (description: string): object => ({
 
 /**
  * mcp.md §3.1 — read-only tools. These may serve from the SQLite store
- * directly when the daemon is unreachable (§4), with TWO documented
+ * directly when the daemon is unreachable (§4), with THREE documented
  * exceptions: `nova_daemon_status`, whose payload is live daemon state
- * that no store table holds, and `nova_events_since`, which
- * novaflow-v02/events.md rule 6 pins to `daemon_unreachable` with no
- * SQLite fallback (a liveness feed served from a store whose writer just
- * died would report a frozen world as current). See src/mcp/server.ts.
+ * that no store table holds, and `nova_events_since` /
+ * `nova_run_logs_since`, which amendments.md row 3 pins to
+ * `daemon_unreachable` with no SQLite fallback (their value is LIVENESS:
+ * a feed served from a store whose writer just died would report a frozen
+ * world as current). See src/mcp/server.ts.
  */
 const READ_TOOLS: McpTool[] = [
   {
@@ -131,6 +132,23 @@ const READ_TOOLS: McpTool[] = [
         task_id: str("the task id (bare ULID)"),
         run_id: str("the run id — omit for the task's latest run"),
         tail_lines: int("how many trailing lines to return (1..1000, default 100)"),
+      },
+    },
+  },
+  {
+    name: "nova_run_logs_since",
+    op: "nova_run_logs_since",
+    kind: "read",
+    description:
+      "Poll a run's redacted events.jsonl from a line offset (novaflow-v02/watch.md): offset is a line count, offset 0 is the file's HEAD, and the returned offset is the window's start — re-poll with offset + lines.length while has_more. done means the run's log is closed. Defaults to the task's latest run; a retry is a NEW run and is never followed. Read-only, but DAEMON-REQUIRED: a dead socket answers daemon_unreachable, never a store snapshot.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: str("the task id (bare ULID)"),
+        run_id: str("the run id — omit for the task's latest run"),
+        offset: int("the line offset to start at (default 0 = the head of the file)"),
+        limit: int("page size in lines (1..1000, default 200)"),
+        tail_lines: int("floor the window at the last N lines (1..1000) — the way to ask for the tail"),
       },
     },
   },
