@@ -542,3 +542,47 @@ test("nova_task_resolve: ULID direct, tsk_ display form, key within the workspac
     await shutdown(env);
   }
 });
+
+/* --------------------- P9 re-judge: target alias is a path segment ---------------- */
+
+test("nova_project_create refuses an unsafe target alias (schema_invalid, naming it); a normal alias still passes", async () => {
+  const env = await boot();
+  try {
+    const targetRoot = join(env.dir, "target");
+    mkdirSync(targetRoot);
+    // an alias is ONE path segment — `join(root, alias)` and the worktree
+    // layout make any path-bearing alias an escape hatch
+    for (const [i, alias] of ["../evil", "a/b", ".."].entries()) {
+      const res = await env.client.request({
+        id: `alias-${i}`,
+        op: "nova_project_create",
+        args: {
+          workspace_id: env.wsId,
+          name: `evil-alias-${i}`,
+          objective: "No.",
+          targets: [{ alias, root_path: targetRoot, target_type: "git_repo" }],
+        },
+      });
+      assert.equal(res["ok"], false, `alias ${alias} must be refused`);
+      const err = res["error"] as { code?: string; message?: string };
+      assert.equal(err?.code, "schema_invalid");
+      assert.ok(String(err?.message).includes(alias), `message must name the alias: ${err?.message}`);
+      assert.match(String(err?.message), /alias is invalid/);
+    }
+
+    // a normal alias is unaffected
+    const ok = await env.client.request({
+      id: "alias-ok",
+      op: "nova_project_create",
+      args: {
+        workspace_id: env.wsId,
+        name: "safe-alias-app",
+        objective: "Ship it.",
+        targets: [{ alias: "app", root_path: targetRoot, target_type: "git_repo" }],
+      },
+    });
+    assert.equal(ok["ok"], true, JSON.stringify(ok["error"]));
+  } finally {
+    await shutdown(env);
+  }
+});

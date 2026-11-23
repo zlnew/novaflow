@@ -342,11 +342,38 @@ function scopedTargets(db: Db, taskId: string): Array<ScopeJoinRow & {
  * startRun's preflight, BEFORE the agent spawns). Throws when a scoped
  * target's root is missing or not a directory — a preflight failure,
  * never a mid-run surprise.
+ *
+ * EXECUTION ROOTS (P9 worktrees): `executionRoots` maps target_id → the
+ * path the agent actually works in — the run's WORKTREE path for
+ * worktree-placed targets (the run loop passes the ProvisionOutcome's
+ * resolved paths), falling back to the shared `root_path` for in-place
+ * targets. The snapshot's `root_path` carries the EXECUTION root: the
+ * pi extension resolves its scope roots from this file, and the
+ * post-run verifier walks and `git status`es there — both must see the
+ * tree the agent touched, never the shared checkout. The protected
+ * DIGESTS stay sourced from the base: they are walked from the target's
+ * recorded `root_path` (the shared tree, which FR-TSK-10 AC2 has already
+ * proven clean at preflight, i.e. at the base ref), so protected paths
+ * relative to the root remain enforceable inside the worktree exactly
+ * as before.
  */
-export function writeProtectedDigests(db: Db, taskId: string, runDir: string, runId: string): string {
+export function writeProtectedDigests(
+  db: Db,
+  taskId: string,
+  runDir: string,
+  runId: string,
+  executionRoots: Record<string, string> = {},
+): string {
   const targets: ProtectedTargetSnapshot[] = scopedTargets(db, taskId).map((t) => {
     if (!existsSync(t.root_path) || !statSync(t.root_path).isDirectory()) {
       throw new Error(`target root missing or not a directory: ${t.root_path} (alias ${t.alias})`);
+    }
+    const execRoot = executionRoots[t.target_id] ?? t.root_path;
+    if (
+      execRoot !== t.root_path &&
+      (!existsSync(execRoot) || !statSync(execRoot).isDirectory())
+    ) {
+      throw new Error(`target execution root missing or not a directory: ${execRoot} (alias ${t.alias})`);
     }
     for (const [column, globs] of [
       ["protected_test_globs_json", t.protected_globs],
@@ -380,7 +407,7 @@ export function writeProtectedDigests(db: Db, taskId: string, runDir: string, ru
       target_id: t.target_id,
       alias: t.alias,
       target_type: t.target_type,
-      root_path: t.root_path,
+      root_path: execRoot,
       protected_globs: t.protected_globs,
       write_scope_globs: t.write_scope_globs,
       full_tree: fullTree,
@@ -397,6 +424,33 @@ export function writeProtectedDigests(db: Db, taskId: string, runDir: string, ru
   const path = join(runDir, SNAPSHOT_FILENAME);
   writeFileSync(path, JSON.stringify(snapshot, null, 2) + "\n");
   return path;
+}
+
+/**
+ * The per-run execution roots the snapshot recorded (target_id → the path
+ * the agent actually worked in: the worktree for worktree-placed targets,
+ * the shared root otherwise). Read by the daemon's verification wiring so
+ * FR-TSK-12 commands run WHERE THE AGENT WORKED. Returns null when the
+ * snapshot is missing or unreadable — callers fall back to the recorded
+ * root_path (the protected check itself fails closed on a bad snapshot).
+ */
+export function loadExecutionRoots(runDir: string): Record<string, string> | null {
+  const snapshotPath = join(runDir, SNAPSHOT_FILENAME);
+  if (!existsSync(snapshotPath)) return null;
+  try {
+    const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as ProtectedSnapshot;
+    if (!Array.isArray(snapshot.targets)) return null;
+    const roots: Record<string, string> = {};
+    for (const t of snapshot.targets) {
+      if (t === null || typeof t !== "object") continue;
+      if (typeof t.target_id === "string" && typeof t.root_path === "string" && t.root_path !== "") {
+        roots[t.target_id] = t.root_path;
+      }
+    }
+    return roots;
+  } catch {
+    return null;
+  }
 }
 
 /* ---------------------------------- verification ---------------------------------- */

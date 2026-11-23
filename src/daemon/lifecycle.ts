@@ -22,7 +22,7 @@ import { createChainEvaluator, type ChainEvaluator } from "../chain/readiness.ts
 import { createRoutingEvaluator, driveSelfPathRequeue, type RoutingEvaluator } from "../chain/routing.ts";
 import { bindControlServer, type ControlServer } from "./server.ts";
 import { runVerification } from "../verify/runner.ts";
-import { verifyProtectedAndScope } from "../verify/protected.ts";
+import { loadExecutionRoots, verifyProtectedAndScope } from "../verify/protected.ts";
 import { annotateRunVerification } from "../verify/artifact-annotate.ts";
 import { completeValidation } from "../validating.ts";
 import type { RunOptions, RunOutcome } from "../runs/loop.ts";
@@ -279,7 +279,16 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
     const driveVerification = (taskId: string, run: { id: string; pi_session_dir: string }): void => {
       const job = (async (): Promise<void> => {
         try {
-          const verify = await runVerification(db, taskId);
+          // P9 worktrees: FR-TSK-12 commands and the scope checks run at
+          // each target's EXECUTION root — the worktree path the run's
+          // preflight snapshot recorded (the tree the agent actually
+          // worked in), never the shared checkout
+          const executionRoots = loadExecutionRoots(run.pi_session_dir);
+          const verify = await runVerification(
+            db,
+            taskId,
+            executionRoots !== null ? { executionRoots } : {},
+          );
           const protectedCheck = await verifyProtectedAndScope(db, taskId, run.pi_session_dir);
           annotateRunVerification(db, run.id, verify, protectedCheck);
           const passed =

@@ -74,8 +74,9 @@ test("--migrate upgrades the store at boot and the daemon serves", async () => {
     try {
       const cols = (ro.prepare("PRAGMA table_info(task_runs)").all() as Array<{ name: string }>).map((c) => c.name);
       assert.ok(cols.includes("cache_read_tokens"), "cache columns applied by the boot upgrade");
+      assert.ok(cols.includes("worktree_root"), "migration 0004 applied by the boot upgrade");
       const files = (ro.prepare("SELECT filename FROM schema_migrations ORDER BY filename").all() as Array<{ filename: string }>).map((r) => r.filename);
-      assert.deepEqual(files, ["0001_init.sql", "0002_project_phase_log.sql", "0003_cache_tokens.sql"]);
+      assert.deepEqual(files, ["0001_init.sql", "0002_project_phase_log.sql", "0003_cache_tokens.sql", "0004_worktree_root.sql"]);
     } finally {
       ro.close();
     }

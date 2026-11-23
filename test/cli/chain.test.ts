@@ -315,3 +315,68 @@ test("nova project import-dag + nova chain end to end through the binary", async
     await forceStopDaemon(h);
   }
 });
+
+/**
+ * `nova chain clean <chain_id> [--force]` through the binary (srs 4.1.1
+ * "Chain clean", novaflow-v030 amendments row 2): the verb is thin — the
+ * daemon owns the refusal rules — so this pins the WIRE mapping (state
+ * rejection → 3, unknown chain → 4) and the `--force` flag discipline on the
+ * other chain verbs.
+ */
+test("nova chain clean refuses a non-terminal chain through the binary; --force belongs to clean alone", async () => {
+  const h = makeHome();
+  try {
+    assert.equal(runNova(["daemon", "start"], h.env).code, 0);
+    assert.equal(runNova(["workspace", "create", "alpha", "--path", h.wsRoot], h.env).code, 0);
+    assert.equal(runNova(["workspace", "switch", "alpha"], h.env).code, 0);
+    const profileSrc = join(h.dir, "dev.json");
+    writeFileSync(
+      profileSrc,
+      JSON.stringify({
+        name: "dev",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet-20241022",
+        thinking_level: "medium",
+        system_prompt_path: "prompts/dev_system.md",
+        tools_allowlist: ["bash", "read"],
+        limits: { max_timeout_sec: 3600, max_cost_usd: 5 },
+      }),
+    );
+    assert.equal(runNova(["profile", "create", "--file", profileSrc], h.env).code, 0);
+    mkdirSync(join(h.wsRoot, "prompts"), { recursive: true });
+    writeFileSync(join(h.wsRoot, "prompts", "dev_system.md"), "You are a worker agent.\n");
+    assert.equal(
+      runNova(["project", "create", "app", "--objective", "Ship it.", "--target", `code=${h.wsRoot}`], h.env).code,
+      0,
+    );
+    const jsonFile = join(h.dir, "clean.json");
+    writeFileSync(jsonFile, graphJson("K1", "K2"));
+    assert.equal(runNova(["project", "import-dag", jsonFile], h.env).code, 0);
+
+    const list = JSON.parse(runNova(["chain", "list", "--json"], h.env).stdout) as {
+      chains: Array<{ id: string; state: string }>;
+    };
+    const chain = list.chains[0]!;
+    assert.equal(chain.state, "active");
+
+    // a non-terminal chain is refused, naming the state
+    const refused = runNova(["chain", "clean", chain.id], h.env);
+    assert.equal(refused.code, 3, refused.stderr);
+    assert.match(refused.stderr, /invalid_transition/);
+    assert.match(refused.stderr, /is active/);
+    assert.match(refused.stderr, /--force|terminal/);
+
+    // unknown chain → 4 (never a silent success)
+    const unknown = runNova(["chain", "clean", "01M84J1ZE6M1P380WK7SBNF1M8"], h.env);
+    assert.equal(unknown.code, 4);
+
+    // --force is clean's flag only: another chain verb rejects it as usage
+    const misuse = runNova(["chain", "list", "--force"], h.env);
+    assert.equal(misuse.code, 2);
+    assert.match(misuse.stderr, /unknown flag --force/);
+
+    assert.equal(runNova(["daemon", "stop"], h.env).code, 0);
+  } finally {
+    await forceStopDaemon(h);
+  }
+});

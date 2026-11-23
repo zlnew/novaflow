@@ -116,8 +116,16 @@ export type LiveRun = {
 export type DispatchStatus = {
   paused: boolean;
   running: number;
+  /**
+   * novaflow-v030 W1 R1.4 + mcp §3.1 amendment row 6: the dispatched-and-
+   * running count. Same number as `running` (one live attempt per task in a
+   * single daemon), reported under the name the contract pins.
+   */
+  inflight: number;
   liveTasks: string[];
   queued: number;
+  /** Each running run's worktree root (NULL for an in-place run). */
+  runs: Array<{ task_id: string; worktree_root: string | null }>;
 };
 
 type CandidateRow = {
@@ -323,13 +331,25 @@ export function createDispatcher(db: Db, opts: DispatchOptions) {
   }
 
   function status(): DispatchStatus {
+    const liveTasks = [...live.keys()];
+    // R1.4: the payload names each running run's worktree_root (migration
+    // 0004). The live attempt is the task's newest run row.
+    const findRun = db.prepare(
+      "SELECT worktree_root FROM task_runs WHERE task_id = ? ORDER BY attempt_number DESC LIMIT 1",
+    );
+    const runs = liveTasks.map((taskId) => {
+      const row = findRun.get(taskId) as { worktree_root: string | null } | undefined;
+      return { task_id: taskId, worktree_root: row?.worktree_root ?? null };
+    });
     return {
       paused,
       running: live.size,
-      liveTasks: [...live.keys()],
+      inflight: live.size,
+      liveTasks,
       queued: (
         db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE state = 'queued'").get() as { n: number }
       ).n,
+      runs,
     };
   }
 

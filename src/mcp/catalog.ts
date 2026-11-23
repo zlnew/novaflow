@@ -171,7 +171,7 @@ const READ_TOOLS: McpTool[] = [
     op: "nova_daemon_status",
     kind: "read",
     description:
-      "Scheduler state, active/queued run counts, recovery summary and budget counters. LIVE daemon state — unavailable when the daemon is down.",
+      "Scheduler state, the inflight (dispatched-and-running) count with each running run's worktree_root, recovery summary and budget counters. LIVE daemon state — unavailable when the daemon is down.",
     inputSchema: { type: "object", properties: {} },
   },
   {
