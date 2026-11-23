@@ -173,7 +173,11 @@ test("a scoped target whose root is missing is a preflight failure — no spawn,
     const row = runRow(s);
     assert.equal(row.preflight_status, "failed");
     assert.equal(row.pid, null);
-    assert.match(row.error_summary ?? "", /protected digests: target root missing/);
+    // P9 re-rooting moved the digest snapshot AFTER provisioning, so the
+    // FR-TSK-10 AC1 root-existence check now fires first — the intent
+    // (missing root → zero-token preflight refusal, no spawn) is unchanged
+    assert.match(row.error_summary ?? "", /preflight failure: target "app" root_path/);
+    assert.match(row.error_summary ?? "", /does not exist/);
     // the stub was never spawned
     assert.equal(existsSync(s.pidfile), false);
   } finally {

@@ -27,8 +27,8 @@ test("migration 0003 applies and adds cache_read_tokens/cache_write_tokens (INTE
   const dir = mkdtempSync(join(tmpdir(), "novaflow-mig0003-"));
   const db = openDb(join(dir, "state.db"));
   try {
-    // 0001_init + 0002_project_phase_log + 0003_cache_tokens
-    assert.equal(migrate(db), 3);
+    // 0001_init + 0002_project_phase_log + 0003_cache_tokens + 0004_worktree_root
+    assert.equal(migrate(db), 4);
 
     const cols = db.prepare("PRAGMA table_info(task_runs)").all() as ColumnInfo[];
     const byName = new Map(cols.map((c) => [c.name, c]));

@@ -12,14 +12,19 @@ import { MIGRATIONS_DIR, applyPending, migrate, BootRefusedError } from "../../s
  * EXISTING store. These tests build a store at the 0001+0002 level and prove
  * `applyPending` walks it forward — and refuses tamper.
  */
-function tempMigrations(level: 2 | 3): string {
+function tempMigrations(level: 2 | 3 | 4): string {
   const dir = mkdtempSync(join(tmpdir(), `novaflow-mig-${process.pid}-`));
-  const files = ["0001_init.sql", "0002_project_phase_log.sql", "0003_cache_tokens.sql"];
+  const files = [
+    "0001_init.sql",
+    "0002_project_phase_log.sql",
+    "0003_cache_tokens.sql",
+    "0004_worktree_root.sql",
+  ];
   for (const f of files.slice(0, level)) copyFileSync(join(MIGRATIONS_DIR, f), join(dir, f));
   return dir;
 }
 
-test("applyPending walks an existing store from 0001+0002 to 0003 (the upgrade path)", () => {
+test("applyPending walks an existing store from 0001+0002 to head (the upgrade path)", () => {
   const at2 = tempMigrations(2);
   const dir = mkdtempSync(join(tmpdir(), "novaflow-upg-"));
   const dbPath = join(dir, "state.db");
@@ -33,12 +38,12 @@ test("applyPending walks an existing store from 0001+0002 to 0003 (the upgrade p
     // the upgrade: nothing to apply yet under the old dir, then the real one
     assert.deepEqual(applyPending(db, { migrationsDir: at2 }).applied, []);
     const report = applyPending(db);
-    assert.deepEqual(report.applied, ["0003_cache_tokens.sql"]);
+    assert.deepEqual(report.applied, ["0003_cache_tokens.sql", "0004_worktree_root.sql"]);
     assert.ok(cols().includes("cache_read_tokens"));
     assert.ok(cols().includes("cache_write_tokens"));
     // recorded, and idempotent
     const rows = db.prepare("SELECT filename FROM schema_migrations ORDER BY filename").all() as Array<{ filename: string }>;
-    assert.deepEqual(rows.map((r) => r.filename), ["0001_init.sql", "0002_project_phase_log.sql", "0003_cache_tokens.sql"]);
+    assert.deepEqual(rows.map((r) => r.filename), ["0001_init.sql", "0002_project_phase_log.sql", "0003_cache_tokens.sql", "0004_worktree_root.sql"]);
     assert.deepEqual(applyPending(db).applied, [], "a second run applies nothing");
     // and the store now BOOTS (migrate() sees full agreement)
     assert.equal(migrate(db), 0);

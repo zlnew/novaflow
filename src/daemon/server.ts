@@ -1,5 +1,13 @@
 import { connect, createServer, type Socket } from "node:net";
-import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmdirSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import type { Db } from "../store/db.ts";
@@ -93,6 +101,13 @@ import {
   workspaceList as readWorkspaceList,
   runLogsSince as readRunLogsSince,
 } from "./readops.ts";
+import {
+  invalidTargetAlias,
+  pruneWorktrees,
+  removeWorktree,
+  runWorktreeTargets,
+  worktreeIsDirty,
+} from "../runs/worktrees.ts";
 import {
   OpError,
   optBoolean,
@@ -394,6 +409,13 @@ function parseTargetsArg(args: Record<string, unknown>): ProjectTargetInput[] | 
       }
     }
     const alias = reqString(o, "alias");
+    const badAlias = invalidTargetAlias(alias);
+    if (badAlias !== null) {
+      throw new OpError(
+        "schema_invalid",
+        `args.targets alias is invalid: ${badAlias}`,
+      );
+    }
     const rootPath = reqString(o, "root_path");
     const targetType = o["target_type"];
     if (targetType !== "git_repo" && targetType !== "directory") {
@@ -1606,6 +1628,138 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
     deps.pausedChains.delete(chainRunId);
     const propagation = await deps.chains.propagateChain(chainRunId);
     return { chain_run_id: chainRunId, paused: false, enqueued: propagation.enqueued };
+  });
+
+  /**
+   * `nova chain clean <chain-run-id> [--force]` (srs 4.1.1 "Chain clean";
+   * novaflow-v030 amendments row 2) — the operator confirmation `data` 3.x
+   * presupposes for worktree cleanup.
+   *
+   * RULES (the contract, verbatim): refuses a chain whose row is not
+   * terminal (naming the state); refuses a member run whose worktree has
+   * uncommitted changes unless `--force`, NAMING THE RUN; removes the
+   * worktrees and prunes; reports every removed tree; NEVER deletes a run
+   * row or its artifacts — `task_runs.worktree_root` is history.
+   *
+   * The refusal is planned BEFORE anything is removed, so a refused clean
+   * leaves every tree exactly as it was.
+   */
+  ops.set("nova_chain_clean", (args, { deps }) => {
+    const chainRunId = reqString(args, "chain_run_id");
+    const force = optBoolean(args, "force") === true;
+    const chain = getChainRun(deps.db, chainRunId);
+    if (chain === undefined) throw new OpError("not_found", `no such chain run: ${chainRunId}`);
+    if (chain.state === "active") {
+      throw new OpError(
+        "invalid_transition",
+        `chain run ${chainRunId} is active — worktree cleanup is the post-terminal confirmation (data §3): wait for completed/failed/aborted, or abort the chain first`,
+      );
+    }
+    const rows = deps.db
+      .prepare(
+        `SELECT r.id AS run_id, r.task_id, r.worktree_root, t.key
+           FROM task_runs r JOIN tasks t ON t.id = r.task_id
+          WHERE t.chain_run_id = ? AND r.worktree_root IS NOT NULL
+          ORDER BY r.started_at, r.id`,
+      )
+      .all(chainRunId) as Array<{
+      run_id: string;
+      task_id: string;
+      worktree_root: string;
+      key: string;
+    }>;
+
+    type Removal = { run_id: string; task_id: string; key: string; path: string; repoRoot: string; dirty: boolean; exists: boolean; error: string | null };
+    const planned: Removal[] = [];
+    for (const row of rows) {
+      for (const target of runWorktreeTargets(deps.db, row.task_id, row.worktree_root)) {
+        const exists = existsSync(target.path);
+        const state = exists ? worktreeIsDirty(target.path) : { dirty: false, error: null };
+        planned.push({
+          run_id: row.run_id,
+          task_id: row.task_id,
+          key: row.key,
+          path: target.path,
+          repoRoot: target.repoRoot,
+          dirty: state.dirty,
+          exists,
+          error: exists ? state.error : null,
+        });
+      }
+    }
+
+    const dirty = planned.filter((p) => p.exists && p.dirty);
+    // FAIL CLOSED (must-fix): a worktree whose dirtiness CANNOT be assessed
+    // (broken .git, missing main repo) is treated as holding work — an
+    // unassessable tree must never be silently removed as "clean"
+    const unassessable = planned.filter((p) => p.exists && p.error !== null);
+    if ((dirty.length > 0 || unassessable.length > 0) && !force) {
+      const first = dirty[0] ?? unassessable[0]!;
+      const why =
+        dirty.length > 0
+          ? `has uncommitted changes in ${first.path}`
+          : `could not be assessed in ${first.path} — ${first.error}`;
+      throw new OpError(
+        "invalid_transition",
+        `chain run ${chainRunId}: run ${first.run_id} (task ${first.key}) ${why}` +
+          `${dirty.length + unassessable.length > 1 ? ` (+${dirty.length + unassessable.length - 1} more)` : ""} — refusing to remove a worktree that holds (or may hold) work; commit or discard it, or re-run with --force`,
+      );
+    }
+
+    const removed: Array<{ run_id: string; task_id: string; key: string; path: string; forced: boolean }> = [];
+    const missing: string[] = [];
+    const failed: Array<{ path: string; error: string }> = [];
+    const repos = new Set<string>();
+    for (const item of planned) {
+      if (!item.exists) {
+        missing.push(item.path);
+        if (existsSync(item.repoRoot)) repos.add(item.repoRoot);
+        continue;
+      }
+      const res = removeWorktree(item.repoRoot, item.path, force && (item.dirty || item.error !== null));
+      if (!res.ok) {
+        failed.push({ path: item.path, error: res.error ?? "git worktree remove failed" });
+        continue;
+      }
+      removed.push({
+        run_id: item.run_id,
+        task_id: item.task_id,
+        key: item.key,
+        path: item.path,
+        forced: force && (item.dirty || item.error !== null),
+      });
+      repos.add(item.repoRoot);
+    }
+    // the run's ROOT is the engine's own container: when its last subdirectory
+    // is gone it is removed too (rmdir only — an occupied directory is never
+    // touched, so nothing outside the root can be lost)
+    for (const row of rows) {
+      try {
+        if (existsSync(row.worktree_root) && readdirSync(row.worktree_root).length === 0) {
+          rmdirSync(row.worktree_root);
+        }
+      } catch {
+        // a concurrently written entry wins: leave the root alone
+      }
+    }
+    const pruned: string[] = [];
+    for (const repoRoot of repos) {
+      const res = pruneWorktrees(repoRoot);
+      if (res.ok) pruned.push(repoRoot);
+      else failed.push({ path: repoRoot, error: res.error ?? "git worktree prune failed" });
+    }
+
+    return {
+      chain_run_id: chainRunId,
+      state: chain.state,
+      forced: force,
+      removed,
+      missing,
+      pruned,
+      failed,
+      // the rows and their artifacts are history: reported, never touched
+      runs_kept: rows.length,
+    };
   });
 
   /* ------------------------ schedule ops (FR-SCH-01/03) ----------------------- */

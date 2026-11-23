@@ -59,7 +59,7 @@ test("PRESERVE: the default migrationsDir is the shipped directory (production b
   const dir = mkdtempSync(join(tmpdir(), "novaflow-"));
   const db = openDb(join(dir, "state.db"));
   try {
-    assert.equal(migrate(db), 3, "0001_init + 0002_project_phase_log + 0003_cache_tokens apply from the shipped dir");
+    assert.equal(migrate(db), 4, "0001_init + 0002_project_phase_log + 0003_cache_tokens + 0004_worktree_root apply from the shipped dir");
     assert.equal(migrate(db), 0, "idempotent");
   } finally {
     db.close();
@@ -135,12 +135,13 @@ test("a CONCURRENT migrate on the shipped directory never sees a foreign file (t
           }),
       ),
     );
-    assert.deepEqual(results, stores.map(() => 3), "every concurrent boot applied all three migrations");
+    assert.deepEqual(results, stores.map(() => 4), "every concurrent boot applied all four migrations");
     // and the shipped directory holds exactly the shipped files
     assert.deepEqual(readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith(".sql")).sort(), [
       "0001_init.sql",
       "0002_project_phase_log.sql",
       "0003_cache_tokens.sql",
+      "0004_worktree_root.sql",
     ]);
   } finally {
     for (const store of stores) rmSync(store, { recursive: true, force: true });

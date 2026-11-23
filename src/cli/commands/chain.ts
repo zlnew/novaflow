@@ -2,12 +2,14 @@ import { daemonRequest } from "../client.ts";
 import { parseArgs, UsageError, type ArgSpec } from "../args.ts";
 import { renderKv, renderTable } from "../format.ts";
 import { operatorActor, workspaceContext } from "../context.ts";
-import { EXIT_OK } from "../exitcode.ts";
+import { EXIT_OPERATION_FAILED, EXIT_OK } from "../exitcode.ts";
 import { drainTransitions, isTerminalState, pollIntervalMs, sleep } from "../watch.ts";
 import type { CommandOpts } from "../opts.ts";
 
 /**
- * `nova chain …` (srs 4.1.1): list/status/abort — plus pause/resume.
+ * `nova chain …` (srs 4.1.1): list/status/abort — plus pause/resume, and
+ * `clean <chain_id> [--force]` (the v0.3.0 worktree-cleanup confirmation, see
+ * `clean` at the bottom of this file).
  *
  * VERB-TABLE TENSION (documented honestly): FR-TSK-08 names "Pause
  * Chain" and "Resume" as operator CLI controls and rules them
@@ -34,6 +36,9 @@ import type { CommandOpts } from "../opts.ts";
 
 const SPEC: ArgSpec = {
   valueFlags: ["workspace"],
+  // --force is `nova chain clean`'s operator confirmation (srs 4.1.1);
+  // every other chain verb rejects it below so this spec stays honest
+  booleanFlags: ["force"],
 };
 
 type ChainRow = {
@@ -49,6 +54,9 @@ type ChainRow = {
 export async function chainCommand(argv: string[], opts: CommandOpts): Promise<number> {
   const p = parseArgs(argv, SPEC);
   const sub = p.positionals[0];
+  if (p.flags.has("force") && sub !== "clean") {
+    throw new UsageError(`unknown flag --force for \`nova chain ${String(sub)}\``);
+  }
   switch (sub) {
     case "list":
       return list(p, opts);
@@ -60,9 +68,11 @@ export async function chainCommand(argv: string[], opts: CommandOpts): Promise<n
       return pause(p, opts);
     case "resume":
       return resume(p, opts);
+    case "clean":
+      return clean(p, opts);
     default:
       throw new UsageError(
-        `nova chain [list|status|abort|pause|resume]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`,
+        `nova chain [list|status|abort|pause|resume|clean]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`,
       );
   }
 }
@@ -254,4 +264,42 @@ async function resume(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
     `chain ${chainRunId} resumed — readiness evaluated immediately: ${enqueued} member${enqueued === 1 ? "" : "s"} enqueued`,
   );
   return 0;
+}
+
+/**
+ * `nova chain clean <chain-run-id> [--force]` (srs 4.1.1 "Chain clean",
+ * novaflow-v030 amendments row 2): the operator confirmation the `data` 3.x
+ * worktree-cleanup rule presupposes. The daemon owns the refusal rules
+ * (non-terminal chain, dirty worktree without --force, naming the run); this
+ * verb only reports what was removed. Exit 1 when any removal failed.
+ */
+async function clean(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
+  const chainRunId = chainIdArg(p);
+  const force = p.flags.has("force");
+  const data = (await daemonRequest("nova_chain_clean", {
+    chain_run_id: chainRunId,
+    force,
+  })) as {
+    chain_run_id: string;
+    state: string;
+    forced: boolean;
+    removed: Array<{ run_id: string; key: string; path: string; forced: boolean }>;
+    missing: string[];
+    pruned: string[];
+    failed: Array<{ path: string; error: string }>;
+    runs_kept: number;
+  };
+  if (opts.json) {
+    console.log(JSON.stringify(data));
+    return data.failed.length > 0 ? EXIT_OPERATION_FAILED : EXIT_OK;
+  }
+  console.log(`chain ${data.chain_run_id}: ${data.state} — removed ${data.removed.length} worktree${data.removed.length === 1 ? "" : "s"}`);
+  for (const r of data.removed) {
+    console.log(`  run ${r.run_id} (${r.key}): ${r.path}${r.forced ? " [forced]" : ""}`);
+  }
+  for (const path of data.missing) console.log(`  already gone (pruned): ${path}`);
+  for (const repo of data.pruned) console.log(`  pruned: ${repo}`);
+  for (const f of data.failed) console.error(`  FAILED: ${f.path} — ${f.error}`);
+  console.log(`  ${data.runs_kept} run row${data.runs_kept === 1 ? "" : "s"} and their artifacts kept (worktree_root is history)`);
+  return data.failed.length > 0 ? EXIT_OPERATION_FAILED : EXIT_OK;
 }
