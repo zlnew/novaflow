@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { openDb, type Db } from "../store/db.ts";
-import { migrate } from "../store/migrate.ts";
+import { migrate, BootRefusedError, applyPending } from "../store/migrate.ts";
 import {
   defaultDaemonConfigPath,
   loadDaemonConfig,
@@ -58,6 +58,8 @@ import type { NotifyOptions } from "../notify.ts";
 export type StartDaemonOptions = {
   /** SQLite database file path (opened + migrated here). */
   dbPath: string;
+  /** `nova daemon start --migrate`: apply pending migrations at boot (the upgrade path). */
+  migrateOnBoot?: boolean;
   /** Override ~/.novaflow/novaflow.sock (tests). */
   socketPath?: string | undefined;
   /** Override ~/.novaflow/config.yaml (tests). */
@@ -198,7 +200,23 @@ export async function startDaemon(opts: StartDaemonOptions): Promise<DaemonHandl
   let schedulesRef: ScheduleEvaluator | undefined;
   let stopped = false;
   try {
+    try {
     migrate(db);
+  } catch (err) {
+    // `nova daemon start --migrate` (p1 review finding 1): version skew is the
+    // one state the daemon refuses, so the upgrade runs HERE — the daemon owns
+    // the store. Drift/tamper still refuses (applyPending checks it first).
+    if (opts.migrateOnBoot === true && err instanceof BootRefusedError) {
+      const report = applyPending(db);
+      warn(
+        report.applied.length === 0
+          ? `store already at head (${report.alreadyApplied} migrations)`
+          : `applied pending migrations: ${report.applied.join(", ")}`,
+      );
+    } else {
+      throw err;
+    }
+  }
 
     // the price table the spend block reports coverage for (novaflow-v02/
     // spend.md): loaded once at boot, from the same path the runs use
