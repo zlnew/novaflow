@@ -307,7 +307,12 @@ export function transitionsSince(
   args: Record<string, unknown>,
 ): Record<string, unknown> {
   const cursor = intArg(args, "cursor", 0, Number.MAX_SAFE_INTEGER) ?? 0;
-  const limit = intArg(args, "limit", 1, MAX_TRANSITION_LIMIT) ?? DEFAULT_TRANSITION_LIMIT;
+  // events.md ruling 4: 0 / non-integer is schema_invalid, ABOVE the max CLAMPS
+  // (a --follow drain loop asking for 5000 gets a full 1000-row page, not a refusal)
+  const limit = Math.min(
+    intArg(args, "limit", 1, Number.MAX_SAFE_INTEGER) ?? DEFAULT_TRANSITION_LIMIT,
+    MAX_TRANSITION_LIMIT,
+  );
   const workspaceId = optNonEmptyString(args, "workspace_id");
   const projectId = optNonEmptyString(args, "project_id");
   const taskId = optNonEmptyString(args, "task_id");
