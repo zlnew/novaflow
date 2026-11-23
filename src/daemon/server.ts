@@ -86,6 +86,7 @@ import {
   ChainValidationError,
 } from "../chain/import.ts";
 import { memberReadiness, type ChainEvaluator } from "../chain/readiness.ts";
+import { chainVerificationReport } from "../chain/verify.ts";
 import { deliveredFeedbackPaths, driveSelfPathRequeue, type RoutingEvaluator } from "../chain/routing.ts";
 import { parseYaml, YamlParseError } from "../chain/yaml.ts";
 import {
@@ -1522,6 +1523,24 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
       feedback: deliveredFeedbackPaths(deps.db, m.id),
     }));
     return { chain, members, paused: deps.pausedChains.has(chainRunId) };
+  });
+
+  /**
+   * `nova chain verify <chain-run-id>` (srs 4.1.1 + novaflow-v030 amendments
+   * row 4 — DEBT-006): per member, over its NEWEST run, the verification
+   * commands configured at run time versus the commands the engine actually
+   * executed with their exit status. READ-ONLY: the body only reads the
+   * chain/task/run rows and the run's own artifacts (events frame,
+   * engine-context snapshot, §4.1 block) — never the task's current config,
+   * which is not evidence about a run that already happened. The UNEXECUTED
+   * verdict is the CLI's exit contract (engine-state, exit 3), not an error
+   * frame: the report itself always answers `ok`, so `--json` stays parseable.
+   */
+  ops.set("nova_chain_verify", (args, { deps }) => {
+    const chainRunId = reqString(args, "chain_run_id");
+    const report = chainVerificationReport(deps.db, chainRunId);
+    if (report === undefined) throw new OpError("not_found", `no such chain run: ${chainRunId}`);
+    return report;
   });
 
   /**

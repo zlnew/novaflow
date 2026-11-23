@@ -262,7 +262,7 @@ test("no configured verification commands → vacuous pass with empty results", 
   const s = seed();
   try {
     const out = await withBound(t.signal, BOUND_MS, runVerification(s.db, s.taskId));
-    const vacuous: VerifyOutcome = { passed: true, collectionError: null, results: [] };
+    const vacuous: VerifyOutcome = { passed: true, collectionError: null, configured: [], results: [] };
     assert.deepEqual(out, vacuous);
   } finally {
     s.db.close();

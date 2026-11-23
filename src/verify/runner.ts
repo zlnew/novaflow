@@ -286,6 +286,14 @@ export type VerifyOutcome = {
   /** ALL commands passed. No commands configured → vacuous pass. */
   passed: boolean;
   /**
+   * The command set as COLLECTED for this pass, each pinned to the root it
+   * runs in (empty when collection failed — the set is then unknown). The
+   * configured side of the run's verification record (src/verify/record.ts,
+   * DEBT-006): `nova chain verify` prints THIS, never the task's current
+   * config.
+   */
+  configured: ScopeCommand[];
+  /**
    * Non-null when the command set itself could not be collected
    * (malformed `verification_commands_json` in a task_target_scopes
    * row): a FAILED verdict with no per-command results — collecting
@@ -347,12 +355,12 @@ export async function runVerification(
   } catch (err) {
     // a malformed command-set definition is a FAILED verdict — the
     // verifier's "never throws" contract starts at collection
-    return { passed: false, collectionError: (err as Error).message, results: [] };
+    return { passed: false, collectionError: (err as Error).message, configured: [], results: [] };
   }
   const results: CommandResult[] = [];
   for (const c of commands) {
     const res = await runGroupedCommand(["/bin/sh", "-c", c.command], c.rootPath, opts);
     results.push(judge(c.command, c.rootPath, res));
   }
-  return { passed: results.every((r) => r.passed), collectionError: null, results };
+  return { passed: results.every((r) => r.passed), collectionError: null, configured: commands, results };
 }
