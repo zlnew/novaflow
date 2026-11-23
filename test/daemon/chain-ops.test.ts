@@ -104,10 +104,16 @@ tasks:
     title: Task A
     objective: The objective of task A.
     profile_name: dev
+    target_scopes:
+      - repo_alias: ${SCOPES[0]!.repo_alias}
+        access_mode: read_write
   - key: B
     title: Task B
     objective: The objective of task B.
     profile_name: dev
+    target_scopes:
+      - repo_alias: ${SCOPES[0]!.repo_alias}
+        access_mode: read_write
 edges:
   - source_key: A
     target_key: B
@@ -195,7 +201,7 @@ test("import-dag: YAML raw text (format yaml) and the auto format (JSON first, t
 
     // auto: JSON content parses as JSON
     const autoJson = await importVia(env, chainGraph({ tasks: [
-      { key: "J1", title: "Task one", objective: "The objective of task one.", profile_name: "dev" },
+      { key: "J1", title: "Task one", objective: "The objective of task one.", profile_name: "dev", target_scopes: SCOPES },
     ], edges: [] }));
     assert.equal(autoJson["ok"], true, JSON.stringify(autoJson));
 
@@ -261,13 +267,33 @@ test("import-dag refusals map to the taxonomy: mismatch, unknown project, ambigu
     }
     rw.close();
     const ambiguous = await importVia(env, chainGraph({
-      tasks: [{ key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "twin" }],
+      tasks: [{ key: "A", title: "Task A", objective: "The objective of task A.", profile_name: "twin", target_scopes: SCOPES }],
       edges: [],
     }));
     assert.equal(ambiguous["ok"], false);
     const aerr = ambiguous["error"] as Record<string, unknown>;
     assert.equal(aerr["code"], "profile_unresolved");
     assert.match(String(aerr["message"]), /twin/);
+
+    // DEBT-011: a member without target_scopes → schema_invalid over the
+    // wire, naming the member and the fix (never a chain that can never run)
+    const scopeless = await importVia(env, chainGraph({
+      tasks: [{ key: "NS", title: "No scope", objective: "The objective of task NS.", profile_name: "dev" }],
+      edges: [],
+    }));
+    assert.equal(scopeless["ok"], false);
+    const serr = scopeless["error"] as Record<string, unknown>;
+    assert.equal(serr["code"], "schema_invalid");
+    assert.match(String(serr["message"]), /add target_scopes to member NS/);
+
+    // every refusal above was atomic: no chain row was ever created
+    const ro = readConnection(env.dbPath);
+    assert.equal(
+      (ro.prepare("SELECT COUNT(*) AS n FROM chain_runs").get() as { n: number }).n,
+      0,
+      "a refused import leaves no chain_runs row behind",
+    );
+    ro.close();
   } finally {
     await shutdown(env);
   }
@@ -1040,8 +1066,8 @@ test("boot order: an unrouted review occurrence survives the crash window — ro
     version: "1.0.0",
     project_slug: "prj",
     tasks: [
-      { key: "E", title: "Emitter", objective: "The objective of the emitter task.", profile_name: "dev" },
-      { key: "T", title: "Target", objective: "The objective of the target task.", profile_name: "dev" },
+      { key: "E", title: "Emitter", objective: "The objective of the emitter task.", profile_name: "dev", target_scopes: SCOPES },
+      { key: "T", title: "Target", objective: "The objective of the target task.", profile_name: "dev", target_scopes: SCOPES },
     ],
     edges: [{ source_key: "E", target_key: "T", edge_type: "on_changes_requested" }],
   });
@@ -1121,7 +1147,7 @@ test("self-path boot recovery: a member wedged in changes_requested by a crash r
   const { tasks } = importChainOffline(seeded, dir, {
     version: "1.0.0",
     project_slug: "prj",
-    tasks: [{ key: "S", title: "Self", objective: "The objective of the self task.", profile_name: "dev" }],
+    tasks: [{ key: "S", title: "Self", objective: "The objective of the self task.", profile_name: "dev", target_scopes: SCOPES }],
     edges: [],
   });
   const s = tasks["S"]!.id;
@@ -1177,7 +1203,7 @@ test("self-path boot recovery, budget spent: the ESCALATION arm (re-judge findin
   const { tasks } = importChainOffline(seeded, dir, {
     version: "1.0.0",
     project_slug: "prj",
-    tasks: [{ key: "S", title: "Self", objective: "The objective of the self task.", profile_name: "dev" }],
+    tasks: [{ key: "S", title: "Self", objective: "The objective of the self task.", profile_name: "dev", target_scopes: SCOPES }],
     edges: [],
   });
   const s = tasks["S"]!.id;
@@ -1217,7 +1243,7 @@ test("boot summary recovery: present → untouched, deleted → rewritten (re-ju
   const { chainRun, tasks } = importChainOffline(seeded, dir, {
     version: "1.0.0",
     project_slug: "prj",
-    tasks: [{ key: "M", title: "Member", objective: "The objective of the member task.", profile_name: "dev" }],
+    tasks: [{ key: "M", title: "Member", objective: "The objective of the member task.", profile_name: "dev", target_scopes: SCOPES }],
     edges: [],
   });
   const m = tasks["M"]!.id;

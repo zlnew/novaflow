@@ -54,6 +54,12 @@ function seed(): Seed {
      VALUES (?, NULL, 'dev', 'anthropic', 'm1', 'prompts/dev_system.md')`,
   ).run(ulid());
   const profileId = (db.prepare("SELECT id FROM agent_profiles").get() as { id: string }).id;
+  // the FK every member's target_scopes reference (the import resolves
+  // repo_alias to a project_targets row before the transaction)
+  db.prepare(
+    `INSERT INTO project_targets (id, project_id, alias, target_type, root_path)
+     VALUES (?, ?, 'app', 'directory', ?)`,
+  ).run(ulid(), projectId, join(wsRoot, "target"));
   return { db, dir, wsRoot, workspaceId, projectId, profileId };
 }
 
@@ -72,6 +78,7 @@ function importMembers(s: Seed, tasks: TaskSpec[]): { chainId: string; ids: Reco
         title: t.title ?? `Task ${t.key}`,
         objective: `The objective of task ${t.key}.`,
         profile_name: "dev",
+        target_scopes: [{ repo_alias: "app", access_mode: "read_write" }],
       })),
       edges: [],
     },

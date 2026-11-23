@@ -6,6 +6,7 @@ import {
   CHAIN_KNOWN_KEYS,
   CHAIN_ARRAY_KEYS,
   TASK_REQUIRED_KEYS,
+  TASK_IMPORT_REQUIRED_KEYS,
   TASK_KNOWN_KEYS,
   SCOPE_KNOWN_KEYS,
   SCOPE_REQUIRED_KEYS,
@@ -96,6 +97,21 @@ test("chain validator required/known keys equal the live §4.3 schema at every l
     "thinking_level",
     "timeout_sec",
   ]);
+});
+
+test("golden: the import's required member keys are the live §4.3 set plus target_scopes (amendment row 5, DEBT-011)", () => {
+  const schema = extractChainSchema() as unknown as ChainSchema;
+  const tasks = schema.properties["tasks"] as SchemaProp & {
+    items: SchemaProp;
+  };
+  // v0.3.0 amendment row 5 is now PINNED into the §4.3 block itself, so the
+  // block's required array already carries target_scopes and the union is
+  // idempotent — dedupe keeps it a real union. (TASK_REQUIRED_KEYS stays
+  // pinned to the block verbatim above.)
+  assert.deepEqual(
+    [...TASK_IMPORT_REQUIRED_KEYS].sort(),
+    [...new Set([...(tasks.items.required ?? []), "target_scopes"])].sort(),
+  );
 });
 
 test("golden: every constraint the validator mirrors equals the live §4.3 block", () => {
