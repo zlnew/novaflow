@@ -1613,6 +1613,10 @@ export type WakeState = {
    * between; these are re-checked on the next poll instead of losing the wake.
    */
   pendingChains: Map<string, WakeTransitionRow>;
+  /** Per-chain schedule for the sticky re-check: next due poll + current gap. */
+  pendingChecks: Map<string, { due: number; gap: number }>;
+  /** Poll counter driving that backoff. */
+  pollIndex: number;
   /** The daemon-down warn is raised once per session (wake.md: "silences"). */
   warnedDown: boolean;
 };
@@ -1623,6 +1627,8 @@ export function newWakeState(): WakeState {
     seeded: false,
     chainsWoken: new Set<string>(),
     pendingChains: new Map<string, WakeTransitionRow>(),
+    pendingChecks: new Map<string, { due: number; gap: number }>(),
+    pollIndex: 0,
     warnedDown: false,
   };
 }
@@ -1862,7 +1868,18 @@ export async function pollWakeStep(state: WakeState, deps: WakePollDeps): Promis
         pagesRead++;
       }
     }
+    // Sticky chain re-checks (judge P4 finding 1). The FIRST follow-up check
+    // lands on the very next poll — the engine writes a member's transition row
+    // before moving its chain row, so "one beat later" must always be checked.
+    // Only the REPEAT checks back off (gap 1, 2, 4, 8 …): a chain that never
+    // terminates then costs O(log n) reads instead of one per poll for the
+    // session's life.
+    state.pollIndex += 1;
     for (const [chainRunId, member] of [...state.pendingChains]) {
+      const rec = state.pendingChecks.get(chainRunId);
+      if (rec !== undefined && state.pollIndex < rec.due) continue;
+      const gap = rec === undefined ? 1 : Math.min(rec.gap * 2, 64);
+      state.pendingChecks.set(chainRunId, { due: state.pollIndex + gap, gap });
       const wake = await chainCompletionWake(state, deps, chainRunId, member);
       if (wake !== null) wakes.push(wake);
     }

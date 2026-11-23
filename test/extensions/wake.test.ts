@@ -616,3 +616,80 @@ test("wake: operator mode wires the watcher to session_start/session_shutdown", 
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+/* --------------------- judge P4 findings 1 and 2: the holes --------------------- */
+
+test("wake: a has_more drain across pages wakes once per row, no duplicates (judge P4 f2)", async () => {
+  const state = newWakeState();
+  state.seeded = true;
+  state.cursor = 0;
+  const pages = [
+    page([row(1, "validating"), row(2, "awaiting_gate")], 2, true),
+    page([row(3, "failed"), row(4, "completed")], 4, false),
+  ];
+  const { request, calls } = stubRequest((op) => (op === "nova_transitions_since" ? pages.shift() : {}));
+  const res = await pollWakeStep(state, { request });
+  assert.deepEqual(
+    res.wakes.map((w) => w.kind),
+    ["awaiting_gate", "failed"],
+    "one wake per human-attention row; a standalone completed does not wake",
+  );
+  const reads = calls.filter((c) => c.op === "nova_transitions_since");
+  assert.equal(reads.length, 2, "the drain read both pages");
+  assert.equal(state.cursor, 4);
+});
+
+test("wake: a reject re-entry into awaiting_gate wakes a SECOND time (judge P4 f2)", async () => {
+  const state = newWakeState();
+  state.seeded = true;
+  state.cursor = 0;
+  const pages = [
+    page([row(10, "awaiting_gate")], 10),
+    page([row(11, "failed"), row(12, "awaiting_gate")], 12),
+  ];
+  const { request } = stubRequest((op) => (op === "nova_transitions_since" ? pages.shift() : {}));
+  const first = await pollWakeStep(state, { request });
+  const second = await pollWakeStep(state, { request });
+  assert.equal(first.wakes.filter((w) => w.kind === "awaiting_gate").length, 1);
+  assert.equal(second.wakes.filter((w) => w.kind === "awaiting_gate").length, 1, "the re-entry is a NEW transition");
+});
+
+test("wake: a stalled chain's sticky re-check BACKS OFF instead of one read per poll (judge P4 f1)", async () => {
+  const state = newWakeState();
+  state.seeded = true;
+  state.cursor = 0;
+  let chainReads = 0;
+  let first = true;
+  const { request } = stubRequest((op) => {
+    if (op === "nova_transitions_since") {
+      if (!first) return page([], 20);
+      first = false;
+      return page([row(20, "completed", { chain_run_id: chainId(9) })], 20);
+    }
+    if (op === "nova_chain_status") {
+      chainReads++;
+      return { chain: { state: "active" }, members: [{ state: "completed" }] };
+    }
+    return {};
+  });
+  for (let n = 0; n < 40; n++) await pollWakeStep(state, { request });
+  assert.ok(chainReads >= 1, "the pending chain was checked at least once");
+  assert.ok(chainReads < 15, `chain_status reads must back off, not one per poll (got ${chainReads})`);
+});
+
+test("wake: an ENABLED watcher pins exactly one interval, and re-start does not double it (judge P4 f2d)", async () => {
+  // The other factory-level test runs with NOVAFLOW_WAKE=off, so it would pass
+  // with the wiring dead. This one drives the enabled path through the real
+  // watcher with an injected scheduler: one interval, no doubling on re-pin,
+  // cleared on shutdown.
+  const { scheduler, timers } = fakeScheduler();
+  const { api } = fakePi();
+  const { request } = stubRequest((op) => (op === "nova_transitions_since" ? page([], 0) : {}));
+  const watcher = createWakeWatcher(api, { scheduler, request, send: () => undefined });
+  await watcher.start();
+  assert.equal(timers.length, 1, "one interval after start");
+  await watcher.start();
+  assert.equal(timers.length, 1, "a second start re-pins rather than doubling");
+  await watcher.stop();
+  assert.equal(timers.length, 0, "shutdown clears it");
+});
