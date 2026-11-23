@@ -15,6 +15,8 @@ import { profileCommand } from "./commands/profile.ts";
 import { taskCommand } from "./commands/task.ts";
 import { scheduleCommand } from "./commands/schedule.ts";
 import { daemonCommand } from "./commands/daemon.ts";
+import { statusCommand } from "./commands/status.ts";
+import { webCommand } from "./commands/web.ts";
 import { chainCommand } from "./commands/chain.ts";
 import { mcpCommand } from "./commands/mcp.ts";
 import { docsCommand } from "./commands/docs.ts";
@@ -64,6 +66,9 @@ const USAGE = `USAGE: nova <noun> <sub> [args] [flags]
   nova daemon start [--foreground] | stop | status | pause | resume | kill-all
   nova daemon backup [--out <path>] | prune [--retention-days <n>]
   nova daemon logs [--lines <n>]
+  nova status [--watch] [--json]
+  nova web sync [--run <id|key> | --all]
+  nova web start | stop | status [--json]
   nova docs list [<workspace>]
   nova version
   nova schedule attach <id|key> [--cron '<expr>' | --at <iso>] [--missed skip|run_immediately]
@@ -129,6 +134,10 @@ async function dispatch(argv: string[]): Promise<number> {
       return scheduleCommand(rest, opts);
     case "daemon":
       return daemonCommand(rest, opts);
+    case "status":
+      return statusCommand(rest, opts);
+    case "web":
+      return webCommand(rest, opts);
     case "version":
       return version(opts.json);
     case "chain":
