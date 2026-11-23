@@ -30,6 +30,15 @@ import type { Db } from "../store/db.ts";
  *   - `condition_expr` is schema-legal and stored verbatim, but NEVER
  *     evaluated in v1 (§5.3: no expression language exists) — the
  *     p4b boundary.
+ *   - `target_scopes` is REQUIRED on every member (v0.3.0 amendment
+ *     row 5, DEBT-011). The frozen §4.3 block still lists it under
+ *     `required` (re-pinned per the v0.3.0 amendments row 5), so `TASK_REQUIRED_KEYS` stays pinned to that
+ *     block and `TASK_IMPORT_REQUIRED_KEYS` is that set PLUS the
+ *     amended key: the import refuses a member without scopes instead
+ *     of handing back a chain the DEBT-010 enqueue guard refuses
+ *     forever (a chain row stuck `active`, `chain status --watch`
+ *     never exiting). No inheritance: a project may bind N targets, so
+ *     the scope is never inferred.
  *
  * Profile resolution (the §4.3 pre-block rule): a task's
  * `profile_name` resolves workspace-local profiles FIRST, then global
@@ -75,13 +84,40 @@ export const PROJECT_SLUG_PATTERN = /^[a-z0-9-]+$/;
 /** Schema: `"key": { "type": "string", "pattern": "^[A-Z0-9_-]+$" }`. */
 export const TASK_KEY_PATTERN = /^[A-Z0-9_-]+$/;
 
-/** The schema's task-item `required` array, order verbatim. */
+/** The schema's task-item `required` array, order verbatim (re-pinned 2026-11-23:
+ *  v0.3.0 amendment row 5 made target_scopes REQUIRED, and the §4.3 block now says so). */
 export const TASK_REQUIRED_KEYS: readonly string[] = [
   "key",
   "title",
   "objective",
   "profile_name",
+  "target_scopes",
 ];
+
+/** The generic-missing-key set: TASK_REQUIRED_KEYS minus target_scopes, whose
+ *  absence is refused by validatedTargetScopes with the DEBT-011 teaching
+ *  message (why the chain would be unstartable) instead of this bare form. */
+export const TASK_GENERIC_REQUIRED_KEYS: readonly string[] = TASK_REQUIRED_KEYS.filter(
+  (k) => k !== "target_scopes",
+);
+
+/**
+ * The member keys the IMPORT requires: the §4.3 task-item set PLUS
+ * `target_scopes`, which the v0.3.0 amendments (row 5) make REQUIRED on
+ * every member (DEBT-011). The frozen schema block still lists
+ * `target_scopes` under `properties` only; the amendment row is the
+ * binding re-pin, so the golden test keeps pinning `TASK_REQUIRED_KEYS`
+ * to the live block and derives this set from it plus the one amended
+ * key.
+ *
+ * WHY the import enforces it: the DEBT-010 guard fails closed on a task
+ * with zero scopes, so a scopeless member is a chain that can never
+ * start — and, worse, a `chain_runs` row that stays `active` forever
+ * (`nova chain status --watch` never exits). The import is the
+ * fail-open, and an empty list is the same unstartable chain, so both
+ * shapes refuse here, naming the member and the fix.
+ */
+export const TASK_IMPORT_REQUIRED_KEYS: readonly string[] = [...TASK_REQUIRED_KEYS];
 
 /** Exported for golden pinning: the closed task-item key set. */
 export const TASK_KNOWN_KEYS: ReadonlySet<string> = new Set([
@@ -165,7 +201,11 @@ export type ValidatedChainTask = {
   requiresHumanGate?: boolean;
   contextFiles?: string[];
   outputSchemaVersion?: string;
-  targetScopes?: ValidatedTargetScope[];
+  /**
+   * REQUIRED by the import (amendment row 5, DEBT-011): at least one
+   * scope, resolved to a project_targets row before the transaction.
+   */
+  targetScopes: ValidatedTargetScope[];
   overrides?: Record<string, unknown>;
 };
 
@@ -328,6 +368,30 @@ function validateScope(item: unknown, index: number): ValidatedTargetScope {
   };
 }
 
+/**
+ * Validate a member's `target_scopes` (amendment row 5, DEBT-011): the key
+ * is REQUIRED, and it must carry at least one scope — an empty list is the
+ * same unstartable chain (zero task_target_scopes rows), so both shapes
+ * refuse naming the member and the fix.
+ */
+function validatedTargetScopes(
+  obj: Record<string, unknown>,
+  what: string,
+  key: string,
+): ValidatedTargetScope[] {
+  const scopes = obj["target_scopes"];
+  if (!Array.isArray(scopes)) {
+    fail("schema_invalid", `${what} target_scopes must be an array of scope objects`);
+  }
+  if (scopes.length === 0) {
+    fail(
+      "schema_invalid",
+      `${what} (member ${key}) declares an empty target_scopes list — add target_scopes to member ${key} with at least one scope object {repo_alias, access_mode}: a member with zero scopes can never be enqueued (the DEBT-010 guard refuses it), so the chain would stay active forever (DEBT-011)`,
+    );
+  }
+  return scopes.map((s, i) => validateScope(s, i));
+}
+
 /** Validate one task item (§4.3, closed keys) and resolve its profile. */
 function validateTask(
   db: Db,
@@ -338,7 +402,7 @@ function validateTask(
   const what = `tasks[${index}]`;
   const obj = expectObject(item, what);
   closedKeys(obj, TASK_KNOWN_KEYS, what);
-  requireKeys(obj, TASK_REQUIRED_KEYS, what);
+  requireKeys(obj, TASK_GENERIC_REQUIRED_KEYS, what);
 
   const key = expectString(obj, "key", what);
   if (!TASK_KEY_PATTERN.test(key)) {
@@ -347,12 +411,34 @@ function validateTask(
       `${what} key must match ${TASK_KEY_PATTERN}, got ${JSON.stringify(key)}`,
     );
   }
+  // v0.3.0 amendment row 5 (DEBT-011): every member REQUIRES at least one
+  // target_scope. Refused here, before any store write, naming the member
+  // key and the fix — the operator must never receive a chain whose every
+  // run the DEBT-010 guard refuses (a chain row stuck active forever).
+  // No inheritance: a project may bind N targets, so the import never
+  // infers the scope.
+  const missingKeys = TASK_IMPORT_REQUIRED_KEYS.filter((k) => !(k in obj));
+  if (missingKeys.length > 0) {
+    const missing = missingKeys.join('", "');
+    fail(
+      "schema_invalid",
+      missingKeys.includes("target_scopes")
+        ? `${what} (member ${key}) is missing required key "${missing}" — add target_scopes to member ${key} naming the target(s) it touches (data.md §4.3 as amended, DEBT-011): a member without a scope can never be enqueued (the DEBT-010 guard refuses it), so the chain would stay active forever, and the import never infers one (a project may bind N targets, so there is no inheritance)`
+        : `${what} is missing required key "${missing}"`,
+    );
+  }
   const title = expectString(obj, "title", what, 3); // schema: minLength 3
   const objective = expectString(obj, "objective", what, 10); // minLength 10
   const profileName = expectString(obj, "profile_name", what);
   const profileId = resolveChainProfile(db, workspaceId, profileName);
 
-  const task: ValidatedChainTask = { key, title, objective, profileId };
+  const task: ValidatedChainTask = {
+    key,
+    title,
+    objective,
+    profileId,
+    targetScopes: validatedTargetScopes(obj, what, key),
+  };
 
   if (obj["priority"] !== undefined) {
     const priority = obj["priority"];
@@ -383,13 +469,6 @@ function validateTask(
       fail("schema_invalid", `${what} output_schema_version must be a non-empty string`);
     }
     task.outputSchemaVersion = v;
-  }
-  if (obj["target_scopes"] !== undefined) {
-    const scopes = obj["target_scopes"];
-    if (!Array.isArray(scopes)) {
-      fail("schema_invalid", `${what} target_scopes must be an array of scope objects`);
-    }
-    task.targetScopes = scopes.map((s, i) => validateScope(s, i));
   }
   if (obj["overrides"] !== undefined) {
     const overrides = expectObject(obj["overrides"], `${what} overrides`);

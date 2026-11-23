@@ -1362,6 +1362,12 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
    * never retargets the import. Without `workspace_id`, the graph's
    * project_slug must resolve unambiguously across workspaces (a slug
    * repeated in N workspaces is a truthful duplicate refusal).
+   *
+   * Every member REQUIRES `target_scopes` (v0.3.0 amendment row 5,
+   * DEBT-011): the validator refuses a scopeless member as
+   * `schema_invalid`, naming the member key and the fix, BEFORE any
+   * write — a member without scopes could only ever produce a chain the
+   * enqueue guard refuses (a chain row stuck `active`).
    */
   ops.set("nova_project_import_dag", (args, { deps }) => {
     const graphText = reqString(args, "graph_text");

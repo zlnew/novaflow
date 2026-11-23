@@ -64,6 +64,8 @@ function graph(over: Record<string, unknown> = {}): Record<string, unknown> {
         title: "Plan the work",
         objective: "Write the implementation plan end to end.",
         profile_name: "dev",
+        // v0.3.0 amendment row 5 (DEBT-011): every member REQUIRES scopes
+        target_scopes: [{ repo_alias: "code", access_mode: "read_only" }],
       },
       {
         key: "WORK",
@@ -93,13 +95,14 @@ function graph(over: Record<string, unknown> = {}): Record<string, unknown> {
   };
 }
 
-function counts(db: Database.Database): { chains: number; tasks: number; edges: number } {
+function counts(db: Database.Database): { chains: number; tasks: number; edges: number; scopes: number } {
   const q = (sql: string): number =>
     (db.prepare(sql).get() as { n: number }).n;
   return {
     chains: q("SELECT COUNT(*) AS n FROM chain_runs"),
     tasks: q("SELECT COUNT(*) AS n FROM tasks"),
     edges: q("SELECT COUNT(*) AS n FROM task_edges"),
+    scopes: q("SELECT COUNT(*) AS n FROM task_target_scopes"),
   };
 }
 
@@ -212,6 +215,37 @@ test("roots are NOT auto-enqueued: every member lands draft, zero transition log
   }
 });
 
+test("DEBT-011: a member without target_scopes refuses BEFORE any write — schema_invalid naming the member, store unchanged", () => {
+  const s = seed();
+  try {
+    const before = counts(s.db);
+    // the shape the import used to accept: PLAN scoped, WORK scopeless
+    const scopeless = graph();
+    const members = scopeless["tasks"] as Array<Record<string, unknown>>;
+    delete members[1]!["target_scopes"];
+
+    let refusal: unknown;
+    try {
+      importChain(s.db, { id: s.workspaceId }, projectRow(s), scopeless);
+      assert.fail("the import must refuse a scopeless member");
+    } catch (thrown) {
+      refusal = thrown;
+    }
+    assert.ok(refusal instanceof ChainValidationError, `expected ChainValidationError, got ${String(refusal)}`);
+    assert.equal(refusal.code, "schema_invalid");
+    // the operator gets the member and the fix, not a chain that can never start
+    assert.match(refusal.message, /WORK/);
+    assert.match(refusal.message, /add target_scopes to member WORK/);
+
+    // atomic by construction: the refusal precedes the transaction, so NO
+    // chain_runs row, no task row, no edge, no scope row was created
+    assert.deepEqual(counts(s.db), before);
+    assert.deepEqual(before, { chains: 0, tasks: 0, edges: 0, scopes: 0 });
+  } finally {
+    s.db.close();
+  }
+});
+
 test("atomicity: a malformed member refuses BEFORE any write — counts unchanged", () => {
   const s = seed();
   try {
@@ -220,7 +254,7 @@ test("atomicity: a malformed member refuses BEFORE any write — counts unchange
       () =>
         importChain(s.db, { id: s.workspaceId }, projectRow(s), graph({
           tasks: [
-            { key: "PLAN", title: "ab", objective: "too short", profile_name: "dev" }, // title/objective violations
+            { key: "PLAN", title: "ab", objective: "too short", profile_name: "dev", target_scopes: [{ repo_alias: "code", access_mode: "read_only" }] }, // title/objective violations
           ],
         })),
       ChainValidationError,
@@ -297,6 +331,9 @@ test("a one-task DAG with a bare `edges:` imports as a single-member chain (DEBT
       "    title: Do the only task",
       "    objective: The single member of a one-task chain.",
       "    profile_name: dev",
+      "    target_scopes:",
+      "      - repo_alias: code",
+      "        access_mode: read_write",
       "edges:",
     ].join("\n");
     const { chainRun, tasks } = importChain(
@@ -311,7 +348,7 @@ test("a one-task DAG with a bare `edges:` imports as a single-member chain (DEBT
     assert.equal(tasks["SOLO"]!.chain_run_id, chainRun.id);
     assert.equal(listChainMembers(s.db, chainRun.id).length, 1);
     // zero edges, zero enqueues: roots are still the operator's call
-    assert.deepEqual(counts(s.db), { chains: 1, tasks: 1, edges: 0 });
+    assert.deepEqual(counts(s.db), { chains: 1, tasks: 1, edges: 0, scopes: 1 });
     assert.equal(
       (s.db.prepare("SELECT COUNT(*) AS n FROM state_transition_logs").get() as { n: number }).n,
       0,
@@ -333,6 +370,9 @@ test("regression: a normal two-task two-edge DAG written in YAML still imports u
       '    title: "Plan the work"',
       "    objective: Write the implementation plan end to end.",
       "    profile_name: dev",
+      "    target_scopes:",
+      "      - repo_alias: code",
+      "        access_mode: read_only",
       "  - key: WORK",
       "    title: Do the work",
       "    objective: Implement the planned feature end to end.",
@@ -351,7 +391,7 @@ test("regression: a normal two-task two-edge DAG written in YAML still imports u
     ].join("\n");
     const { tasks } = importChain(s.db, { id: s.workspaceId }, projectRow(s), parseYaml(yaml));
     assert.deepEqual(Object.keys(tasks).sort(), ["PLAN", "WORK"]);
-    assert.deepEqual(counts(s.db), { chains: 1, tasks: 2, edges: 2 });
+    assert.deepEqual(counts(s.db), { chains: 1, tasks: 2, edges: 2, scopes: 2 });
     const rows = s.db
       .prepare("SELECT * FROM task_edges WHERE project_id = ? ORDER BY edge_type")
       .all(s.projectId) as Array<Record<string, unknown>>;

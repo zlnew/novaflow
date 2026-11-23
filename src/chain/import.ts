@@ -111,32 +111,33 @@ export function importChain(
   }
 
   // target-alias resolution (read-only, before the transaction): each
-  // scope's repo_alias must name a project_targets row of THIS project
-  const resolvedScopes: Array<CreateTaskTargetScope[] | undefined> = [];
+  // scope's repo_alias must name a project_targets row of THIS project.
+  // Every member carries at least one scope — the validator refuses a
+  // scopeless member (amendment row 5, DEBT-011) before this point.
+  const resolvedScopes: CreateTaskTargetScope[][] = [];
   for (const task of chain.tasks) {
-    const scopes: CreateTaskTargetScope[] | undefined =
-      task.targetScopes?.map((scope): CreateTaskTargetScope => {
-        const target = db
-          .prepare("SELECT id FROM project_targets WHERE project_id = ? AND alias = ?")
-          .get(project.id, scope.repoAlias) as { id: string } | undefined;
-        if (!target) {
-          throw new ChainValidationError(
-            "not_found",
-            `task "${task.key}" target_scopes carry repo_alias "${scope.repoAlias}" — the project has no such target`,
-          );
-        }
-        return {
-          targetId: target.id,
-          accessMode: scope.accessMode,
-          ...(scope.writeScopeGlobs !== undefined ? { writeScopeGlobs: scope.writeScopeGlobs } : {}),
-          ...(scope.protectedTestGlobs !== undefined
-            ? { protectedTestGlobs: scope.protectedTestGlobs }
-            : {}),
-          ...(scope.verificationCommands !== undefined
-            ? { verificationCommands: scope.verificationCommands }
-            : {}),
-        };
-      });
+    const scopes: CreateTaskTargetScope[] = task.targetScopes.map((scope) => {
+      const target = db
+        .prepare("SELECT id FROM project_targets WHERE project_id = ? AND alias = ?")
+        .get(project.id, scope.repoAlias) as { id: string } | undefined;
+      if (!target) {
+        throw new ChainValidationError(
+          "not_found",
+          `task "${task.key}" target_scopes carry repo_alias "${scope.repoAlias}" — the project has no such target`,
+        );
+      }
+      return {
+        targetId: target.id,
+        accessMode: scope.accessMode,
+        ...(scope.writeScopeGlobs !== undefined ? { writeScopeGlobs: scope.writeScopeGlobs } : {}),
+        ...(scope.protectedTestGlobs !== undefined
+          ? { protectedTestGlobs: scope.protectedTestGlobs }
+          : {}),
+        ...(scope.verificationCommands !== undefined
+          ? { verificationCommands: scope.verificationCommands }
+          : {}),
+      };
+    });
     resolvedScopes.push(scopes);
   }
 
@@ -165,9 +166,7 @@ export function importChain(
             ? { outputSchemaVersion: task.outputSchemaVersion }
             : {}),
           ...(task.overrides !== undefined ? { overrides: task.overrides } : {}),
-          ...(resolvedScopes[index] !== undefined
-            ? { targetScopes: resolvedScopes[index] }
-            : {}),
+          targetScopes: resolvedScopes[index]!,
           chainRunId, // the 8.1 ownership stamp
         });
       } catch (err) {

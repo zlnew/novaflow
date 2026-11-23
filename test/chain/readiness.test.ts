@@ -300,7 +300,7 @@ test("boot sweep: a restart-shaped store (ready members implied by member states
     const two = importChain(s.db, { id: s.workspaceId }, { id: s.projectId, slug: "prj" }, {
       version: "1.0.0",
       project_slug: "prj",
-      tasks: [{ key: "SOLO", title: "Solo task", objective: "The objective of the solo task.", profile_name: "dev" }],
+      tasks: [{ key: "SOLO", title: "Solo task", objective: "The objective of the solo task.", profile_name: "dev", target_scopes: SCOPES }],
       edges: [],
     });
     complete(s, two.tasks["SOLO"]!.id);

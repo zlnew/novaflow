@@ -9,11 +9,11 @@ import { ulid } from "../../src/store/ids.ts";
 import { openDb } from "../../src/store/db.ts";
 import { migrate } from "../../src/store/migrate.ts";
 import { applyTransition } from "../../src/fsm/engine.ts";
-import { ENQUEUE_TRIGGER, enqueueTask, type TaskRow } from "../../src/tasks.ts";
+import { ENQUEUE_TRIGGER, createTask, enqueueTask, type TaskRow } from "../../src/tasks.ts";
 import { START_TRIGGER, VALIDATING_TRIGGER } from "../../src/runs/triggers.ts";
 import { VERIFY_PASSED_TRIGGER } from "../../src/fsm/triggers.ts";
 import { OpError } from "../../src/opcodes.ts";
-import { importChain } from "../../src/chain/import.ts";
+import { importChain, ChainValidationError } from "../../src/chain/import.ts";
 import { createChainEvaluator } from "../../src/chain/readiness.ts";
 import { createScheduleEvaluator } from "../../src/daemon/schedules.ts";
 import { canonicalTimestamp } from "../../src/sched/iso.ts";
@@ -30,7 +30,8 @@ import { seedFileStore, readConnection, type SeededStore } from "./seed.ts";
  *   1. the nova_task_run op — schema_invalid naming DEBT-010, the task
  *      stays draft (no log row, no spawn);
  *   2. the chain readiness evaluator — a scopeless member's propagation
- *      is refused and logged (the import itself stays legal);
+ *      is refused and logged (the import itself refuses the shape since
+ *      DEBT-011: this is the second line of defence);
  *   3. the schedule evaluator — a scopeless task's fire is refused,
  *      logged, and the occurrence advances (never wedged);
  *   4. a properly scoped task still enqueues and runs to completion.
@@ -97,6 +98,10 @@ function logCount(db: Database.Database, taskId: string): number {
     .get(taskId) as { n: number }).n;
 }
 
+function tableCount(db: Database.Database, table: string): number {
+  return (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+}
+
 /* ------------------------- 1. the nova_task_run op ------------------------- */
 
 test("DEBT-010: nova_task_run on a scopeless draft task refuses with schema_invalid naming DEBT-010; the task stays draft", async () => {
@@ -154,17 +159,21 @@ test("DEBT-010: nova_task_run on a scopeless draft task refuses with schema_inva
   }
 });
 
-/* --------------------- 2. the chain readiness evaluator --------------------- */
+/* --------------------- 2. the chain import + readiness evaluator --------------------- */
 
-test("DEBT-010: a chain whose root task has no target_scopes imports, but the readiness enqueue refuses the same way", async () => {
+test("DEBT-011: a chain member without target_scopes is refused at import — schema_invalid naming the member, NO chain row created", () => {
   const s = seededDb();
   try {
-    // the import itself is legal: a scopeless member is a parked draft
-    const { chainRun, tasks } = importChain(
-      s.db,
-      { id: s.workspaceId },
-      { id: s.projectId, slug: "prj" },
-      {
+    const before = {
+      chains: tableCount(s.db, "chain_runs"),
+      tasks: tableCount(s.db, "tasks"),
+      edges: tableCount(s.db, "task_edges"),
+      scopes: tableCount(s.db, "task_target_scopes"),
+    };
+    let refusal: unknown;
+    try {
+      // the shape the import used to accept: both members scopeless
+      importChain(s.db, { id: s.workspaceId }, { id: s.projectId, slug: "prj" }, {
         version: "1.0.0",
         project_slug: "prj",
         tasks: [
@@ -172,15 +181,67 @@ test("DEBT-010: a chain whose root task has no target_scopes imports, but the re
           { key: "B", title: "Task B", objective: "The objective of task B.", profile_name: "dev" },
         ],
         edges: [{ source_key: "A", target_key: "B", edge_type: "depends_on" }],
+      });
+      assert.fail("the import must refuse a member without target_scopes");
+    } catch (thrown) {
+      refusal = thrown;
+    }
+    assert.ok(refusal instanceof ChainValidationError, `expected ChainValidationError, got ${String(refusal)}`);
+    assert.equal(refusal.code, "schema_invalid");
+    // the refusal names the member and the fix, before any row exists
+    assert.match(refusal.message, /add target_scopes to member A/);
+    assert.deepEqual(
+      {
+        chains: tableCount(s.db, "chain_runs"),
+        tasks: tableCount(s.db, "tasks"),
+        edges: tableCount(s.db, "task_edges"),
+        scopes: tableCount(s.db, "task_target_scopes"),
       },
+      before,
+      "the import is all-or-nothing: not even the chain_runs row exists",
     );
-    const a = tasks["A"]!.id;
-    const b = tasks["B"]!.id;
-    assert.equal(chainRun.state, "active");
+    assert.deepEqual(before, { chains: 0, tasks: 0, edges: 0, scopes: 0 });
+  } finally {
+    s.db.close();
+  }
+});
+
+test("DEBT-010: the readiness enqueue still refuses a scopeless member — the second line of defence", async () => {
+  const s = seededDb();
+  try {
+    // the import refuses this shape now (DEBT-011), so the only way such a
+    // member can still exist is a store written outside the import (a
+    // pre-v0.3.0 row, a hand-written DB): construct exactly that
+    const chainRunId = ulid();
+    s.db
+      .prepare("INSERT INTO chain_runs (id, project_id, state) VALUES (?, ?, 'active')")
+      .run(chainRunId, s.projectId);
+    const a = createTask(s.db, {
+      projectId: s.projectId,
+      key: "A",
+      title: "Task A",
+      objective: "The objective of task A.",
+      profileId: s.profileId,
+      chainRunId,
+    });
+    const b = createTask(s.db, {
+      projectId: s.projectId,
+      key: "B",
+      title: "Task B",
+      objective: "The objective of task B.",
+      profileId: s.profileId,
+      chainRunId, // no targetScopes: the DEBT-010 shape
+    });
+    s.db
+      .prepare(
+        `INSERT INTO task_edges (id, project_id, source_task_id, target_task_id, edge_type)
+         VALUES (?, ?, ?, ?, 'depends_on')`,
+      )
+      .run(ulid(), s.projectId, a.id, b.id);
 
     // the guarded row itself refuses member B the same named way
     await assert.rejects(
-      enqueueTask(s.db, b, "chain-engine", { ...PROBE, triggerType: "engine" }),
+      enqueueTask(s.db, b.id, "chain-engine", { ...PROBE, triggerType: "engine" }),
       (err: unknown) => {
         assert.ok(err instanceof OpError, String(err));
         assert.equal(err.code, "schema_invalid");
@@ -188,26 +249,26 @@ test("DEBT-010: a chain whose root task has no target_scopes imports, but the re
         return true;
       },
     );
-    assert.equal(taskState(s.db, b), "draft");
-    assert.equal(logCount(s.db, b), 0);
+    assert.equal(taskState(s.db, b.id), "draft");
+    assert.equal(logCount(s.db, b.id), 0);
 
     // A completes (seed-side rows) → B is ready → the evaluator's enqueue
     // is refused and logged; B stays draft and the chain stays active
-    applyTransition(s.db, a, ENQUEUE_TRIGGER, { triggerType: "human", actor: "seed" });
-    applyTransition(s.db, a, START_TRIGGER, { triggerType: "engine", actor: "seed" });
-    applyTransition(s.db, a, VALIDATING_TRIGGER, { triggerType: "engine", actor: "seed" });
-    applyTransition(s.db, a, VERIFY_PASSED_TRIGGER, { triggerType: "engine", actor: "seed" });
+    applyTransition(s.db, a.id, ENQUEUE_TRIGGER, { triggerType: "human", actor: "seed" });
+    applyTransition(s.db, a.id, START_TRIGGER, { triggerType: "engine", actor: "seed" });
+    applyTransition(s.db, a.id, VALIDATING_TRIGGER, { triggerType: "engine", actor: "seed" });
+    applyTransition(s.db, a.id, VERIFY_PASSED_TRIGGER, { triggerType: "engine", actor: "seed" });
 
     const evaluator = createChainEvaluator(s.db, { enqueueOptions: PROBE });
-    const { out, warns } = await captureWarn(() => evaluator.evaluateForTask(a));
+    const { out, warns } = await captureWarn(() => evaluator.evaluateForTask(a.id));
     assert.deepEqual(out?.enqueued, [], "the readiness enqueue refused the scopeless member");
-    assert.equal(taskState(s.db, b), "draft");
-    assert.equal(logCount(s.db, b), 0, "no transition row — the refusal left no trace on the task");
+    assert.equal(taskState(s.db, b.id), "draft");
+    assert.equal(logCount(s.db, b.id), 0, "no transition row — the refusal left no trace on the task");
     assert.ok(
-      warns.some((w) => /DEBT-010/.test(w) && new RegExp(b).test(w)),
+      warns.some((w) => /DEBT-010/.test(w) && new RegExp(b.id).test(w)),
       `the refusal is logged naming DEBT-010: ${JSON.stringify(warns)}`,
     );
-    const chain = s.db.prepare("SELECT state FROM chain_runs WHERE id = ?").get(chainRun.id) as { state: string };
+    const chain = s.db.prepare("SELECT state FROM chain_runs WHERE id = ?").get(chainRunId) as { state: string };
     assert.equal(chain.state, "active", "the evaluator never wedges on the refusal");
   } finally {
     s.db.close();
