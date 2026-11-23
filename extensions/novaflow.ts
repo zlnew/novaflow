@@ -57,7 +57,12 @@
  *   OPERATOR MODE (no run context): the /nova command family —
  *   status / plan / queue / gate approve|reject — over the socket
  *   client, surface "human". A dead socket renders the CLI's
- *   exit-5-style structured error to the chat, never a throw.
+ *   exit-5-style structured error to the chat, never a throw. Operator
+ *   sessions additionally run the WAKE WATCHER (novaflow-v02/wake.md):
+ *   a ~2 s poll of `nova_transitions_since` that injects one
+ *   `[novaflow] …` follow-up message per human-attention transition
+ *   (awaiting_gate, failed, inferred chain completion) — seeded at head
+ *   on session_start, cleared on session_shutdown.
  */
 
 import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
@@ -1407,6 +1412,632 @@ export async function runNovaCommand(args: string, ctx: ExtensionCommandContext)
   }
 }
 
+/* -------------------------------- the wake watcher -------------------------------- */
+/*
+ * wake.md (frozen 2026-11-23) — the orchestrator gets woken, not spammed.
+ *
+ *   - OPERATOR MODE ONLY. Operator mode is the factory's existing
+ *     NOVAFLOW_RUN_CONTEXT branch; a run-mode session ends with the run and
+ *     never starts a watcher.
+ *   - The watcher polls `nova_transitions_since` (events.md) every ~2 s over
+ *     the ported socket client, holding its cursor IN MEMORY. The cursor is
+ *     the store's own rowid, so a daemon restart gaps nothing.
+ *   - SESSION START SEEDS AT HEAD (events.md rule 2's `cursor: 0`): the first
+ *     poll of a session wakes on NOTHING from that page. Pre-existing
+ *     transitions are history, not news — that trap is why this is pinned.
+ *   - Policy (wake.md's table): `to_state = awaiting_gate`, `to_state =
+ *     failed`, and chain-run completion INFERRED from the chain status
+ *     surface (a member reached `completed`, every member completed, the
+ *     chain row `completed` — chain runs have no transition rows). Never
+ *     queued/running/validating/changes_requested, never a standalone task's
+ *     `completed`.
+ *   - Dedupe is structural: one wake per transition row; the cursor filter in
+ *     pollWakeStep turns a re-served page into a no-op, and the chain-complete
+ *     check is latched per chain run (completion is ONE logical event even
+ *     when two member rows land on the same page).
+ *   - Injection: `pi.sendUserMessage("[novaflow] …", {deliverAs:
+ *     "followUp"})` — proven live on pi 1.6.0, so it never interrupts the
+ *     operator's own turn. The captured `pi` is STALE after a session
+ *     replacement: a throwing send is swallowed with a warn (never thrown out
+ *     of a timer), and the timer is re-established on the next session_start.
+ *   - Lifecycle: `session_shutdown` clears the interval; every `session_start`
+ *     (startup/reload/new/resume/fork) re-pins exactly ONE interval — start()
+ *     stops first, so the reasons cannot double-pin.
+ *   - A daemon-down poll never throws: it warns once per session and keeps its
+ *     cursor, so the next successful poll resumes from where it stood.
+ */
+
+/** wake.md: the poll interval (~2 s); `NOVAFLOW_WAKE_MS` overrides for tests/operators. */
+export const WAKE_DEFAULT_INTERVAL_MS = 2000;
+const WAKE_INTERVAL_ENV = "NOVAFLOW_WAKE_MS";
+const WAKE_ENV = "NOVAFLOW_WAKE";
+
+const TRANSITIONS_OP = "nova_transitions_since";
+const CHAIN_STATUS_OP = "nova_chain_status";
+const RESULT_GET_OP = "nova_result_get";
+const WORKSPACE_LIST_OP = "nova_workspace_list";
+
+/** The `wake: { enabled, workspace }` block of `~/.novaflow/config.yaml`. */
+export type WakeConfig = { enabled: boolean; workspace: string | null };
+
+/** wake.md defaults: enabled true, workspace null (every workspace). */
+export function defaultWakeConfig(): WakeConfig {
+  return { enabled: true, workspace: null };
+}
+
+/** The daemon's own config file — the extension is a direct consumer of its `wake` block. */
+export function wakeConfigPath(home: string = novaHome()): string {
+  return join(home, "config.yaml");
+}
+
+const WAKE_TRUE: ReadonlySet<string> = new Set(["true", "yes", "on"]);
+const WAKE_FALSE: ReadonlySet<string> = new Set(["false", "no", "off"]);
+
+function wakeScalar(raw: string): string {
+  if (raw.length >= 2) {
+    const first = raw[0]!;
+    if ((first === '"' || first === "'") && raw.endsWith(first)) return raw.slice(1, -1);
+  }
+  return raw;
+}
+
+function applyWakeKey(cfg: WakeConfig, key: string, raw: string): void {
+  const value = wakeScalar(raw.trim());
+  const lower = value.toLowerCase();
+  if (key === "enabled") {
+    if (WAKE_TRUE.has(lower)) cfg.enabled = true;
+    else if (WAKE_FALSE.has(lower)) cfg.enabled = false;
+    // anything else is ignored — the config is read DEFENSIVELY, never thrown on
+    return;
+  }
+  if (key === "workspace") {
+    cfg.workspace = value === "" || lower === "null" || value === "~" ? null : value;
+  }
+  // unknown keys under `wake:` are ignored (the daemon owns the rest of the file)
+}
+
+/**
+ * Parse the `wake` block of a config.yaml text. DELIBERATELY forgiving — the
+ * extension reads a file the daemon owns, so a malformed or unknown-shape file
+ * must never throw: every unreadable key keeps its default. Accepted spellings:
+ * the block form
+ *
+ *     wake:
+ *       enabled: true
+ *       workspace: null
+ *
+ * and the inline flow form `wake: { enabled: false, workspace: my-ws }`. Only
+ * the two documented keys are read; everything else (other sections, unknown
+ * keys, deeper nesting, junk lines) is skipped.
+ */
+export function parseWakeConfig(text: string): WakeConfig {
+  const cfg = defaultWakeConfig();
+  let section: string | null = null;
+  for (const raw of text.split("\n")) {
+    const trimmed = raw.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    const indent = raw.length - raw.trimStart().length;
+    const colon = trimmed.indexOf(":");
+    if (colon < 0) {
+      if (indent === 0) section = null; // a junk top-level line ends the section
+      continue;
+    }
+    const key = trimmed.slice(0, colon).trim();
+    const value = trimmed.slice(colon + 1).trim();
+    if (indent === 0) {
+      if (value === "") {
+        section = key;
+        continue;
+      }
+      section = null;
+      if (key === "wake" && value.startsWith("{")) {
+        for (const pair of value.replace(/^\{/, "").replace(/\}$/, "").split(",")) {
+          const idx = pair.indexOf(":");
+          if (idx < 0) continue;
+          applyWakeKey(cfg, pair.slice(0, idx).trim(), pair.slice(idx + 1));
+        }
+      }
+      continue;
+    }
+    if (section === "wake") applyWakeKey(cfg, key, value);
+  }
+  return cfg;
+}
+
+export type WakeEnv = Record<string, string | undefined>;
+
+/**
+ * Load the session's wake config: `~/.novaflow/config.yaml`'s `wake` block,
+ * with `NOVAFLOW_WAKE=off` overriding to disabled (wake.md). A missing or
+ * unreadable file is all defaults — never a throw.
+ */
+export function loadWakeConfig(opts: { home?: string; env?: WakeEnv } = {}): WakeConfig {
+  const env = opts.env ?? process.env;
+  const cfg = defaultWakeConfig();
+  try {
+    const parsed = parseWakeConfig(readFileSync(wakeConfigPath(opts.home ?? novaHome()), "utf8"));
+    cfg.enabled = parsed.enabled;
+    cfg.workspace = parsed.workspace;
+  } catch {
+    /* missing/unreadable config.yaml = the documented defaults */
+  }
+  if ((env[WAKE_ENV] ?? "").trim().toLowerCase() === "off") cfg.enabled = false;
+  return cfg;
+}
+
+/** The poll interval: 2000 ms, `NOVAFLOW_WAKE_MS` for tests/operators. */
+export function wakeIntervalMs(env: WakeEnv = process.env): number {
+  const raw = env[WAKE_INTERVAL_ENV];
+  if (raw === undefined) return WAKE_DEFAULT_INTERVAL_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : WAKE_DEFAULT_INTERVAL_MS;
+}
+
+/** One row of `nova_transitions_since` (events.md's public projection). */
+export type WakeTransitionRow = {
+  cursor: number;
+  task_id: string;
+  run_id: string | null;
+  chain_run_id: string | null;
+  task_key: string;
+  chain_slug: string | null;
+  from_state: string;
+  to_state: string;
+  trigger_type: string;
+  actor: string;
+  reason: string | null;
+  created_at: string;
+};
+
+export type WakePage = {
+  transitions: WakeTransitionRow[];
+  next_cursor: number;
+  has_more: boolean;
+};
+
+/** The socket request seam (defaults to the ported daemon client). */
+export type WakeRequest = (op: string, args: Record<string, unknown>) => Promise<unknown>;
+
+/** The in-memory watch state — one per session, reset on every session_start. */
+export type WakeState = {
+  /** The last rowid this session has consumed (0 before the seed). */
+  cursor: number;
+  /** True once a poll has succeeded; the seed poll consumes its page silently. */
+  seeded: boolean;
+  /** Chain runs already reported complete (completion is one event, not per row). */
+  chainsWoken: Set<string>;
+  /**
+   * Chains whose member reached `completed` while the chain row was still
+   * `active`. The engine applies the member's transition row and THEN
+   * evaluates the chain (src/daemon/lifecycle.ts), so a poll can land in
+   * between; these are re-checked on the next poll instead of losing the wake.
+   */
+  pendingChains: Map<string, WakeTransitionRow>;
+  /** The daemon-down warn is raised once per session (wake.md: "silences"). */
+  warnedDown: boolean;
+};
+
+export function newWakeState(): WakeState {
+  return {
+    cursor: 0,
+    seeded: false,
+    chainsWoken: new Set<string>(),
+    pendingChains: new Map<string, WakeTransitionRow>(),
+    warnedDown: false,
+  };
+}
+
+export type WakeKind = "awaiting_gate" | "failed" | "chain_completed";
+
+export type Wake = {
+  kind: WakeKind;
+  /** The injected `[novaflow] …` message body (it names the follow-up calls). */
+  text: string;
+  cursor: number;
+  task_id: string;
+  chain_run_id: string | null;
+};
+
+export type WakePollDeps = {
+  request: WakeRequest;
+  /** `wake.workspace` resolved to an id; null/absent = every workspace. */
+  workspaceId?: string | null;
+  /** The session's warn sink (one daemon-down warn per session). */
+  warn?: (message: string) => void;
+};
+
+export type WakePollResult = {
+  /** False when no page could be read (daemon down) — the cursor did not move. */
+  polled: boolean;
+  seeded: boolean;
+  cursor: number;
+  wakes: Wake[];
+  warnings: string[];
+};
+
+function taskRef(row: WakeTransitionRow): string {
+  return `${row.task_key} (${row.task_id})`;
+}
+
+function transitionRef(row: WakeTransitionRow): string {
+  const reason = row.reason !== null && row.reason !== "" ? `, reason: ${JSON.stringify(row.reason)}` : "";
+  return `${row.from_state}→${row.to_state} (${row.trigger_type}, ${row.actor}${reason})`;
+}
+
+/** The gate wake: what moved, whether the artifact is a `blocked` refusal, and the calls to make. */
+function gateWakeMessage(row: WakeTransitionRow, artifactStatus: string | null): string {
+  const lines = [`[novaflow] gate needed: ${taskRef(row)} is awaiting_gate — ${transitionRef(row)}.`];
+  if (artifactStatus === "blocked") {
+    lines.push("artifact status: blocked — a refusal to fix, not a review to approve.");
+  } else if (artifactStatus !== null) {
+    lines.push(`artifact status: ${artifactStatus}.`);
+  }
+  lines.push(
+    `follow up: nova_task_status ${row.task_id}; nova_result_get ${row.task_id} (the handoff artifact); ` +
+      `then decide the gate: nova_gate_approve ${row.task_id} "<note>" or nova_gate_reject ${row.task_id} "<feedback>" ` +
+      `(/nova gate approve|reject ${row.task_key} … in this chat).`,
+  );
+  return lines.join("\n");
+}
+
+/** The failure wake: the transition, then the status/log/re-run calls. */
+function failedWakeMessage(row: WakeTransitionRow): string {
+  const chain =
+    row.chain_run_id !== null ? `; the chain: nova_chain_status ${row.chain_run_id}` : "";
+  return [
+    `[novaflow] task failed: ${taskRef(row)} — ${transitionRef(row)}.`,
+    `follow up: nova_task_status ${row.task_id}; nova_run_logs ${row.task_id} (the run's redacted events.jsonl); ` +
+      `then nova_task_run ${row.task_id} to retry${chain}.`,
+  ].join("\n");
+}
+
+/** The inferred chain-completion wake (there is no chain transition row to read). */
+function chainCompletedMessage(chainRunId: string, member: WakeTransitionRow): string {
+  const project = member.chain_slug !== null ? ` (project ${member.chain_slug})` : "";
+  return [
+    `[novaflow] chain completed: ${chainRunId}${project} — member ${taskRef(member)} reached completed ` +
+      `and every member is completed, so the chain row is completed.`,
+    `follow up: nova_chain_status ${chainRunId} (member states + readiness). Nothing is pending on this chain — no gate decision is required.`,
+  ].join("\n");
+}
+
+/**
+ * The inferred chain-completion check (wake.md: "inferred, never read").
+ * Called only for a member row that reached `completed`; the chain run's own
+ * state comes from `nova chain status`, never from the feed. A chain that is
+ * still `active` stays PENDING (re-checked next poll — the engine moves the
+ * chain row a beat after the member's row); a terminal non-completed chain
+ * (failed/aborted) is dropped, since only completion wakes.
+ */
+async function chainCompletionWake(
+  state: WakeState,
+  deps: WakePollDeps,
+  chainRunId: string,
+  member: WakeTransitionRow,
+): Promise<Wake | null> {
+  if (state.chainsWoken.has(chainRunId)) {
+    state.pendingChains.delete(chainRunId);
+    return null;
+  }
+  let data: unknown;
+  try {
+    data = await deps.request(CHAIN_STATUS_OP, { chain_run_id: chainRunId });
+  } catch {
+    // the surface refused or the daemon went away — never throw out of a poll;
+    // the chain stays pending for the next attempt
+    state.pendingChains.set(chainRunId, member);
+    return null;
+  }
+  const chain = (data as { chain?: { state?: unknown } } | null)?.["chain"];
+  const members = (data as { members?: unknown } | null)?.["members"];
+  const chainState = typeof chain?.state === "string" ? chain.state : null;
+  if (chainState === null || !Array.isArray(members)) return null;
+  if (chainState === "completed") {
+    const everyMemberCompleted =
+      members.length > 0 &&
+      members.every((m: unknown) => (m as { state?: unknown } | null)?.["state"] === "completed");
+    state.pendingChains.delete(chainRunId);
+    if (!everyMemberCompleted) return null;
+    state.chainsWoken.add(chainRunId);
+    return {
+      kind: "chain_completed",
+      text: chainCompletedMessage(chainRunId, member),
+      cursor: member.cursor,
+      task_id: member.task_id,
+      chain_run_id: chainRunId,
+    };
+  }
+  if (chainState !== "active") {
+    // failed/aborted: terminal, but never a completion wake
+    state.pendingChains.delete(chainRunId);
+    return null;
+  }
+  state.pendingChains.set(chainRunId, member);
+  return null;
+}
+
+/**
+ * The gate wake reads the run's artifact to carry its `blocked` status into
+ * the message (wake.md: a blocked artifact must read as a refusal to fix). A
+ * failed or absent artifact read is simply "no status" — never a throw.
+ */
+async function artifactStatusOf(deps: WakePollDeps, taskId: string): Promise<string | null> {
+  try {
+    const data = await deps.request(RESULT_GET_OP, { task_id: taskId });
+    const status = (data as { artifact?: { status?: unknown } } | null)?.["artifact"]?.["status"];
+    return typeof status === "string" ? status : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Fold one transition row into the wake list, per wake.md's policy table. */
+async function considerTransition(
+  state: WakeState,
+  deps: WakePollDeps,
+  row: WakeTransitionRow,
+  wakes: Wake[],
+): Promise<void> {
+  if (row.to_state === "awaiting_gate") {
+    const artifactStatus = await artifactStatusOf(deps, row.task_id);
+    wakes.push({
+      kind: "awaiting_gate",
+      text: gateWakeMessage(row, artifactStatus),
+      cursor: row.cursor,
+      task_id: row.task_id,
+      chain_run_id: row.chain_run_id,
+    });
+    return;
+  }
+  if (row.to_state === "failed") {
+    wakes.push({
+      kind: "failed",
+      text: failedWakeMessage(row),
+      cursor: row.cursor,
+      task_id: row.task_id,
+      chain_run_id: row.chain_run_id,
+    });
+    return;
+  }
+  // a standalone task's `completed` never wakes (wake.md); a CHAIN member's
+  // `completed` is the only thing that can imply a chain-completion wake
+  if (row.to_state === "completed" && row.chain_run_id !== null) {
+    const wake = await chainCompletionWake(state, deps, row.chain_run_id, row);
+    if (wake !== null) wakes.push(wake);
+  }
+}
+
+/**
+ * ONE poll step of the watcher — the whole policy, driven by an injected
+ * request seam so it is deterministic in tests (no timers, no daemon).
+ *
+ * Seed rule: while `!state.seeded`, the poll asks with `cursor: 0` ("start at
+ * head", events.md rule 2) and wakes on NOTHING from the page — it only
+ * records `next_cursor`. A store that was EMPTY at seed keeps cursor 0, and
+ * the following poll's head page is genuinely news; the `seeded` latch is what
+ * separates the two (a pre-existing page always leaves a nonzero cursor).
+ *
+ * Everything else: every row above the cursor is judged by `considerTransition`
+ * (skipping rows at or below the cursor makes a re-served page a no-op), pages
+ * are drained while `has_more`, and the pending chain checks run after the page
+ * so a chain row that landed since the member's row is not lost.
+ */
+export async function pollWakeStep(state: WakeState, deps: WakePollDeps): Promise<WakePollResult> {
+  const wakes: Wake[] = [];
+  const warnings: string[] = [];
+  const warn = (message: string): void => {
+    warnings.push(message);
+    deps.warn?.(message);
+  };
+  const scope: Record<string, unknown> =
+    deps.workspaceId !== null && deps.workspaceId !== undefined
+      ? { workspace_id: deps.workspaceId }
+      : {};
+  const seeding = !state.seeded;
+  let at = state.cursor;
+  let pagesRead = 0;
+  try {
+    let page = (await deps.request(TRANSITIONS_OP, { cursor: at, ...scope })) as WakePage;
+    if (page === null || typeof page !== "object" || !Array.isArray(page.transitions)) {
+      throw new Error(`${TRANSITIONS_OP} returned an unexpected payload`);
+    }
+    pagesRead++;
+    if (seeding) {
+      // seed at head: consume the page, wake on none of it
+      state.seeded = true;
+      state.cursor = page.next_cursor;
+    } else {
+      for (;;) {
+        for (const row of page.transitions) {
+          if (row.cursor <= state.cursor) continue;
+          await considerTransition(state, deps, row, wakes);
+        }
+        if (page.next_cursor > state.cursor) state.cursor = page.next_cursor;
+        if (!page.has_more || page.next_cursor <= at) break;
+        at = page.next_cursor;
+        page = (await deps.request(TRANSITIONS_OP, { cursor: at, ...scope })) as WakePage;
+        if (page === null || typeof page !== "object" || !Array.isArray(page.transitions)) {
+          throw new Error(`${TRANSITIONS_OP} returned an unexpected payload`);
+        }
+        pagesRead++;
+      }
+    }
+    for (const [chainRunId, member] of [...state.pendingChains]) {
+      const wake = await chainCompletionWake(state, deps, chainRunId, member);
+      if (wake !== null) wakes.push(wake);
+    }
+  } catch (err) {
+    // a daemon-down (or any failed) poll SILENCES: one warn per session, the
+    // cursor untouched, so the next successful poll resumes exactly there
+    if (!state.warnedDown) {
+      state.warnedDown = true;
+      warn(
+        `[novaflow] wake poll failed: ${(err as Error).message} — the watcher keeps its cursor and resumes when the daemon answers`,
+      );
+    }
+    return { polled: pagesRead > 0, seeded: state.seeded, cursor: state.cursor, wakes, warnings };
+  }
+  return { polled: true, seeded: state.seeded, cursor: state.cursor, wakes, warnings };
+}
+
+/** The timer seam (the factory uses the Node globals; tests inject a fake). */
+export type WakeScheduler = {
+  setInterval: (fn: () => void, ms: number) => unknown;
+  clearInterval: (handle: unknown) => void;
+};
+
+const NODE_SCHEDULER: WakeScheduler = {
+  setInterval: (fn, ms) => setInterval(fn, ms),
+  clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
+};
+
+export type WakeWatcherOptions = {
+  /** The socket request seam (tests). */
+  request?: WakeRequest;
+  /** The config to use instead of loading the file (tests). */
+  config?: WakeConfig;
+  /** The poll interval override (tests). */
+  intervalMs?: number;
+  /** The timer seam (tests). */
+  scheduler?: WakeScheduler;
+  /** The injection seam (tests); the factory uses pi.sendUserMessage. */
+  send?: (text: string) => void;
+};
+
+export type WakeWatcher = {
+  /** Seed at head and start polling — called on EVERY session_start; re-pins once. */
+  start: (ctx: Pick<ExtensionContext, "ui">) => Promise<void>;
+  /** Clear the interval and invalidate any in-flight poll (session_shutdown). */
+  stop: () => void;
+  /** Drive exactly one poll step (tests, and the interval's own callback). */
+  poll: () => Promise<void>;
+  state: () => WakeState;
+};
+
+/**
+ * The operator-mode wake watcher (wake.md). Owned by the extension factory for
+ * the lifetime of the extension instance; `start`/`stop` ride the session
+ * lifecycle. Nothing here throws out of a timer: the poll step swallows its
+ * failures, and the injection is wrapped (a stale `pi`/ctx after a session
+ * replacement is a warn, per the PROVEN mechanism note in wake.md).
+ */
+export function createWakeWatcher(pi: ExtensionAPI, options: WakeWatcherOptions = {}): WakeWatcher {
+  const scheduler = options.scheduler ?? NODE_SCHEDULER;
+  const request: WakeRequest = options.request ?? ((op, args) => daemonRequest(op, args));
+  const send: (text: string) => void =
+    options.send ??
+    ((text: string) => {
+      pi.sendUserMessage(text, { deliverAs: "followUp" });
+    });
+
+  let generation = 0;
+  let running = false;
+  let inFlight = false;
+  let handle: unknown = null;
+  let state = newWakeState();
+  let workspaceId: string | null = null;
+  let warn: (message: string) => void = () => undefined;
+
+  function stop(): void {
+    // the generation bump is the staleness discipline: a poll still awaiting its
+    // page, and a tick still queued by the old interval, both become no-ops
+    generation++;
+    running = false;
+    if (handle !== null) {
+      scheduler.clearInterval(handle);
+      handle = null;
+    }
+  }
+
+  async function run(gen: number): Promise<void> {
+    const result = await pollWakeStep(state, { request, workspaceId, warn });
+    for (const wake of result.wakes) {
+      if (gen !== generation) return;
+      try {
+        send(wake.text);
+      } catch (err) {
+        // the captured pi/ctx is stale (session replaced): never throw out of
+        // a timer, and never re-try through a dead context
+        warn(
+          `[novaflow] wake not delivered — the session context is stale (${(err as Error).message})`,
+        );
+      }
+    }
+  }
+
+  async function poll(): Promise<void> {
+    if (!running || inFlight) return;
+    inFlight = true;
+    const gen = generation;
+    try {
+      await run(gen);
+    } catch (err) {
+      warn(`[novaflow] wake poll failed: ${(err as Error).message}`);
+    } finally {
+      inFlight = false;
+    }
+  }
+
+  async function start(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
+    stop(); // every session_start reason re-pins exactly ONE interval
+    state = newWakeState(); // a new session seeds at head again
+    workspaceId = null;
+    warn = (message: string): void => {
+      try {
+        ctx.ui.notify(message, "warning");
+      } catch {
+        /* a stale ctx after a session replacement never throws out of a poll */
+      }
+    };
+    const config = options.config ?? loadWakeConfig();
+    if (!config.enabled) return; // wake.enabled: false or NOVAFLOW_WAKE=off
+    running = true;
+    const gen = generation;
+
+    if (config.workspace !== null) {
+      try {
+        const data = (await request(WORKSPACE_LIST_OP, {})) as {
+          workspaces?: Array<{ id?: unknown; slug?: unknown }>;
+        };
+        const row = (data.workspaces ?? []).find(
+          (w) => w.slug === config.workspace || w.id === config.workspace,
+        );
+        if (typeof row?.id === "string") workspaceId = row.id;
+      } catch {
+        /* unresolved below: the session polls every workspace, with a warn */
+      }
+      if (gen !== generation) return;
+      if (workspaceId === null) {
+        warn(
+          `[novaflow] wake.workspace "${config.workspace}" did not resolve to a workspace id — the watcher polls every workspace for this session`,
+        );
+      }
+    }
+
+    // the SEED poll (cursor 0, wakes on nothing) — awaited so the seed point
+    // is exactly session start, and so a caller sees a seeded watcher
+    inFlight = true;
+    try {
+      await run(gen);
+    } catch (err) {
+      warn(`[novaflow] wake poll failed: ${(err as Error).message}`);
+    } finally {
+      inFlight = false;
+    }
+    if (gen !== generation || !running) return;
+    handle = scheduler.setInterval(() => {
+      void poll();
+    }, options.intervalMs ?? wakeIntervalMs());
+  }
+
+  return {
+    start,
+    stop,
+    poll,
+    state: () => state,
+  };
+}
+
 /* ---------------------------------- the factory ---------------------------------- */
 
 const MUTATING_TOOLS: ReadonlySet<string> = new Set(["write", "edit", "bash", "powershell"]);
@@ -1632,6 +2263,17 @@ function registerOperatorMode(pi: ExtensionAPI): void {
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       await runNovaCommand(args, ctx);
     },
+  });
+
+  // the wake watcher (wake.md) is an OPERATOR-mode feature: run-mode sessions
+  // end with the run. Seeded at head on every session_start reason, cleared on
+  // session_shutdown (the captured pi is stale after a session replacement).
+  const watcher = createWakeWatcher(pi);
+  pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
+    await watcher.start(ctx);
+  });
+  pi.on("session_shutdown", async () => {
+    watcher.stop();
   });
 }
 
