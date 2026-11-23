@@ -13,6 +13,7 @@ import { readFileSync } from "node:fs";
 import type { Db } from "../store/db.ts";
 import { ulid } from "../store/ids.ts";
 import { applyTransition, InvalidTransitionError } from "../fsm/engine.ts";
+import { withFixHint, IMPORT_GRAPH_FIX } from "../fixhint.ts";
 import {
   createTask,
   enqueueTask,
@@ -245,6 +246,11 @@ export type ControlServer = {
  * (repo_alias + access_mode, optional string-array fields; column
  * defaults apply when omitted).
  */
+function failImport(message: string): never {
+  // W4 R4.3: the graph-import refusal names the operator's next move.
+  throw new OpError("schema_invalid", withFixHint(message, IMPORT_GRAPH_FIX));
+}
+
 function parseOverridesArg(args: Record<string, unknown>): Record<string, unknown> | undefined {
   const v = args["overrides"];
   if (v === undefined) return undefined;
@@ -1396,7 +1402,7 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
     const graphText = reqString(args, "graph_text");
     const format = args["format"];
     if (format !== undefined && format !== "json" && format !== "yaml") {
-      throw new OpError("schema_invalid", 'args.format must be "json" or "yaml"');
+      failImport('args.format must be "json" or "yaml"');
     }
     // YamlParseError propagates to toErrorPayload (schema_invalid, line named)
     const graph: unknown =
@@ -1407,29 +1413,24 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
               return JSON.parse(graphText) as unknown;
             } catch (jsonErr) {
               if (format === "json") {
-                throw new OpError(
-                  "schema_invalid",
-                  `graph_text is not valid JSON: ${(jsonErr as Error).message}`,
-                );
+                failImport(`graph_text is not valid JSON: ${(jsonErr as Error).message}`);
               }
               // auto (documented): JSON first, then the YAML subset
               return parseYaml(graphText);
             }
           })();
     if (typeof graph !== "object" || graph === null || Array.isArray(graph)) {
-      throw new OpError("schema_invalid", "the chain graph must be a JSON/YAML object");
+      failImport("the chain graph must be a JSON/YAML object");
     }
     const obj = graph as Record<string, unknown>;
     if (typeof obj["project_slug"] !== "string" || obj["project_slug"] === "") {
-      throw new OpError(
-        "schema_invalid",
+      failImport(
         'the chain graph must declare a non-empty string "project_slug" (§4.3 required key)',
       );
     }
     const slug = obj["project_slug"];
     if (args["project_slug"] !== undefined && args["project_slug"] !== slug) {
-      throw new OpError(
-        "schema_invalid",
+      failImport(
         `the graph declares project_slug "${slug}" but "${String(args["project_slug"])}" was given — mismatch refused (the schema carries project_slug)`,
       );
     }

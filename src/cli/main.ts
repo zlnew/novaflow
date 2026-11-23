@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { UsageError } from "./args.ts";
+import { parseArgs, UsageError } from "./args.ts";
 import {
   EXIT_DAEMON_UNREACHABLE,
   EXIT_OK,
@@ -9,6 +9,8 @@ import {
   exitCodeForTaxonomy,
 } from "./exitcode.ts";
 import { DaemonUnreachableError, OpFailureError } from "./client.ts";
+import { findVerb, renderNounHelp, renderOverview, renderVerbHelp } from "./help.ts";
+import { verbsOf } from "./verbs.ts";
 import { workspaceCommand } from "./commands/workspace.ts";
 import { projectCommand } from "./commands/project.ts";
 import { profileCommand } from "./commands/profile.ts";
@@ -27,11 +29,24 @@ import type { CommandOpts } from "./opts.ts";
  * JSONL socket surface: one command = one op call (single-writer rule,
  * architecture 8.1). The CLI never opens the SQLite store.
  *
- * `nova mcp` (p5) starts the MCP control surface on stdio
- * (novaflow-v1/mcp): it is a SERVER, so it runs until its client
- * disconnects and exits 0 — see src/cli/commands/mcp.ts for why the srs
- * exit map does not apply to it. `nova chain` shipped in p4a
- * (list/status/abort + FR-TSK-08's pause/resume).
+ * DISPATCH IS THE VERB TABLE (src/cli/verbs.ts), and help is intercepted
+ * HERE, once, for every verb (W4 R4.1):
+ *
+ *   - `nova <noun> <verb> --help` / `-h` → that verb's usage, flags and one
+ *     example, exit 0. Never the whole manual: the intercepted request never
+ *     reaches a noun module, so `--help` can never be parsed as an unknown
+ *     flag (the observed defect: `nova chain create --help` answered
+ *     `unknown flag --help` and dumped everything).
+ *   - a UsageError from a KNOWN verb (unknown flag, bad positional shape)
+ *     prints THAT verb's usage and exits 2 — the whole-program dump is only
+ *     for an unknown noun/subcommand, which is still a usage error (exit 2)
+ *     per the v1 map.
+ *   - `nova help <noun>` lists the noun's verbs; bare `nova help` prints the
+ *     overview and exits 0; bare `nova` prints it on stderr and exits 2.
+ *
+ * `nova mcp` (p5) starts the MCP control surface on stdio (novaflow-v1/mcp):
+ * it is a SERVER, so it runs until its client disconnects and exits 0 — see
+ * src/cli/commands/mcp.ts for why the srs exit map does not apply to it.
  */
 
 const VERSION = readVersion();
@@ -47,51 +62,57 @@ function readVersion(): string {
   }
 }
 
-/** The srs 4.1.1 command table, with the not-in-phase nouns marked. */
-const USAGE = `USAGE: nova <noun> <sub> [args] [flags]
-  common flags: --workspace <slug|id>   --json   --watch
+type NounCommand = (argv: string[], opts: CommandOpts) => Promise<number>;
 
-  nova workspace create <name> --path <dir> [--default-branch <b>]
-  nova workspace list | switch <slug> | archive <slug> | unregister <slug>
-  nova project create <name> --objective <text> [--target alias=path[:git_repo|directory]]...
-  nova project list | status <id|slug> | phase <id|slug> <label...>
-  nova project import-dag <file> [--project <slug>]
-  nova profile create --file <path> | update <name> --file <path> | delete <name> | list | validate <name>
-  nova task create <key> --title <t> --objective <o> --profile <name> --project <slug|id> [--gate] [--context <path>]...
-  nova task run <id|key> [--watch] | status <id|key> [--watch] | list
-  nova task result <id|key> | logs <id|key> [--lines <n>] [--follow] | abort | retry <id|key>
-  nova task steer <id|key> <message...>
-  nova task gate-approve <id|key> [--run <id>] [--by <name>] [--note <text>]
-  nova task gate-reject <id|key> <feedback...>
-  nova daemon start [--foreground] | stop | status | pause | resume | kill-all
-  nova daemon backup [--out <path>] | prune [--retention-days <n>]
-  nova daemon logs [--lines <n>]
-  nova status [--watch] [--json]
-  nova web sync [--run <id|key> | --all]
-  nova web start | stop | status [--json]
-  nova docs list [<workspace>]
-  nova version
-  nova schedule attach <id|key> [--cron '<expr>' | --at <iso>] [--missed skip|run_immediately]
-  nova schedule list [--task <id|key>] [--workspace <slug|id>]
-  nova schedule pause <schedule-id> | resume <schedule-id>
-  nova chain list | status <chain-run-id> [--watch]
-  nova chain abort | pause | resume <chain-run-id>
-  nova chain verify <chain-run-id>   (configured vs executed verification commands,
-                                      per member run; exit 3 when one is UNEXECUTED)
-  nova chain clean <chain-run-id> [--force]
-  nova mcp            (MCP server on stdio; runs until its client disconnects)`;
+/**
+ * The dispatch table: one entry per srs 4.1.1 noun. `VERBS` (src/cli/verbs.ts)
+ * carries the verbs each entry must answer; the dispatcher refuses a verb the
+ * table does not carry, so the two can never disagree at runtime.
+ */
+export const NOUN_COMMANDS: Record<string, NounCommand> = {
+  workspace: workspaceCommand,
+  project: projectCommand,
+  profile: profileCommand,
+  task: taskCommand,
+  schedule: scheduleCommand,
+  daemon: daemonCommand,
+  status: statusCommand,
+  web: webCommand,
+  version: async (argv) => {
+    // the one noun-level verb with no module: validate its flags HERE so an
+    // unknown flag is a usage error with the verb's usage (R4.1), never a
+    // silent success
+    const p = parseArgs(argv, {});
+    if (p.positionals.length > 0) {
+      throw new UsageError(`nova version takes no arguments (got "${p.positionals.join(" ")}")`);
+    }
+    return version(p.json);
+  },
+  chain: chainCommand,
+  mcp: mcpCommand,
+  docs: docsCommand,
+};
+
+/** The verb list the dispatcher answers to (re-exported for the generated tests). */
+export { VERBS } from "./verbs.ts";
+
+/** Where the failing invocation was, so a usage error can name the right verb. */
+type DispatchContext = { noun?: string; sub?: string | undefined };
 
 /**
  * Run one CLI invocation; returns the process exit code (0–5, the srs
  * 4.1.1 map). Never throws.
  */
 export async function main(argv: string[]): Promise<number> {
+  const ctx: DispatchContext = {};
   try {
-    return await dispatch(argv);
+    return await dispatch(argv, ctx);
   } catch (err) {
     if (err instanceof UsageError) {
       console.error(`nova: ${err.message}`);
-      console.error(USAGE);
+      // a known verb answers with ITS usage; anything unknown gets the manual
+      const verb = ctx.noun === undefined ? undefined : findVerb(ctx.noun, ctx.sub);
+      console.error(verb === undefined ? renderOverview() : renderVerbHelp(verb));
       return EXIT_USAGE;
     }
     if (err instanceof DaemonUnreachableError) {
@@ -107,51 +128,142 @@ export async function main(argv: string[]): Promise<number> {
   }
 }
 
-/** Sub-usage errors thrown as plain errors by noun modules are usage too. */
-async function dispatch(argv: string[]): Promise<number> {
+async function dispatch(argv: string[], ctx: DispatchContext): Promise<number> {
   let [noun, ...rest] = argv;
   // conventional alias: --version / -V is `nova version` (review finding)
   if (noun === "--version" || noun === "-V") {
     noun = "version";
     rest = [];
   }
-  if (noun === undefined || noun === "" || noun === "help") {
-    console.error(USAGE);
+
+  // a help request is intercepted BEFORE any module parses flags (R4.1)
+  if (wantsHelp(rest)) return helpRequest(noun, rest);
+
+  if (noun === "help") {
+    const [topic, ...more] = rest;
+    if (topic === undefined) {
+      console.log(renderOverview());
+      return EXIT_OK;
+    }
+    if (!isNoun(topic)) {
+      console.error(`nova: unknown noun "${topic}"`);
+      console.error(renderOverview());
+      return EXIT_USAGE;
+    }
+    const sub = more.find((token) => !token.startsWith("-"));
+    ctx.noun = topic;
+    if (sub !== undefined) {
+      const verb = findVerb(topic, sub);
+      ctx.sub = verb?.sub ?? undefined;
+      if (verb === undefined) {
+        console.error(`nova: unknown verb "nova ${topic} ${sub}"`);
+        console.error(renderNounHelp(topic));
+        return EXIT_USAGE;
+      }
+      console.log(renderVerbHelp(verb));
+      return EXIT_OK;
+    }
+    const only = verbsOf(topic);
+    console.log(only.length === 1 ? renderVerbHelp(only[0]!) : renderNounHelp(topic));
+    return EXIT_OK;
+  }
+
+  if (noun === undefined || noun === "") {
+    console.error(renderOverview());
     return EXIT_USAGE;
+  }
+  if (!isNoun(noun)) {
+    ctx.noun = noun;
+    throw new UsageError(`unknown command "${noun}" — run \`nova help\` for the verb list`);
+  }
+
+  // a one-verb noun (status/version/mcp) owns its own positional rule; the
+  // module's own UsageError then renders that verb's usage block
+  if (verbsOf(noun).every((verb) => verb.sub === null)) {
+    ctx.noun = noun;
+    ctx.sub = undefined;
+    return NOUN_COMMANDS[noun]!(rest, commandOpts(rest));
+  }
+
+  const sub = subOf(noun, rest);
+  const verb = findVerb(noun, sub);
+  ctx.noun = noun;
+  ctx.sub = verb?.sub ?? undefined;
+  if (verb === undefined) {
+    // unchanged v1 behaviour for an unknown SUBCOMMAND: a usage error (exit
+    // 2) carrying the noun's own verb list, never a silent no-op.
+    throw new UsageError(unknownSubMessage(noun, sub));
   }
 
   // The common flags are parsed by each noun module's spec; dispatch
   // hands the raw argv through and threads the resolved opts.
   const opts = commandOpts(rest);
+  return NOUN_COMMANDS[noun]!(rest, opts);
+}
 
-  switch (noun) {
-    case "workspace":
-      return workspaceCommand(rest, opts);
-    case "project":
-      return projectCommand(rest, opts);
-    case "profile":
-      return profileCommand(rest, opts);
-    case "task":
-      return taskCommand(rest, opts);
-    case "schedule":
-      return scheduleCommand(rest, opts);
-    case "daemon":
-      return daemonCommand(rest, opts);
-    case "status":
-      return statusCommand(rest, opts);
-    case "web":
-      return webCommand(rest, opts);
-    case "version":
-      return version(opts.json);
-    case "chain":
-      return chainCommand(rest, opts);
-    case "mcp":
-      return mcpCommand(rest, opts);
-    case "docs":
-      return docsCommand(rest, opts);
-    default:
-      throw new UsageError(`unknown command "${noun}"`);
+function isNoun(noun: string): boolean {
+  return Object.hasOwn(NOUN_COMMANDS, noun);
+}
+
+/** True when `-h`/`--help` appears before the `--` end-of-flags marker. */
+function wantsHelp(rest: readonly string[]): boolean {
+  for (const token of rest) {
+    if (token === "--") return false;
+    if (token === "--help" || token === "-h") return true;
   }
+  return false;
+}
+
+/** The sub-verb an invocation names: the first token that IS one of the noun's verbs. */
+function subOf(noun: string, rest: readonly string[]): string | undefined {
+  const known = new Set(
+    verbsOf(noun)
+      .map((verb) => verb.sub)
+      .filter((sub): sub is string => sub !== null),
+  );
+  let firstPlain: string | undefined;
+  for (const token of rest) {
+    if (token === "--") break;
+    if (token.startsWith("-")) continue;
+    if (firstPlain === undefined) firstPlain = token;
+    if (known.has(token)) return token;
+  }
+  return firstPlain;
+}
+
+function unknownSubMessage(noun: string, sub: string | undefined): string {
+  const subs = verbsOf(noun)
+    .map((verb) => verb.sub)
+    .filter((s): s is string => s !== null);
+  const got = sub === undefined ? "" : ` — got "${sub}"`;
+  return `nova ${noun} [${subs.join("|")}]${got}`;
+}
+
+/** `--help` / `-h` / `nova help <noun> [<verb>]` — verb-scoped, exit 0. */
+function helpRequest(noun: string | undefined, rest: readonly string[]): number {
+  if (noun === undefined || noun === "" || noun === "help") {
+    console.log(renderOverview());
+    return EXIT_OK;
+  }
+  if (!isNoun(noun)) {
+    console.error(`nova: unknown command "${noun}"`);
+    console.error(renderOverview());
+    return EXIT_USAGE;
+  }
+  const sub = subOf(noun, rest);
+  if (sub !== undefined) {
+    const verb = findVerb(noun, sub);
+    if (verb === undefined) {
+      console.error(`nova: unknown verb "nova ${noun} ${sub}"`);
+      console.error(renderNounHelp(noun));
+      return EXIT_USAGE;
+    }
+    console.log(renderVerbHelp(verb));
+    return EXIT_OK;
+  }
+  const only = verbsOf(noun);
+  console.log(only.length === 1 ? renderVerbHelp(only[0]!) : renderNounHelp(noun));
+  return EXIT_OK;
 }
 
 /** Pre-scan ONLY for the common flags (each module re-parses its own

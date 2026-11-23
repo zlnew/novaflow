@@ -327,7 +327,8 @@ test("nova web sync: --run and --all are exclusive and one of them is required (
       assert.match(res.stderr, /--run|--all/);
     }
     const help = runNova(["help"], {});
-    assert.match(help.stderr, /nova web sync \[--run <id\|key> \| --all\]/);
+    assert.equal(help.code, 0, help.stderr);
+    assert.match(help.stdout, /nova web sync \[--run <id\|key> \| --all\]/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

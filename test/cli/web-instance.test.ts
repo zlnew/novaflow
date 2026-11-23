@@ -329,8 +329,10 @@ test("nova web start/stop with a real pi-web: /api/sessions lists the mirrored r
 
 test("nova web start/stop/status appear in the help text (the 4.1.1 web verbs)", () => {
   const res = runNova(["help"], {});
-  assert.equal(res.code, 2);
-  assert.match(res.stderr, /nova web sync/);
-  assert.match(res.stderr, /nova web start \| stop \| status/);
-  assert.match(res.stderr, /nova status \[--watch\]/);
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /nova web sync/);
+  assert.match(res.stdout, /nova web start/);
+  assert.match(res.stdout, /nova web stop/);
+  assert.match(res.stdout, /nova web status/);
+  assert.match(res.stdout, /nova status \[--watch\]/);
 });

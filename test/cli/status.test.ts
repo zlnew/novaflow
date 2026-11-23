@@ -226,3 +226,39 @@ test("nova status exits 5 (daemon unreachable) rather than inventing a screen fr
     await shutdown(e);
   }
 });
+
+test("nova status shows an UNARMED breaker: prices_armed false names the inert model (R4.4)", async () => {
+  const e = await boot();
+  try {
+    // a run of a model with no price row: the breaker is inert for it, and the
+    // screen must SAY so instead of presenting a zero charge as if it were free
+    const taskId = addTask(e, "WC8");
+    const startedAt = new Date().toISOString();
+    e.db
+      .prepare(
+        `INSERT INTO task_runs
+           (id, task_id, attempt_number, pi_session_id, pi_session_dir, status,
+            model_used, cost_usd, events_log_path, started_at)
+         VALUES (?, ?, 1, ?, ?, 'succeeded', 'novaflow-unpriced-model', 0.42, ?, ?)`,
+      )
+      .run(ulid(), taskId, ulid(), join(e.wsRoot, "session"), join(e.wsRoot, "events.jsonl"), startedAt);
+
+    const res = runNova(["status"], e.env);
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(res.stdout, /prices_armed false/, res.stdout);
+    assert.match(res.stdout, /inert_models novaflow-unpriced-model/, res.stdout);
+    assert.match(res.stdout, /today \$0\.4200 \(1 runs\)/, res.stdout);
+
+    const json = runNova(["status", "--json"], e.env);
+    assert.equal(json.code, 0, json.stderr);
+    const parsed = JSON.parse(json.stdout.trim()) as {
+      daemon: { spend: { prices_armed: boolean; inert_models: string[]; today: { cost_usd: number; runs: number } } };
+    };
+    assert.equal(parsed.daemon.spend.prices_armed, false);
+    assert.deepEqual(parsed.daemon.spend.inert_models, ["novaflow-unpriced-model"]);
+    assert.equal(parsed.daemon.spend.today.cost_usd, 0.42);
+    assert.equal(parsed.daemon.spend.today.runs, 1);
+  } finally {
+    await shutdown(e);
+  }
+});

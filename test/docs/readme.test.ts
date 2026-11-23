@@ -52,8 +52,9 @@ test("README's quickstart references only verbs the CLI actually has", () => {
     ["web stop", /bin\/nova web stop/],
   ];
   for (const [what, re] of must) assert.match(README, re, `README must show ${what}`);
-  // and the exact verb lists the help prints
-  const help = readFileSync(join(REPO, "src", "cli", "main.ts"), "utf8");
+  // and the exact verb lists the help prints (the overview is generated from
+  // the verb table — P12 moved the usage text out of main.ts)
+  const help = readFileSync(join(REPO, "src", "cli", "verbs.ts"), "utf8");
   // the usage block prints both daemon verbs on one line; the individual
   // names must each appear
   for (const verb of [/nova workspace create/, /nova docs list/, /daemon backup/, /prune \[--retention-days/]) {
