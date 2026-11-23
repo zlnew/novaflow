@@ -476,7 +476,13 @@ function resolveProfileByName(db: Db, projectId: string, name: string): string {
   // lifecycle verbs resolve through the very same statement.
   const row = resolveProfileRow(db, name, project.workspace_id);
   if (!row) {
-    throw new OpError("not_found", `no profile named "${name}" in the project's workspace`);
+    throw new OpError(
+      "not_found",
+      withFixHint(
+        `no profile named "${name}" in the project's workspace`,
+        "list the workspace and global profiles with `nova profile list --workspace <slug>` and use an exact name",
+      ),
+    );
   }
   if (process.env["NF_DEBUG_PROFILE"] === "1") {
   }
@@ -541,7 +547,7 @@ export function buildOpTable(): Map<string, OpHandler> {
       : null;
     if (bare !== null) {
       const task = getTask(deps.db, bare);
-      if (!task) throw new OpError("not_found", `no such task: ${ident}`);
+      if (!task) throw new OpError("not_found", withFixHint(`no such task: ${ident}`, "list tasks with `nova task list`"));
       return { task };
     }
     // the human key: resolved within the workspace context — the CLI's
@@ -563,7 +569,7 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (rows.length === 0) {
       throw new OpError(
         "not_found",
-        `no task with key "${ident}" in workspace "${workspace.slug}"`,
+        withFixHint(`no task with key "${ident}" in workspace "${workspace.slug}"`, "list tasks with `nova task list`"),
       );
     }
     if (rows.length > 1) {
@@ -573,7 +579,7 @@ export function buildOpTable(): Map<string, OpHandler> {
       );
     }
     const task = getTask(deps.db, rows[0]!.id);
-    if (!task) throw new OpError("not_found", `no such task: ${rows[0]!.id}`);
+    if (!task) throw new OpError("not_found", withFixHint(`no such task: ${rows[0]!.id}`, "list tasks with `nova task list`"));
     return { task };
   });
 
@@ -750,14 +756,20 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (!WORKSPACE_NAME_PATTERN.test(name)) {
       throw new OpError(
         "schema_invalid",
-        `workspace name must be lower-case kebab-case (${WORKSPACE_NAME_PATTERN}), got "${name}"`,
+        withFixHint(
+          `workspace name must be lower-case kebab-case (${WORKSPACE_NAME_PATTERN}), got "${name}"`,
+          'use lower-case letters, digits and hyphens, e.g. "my-workspace"',
+        ),
       );
     }
     const rootPath = resolve(reqString(args, "root_path"));
     if (!isWritableDirectory(rootPath)) {
       throw new OpError(
         "schema_invalid",
-        `root_path is not an existing writable directory: ${rootPath}`,
+        withFixHint(
+          `root_path is not an existing writable directory: ${rootPath}`,
+          "create the directory (`mkdir -p <path>`), make it writable, then re-run `nova workspace create`",
+        ),
       );
     }
     if (deps.db.prepare("SELECT id FROM workspaces WHERE slug = ?").get(name) !== undefined) {
@@ -841,7 +853,10 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (!PROJECT_NAME_PATTERN.test(name)) {
       throw new OpError(
         "schema_invalid",
-        `project name must be lower-case kebab-case (${PROJECT_NAME_PATTERN}), got "${name}"`,
+        withFixHint(
+          `project name must be lower-case kebab-case (${PROJECT_NAME_PATTERN}), got "${name}"`,
+          'use lower-case letters, digits and hyphens, e.g. "my-project"',
+        ),
       );
     }
     const objective = reqString(args, "objective");
@@ -1020,7 +1035,10 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (!row) {
       throw new OpError(
         "not_found",
-        `no profile named "${name}" in ${workspace ? `workspace "${workspace.slug}" or the global scope` : "the global scope"}`,
+        withFixHint(
+          `no profile named "${name}" in ${workspace ? `workspace "${workspace.slug}" or the global scope` : "the global scope"}`,
+          "list the profiles in scope with `nova profile list`",
+        ),
       );
     }
     // the scope actually acted on comes from the ROW, not the request
@@ -1086,7 +1104,10 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (!row) {
       throw new OpError(
         "not_found",
-        `no profile named "${name}" in ${workspace ? `workspace "${workspace.slug}" or the global scope` : "the global scope"}`,
+        withFixHint(
+          `no profile named "${name}" in ${workspace ? `workspace "${workspace.slug}" or the global scope` : "the global scope"}`,
+          "list the profiles in scope with `nova profile list`",
+        ),
       );
     }
     const scope = row.workspace_id === null ? "global" : "workspace";
@@ -1095,7 +1116,10 @@ export function buildOpTable(): Map<string, OpHandler> {
     if (pins > 0) {
       throw new OpError(
         "schema_invalid",
-        `profile "${name}" (${scopeLabel}) is pinned by ${pins} task${pins === 1 ? "" : "s"} — a pinned profile is never deleted (tasks.profile_id is ON DELETE RESTRICT); reassign or delete those tasks first`,
+        withFixHint(
+          `profile "${name}" (${scopeLabel}) is pinned by ${pins} task${pins === 1 ? "" : "s"} — a pinned profile is never deleted (tasks.profile_id is ON DELETE RESTRICT)`,
+          "pin new tasks to a different profile (`nova task create … --profile <other>`), since v1 has no task reassign or delete",
+        ),
       );
     }
     const canonicalPath =
@@ -1196,12 +1220,15 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
          JOIN workspaces w ON w.id = p.workspace_id WHERE t.id = ?`,
     )
     .get(taskId) as { status: string; slug: string } | undefined;
-  if (row === undefined) throw new OpError("not_found", `no such task: ${taskId}`);
+  if (row === undefined) throw new OpError("not_found", withFixHint(`no such task: ${taskId}`, "list tasks with `nova task list`"));
   if (row.status !== "active") {
     throw new OpError(
       "aborted",
-      `workspace "${row.slug}" is ${row.status} — task execution is disabled (FR-WS-03); ` +
-        "dispatch will never admit this task. Unarchive is not a v1 surface.",
+      withFixHint(
+        `workspace "${row.slug}" is ${row.status} — task execution is disabled (FR-WS-03); ` +
+          "dispatch will never admit this task. Unarchive is not a v1 surface.",
+        "create a new workspace with `nova workspace create <name> --path <dir>` and re-create the task there",
+      ),
     );
   }
 }
@@ -1229,7 +1256,7 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
       actor: optString(args, "actor", "operator"),
     });
     if (decision.kind === "not-failed") {
-      throw new OpError("not_found", `no such task: ${taskId}`);
+      throw new OpError("not_found", withFixHint(`no such task: ${taskId}`, "list tasks with `nova task list`"));
     }
     deps.dispatcher.requestDispatch();
     return { decision };
@@ -1442,14 +1469,23 @@ function requireActiveWorkspace(db: Db, taskId: string): void {
         .prepare("SELECT id, workspace_id, slug FROM projects WHERE workspace_id = ? AND slug = ?")
         .get(workspace.id, slug) as { id: string; workspace_id: string; slug: string } | undefined;
       if (project === undefined) {
-        throw new OpError("not_found", `no project "${slug}" in workspace "${workspace.slug}"`);
+        throw new OpError(
+          "not_found",
+          withFixHint(
+            `no project "${slug}" in workspace "${workspace.slug}"`,
+            "list projects with `nova project list --workspace <slug>` and use an exact slug",
+          ),
+        );
       }
     } else {
       const rows = deps.db
         .prepare("SELECT id, workspace_id, slug FROM projects WHERE slug = ?")
         .all(slug) as Array<{ id: string; workspace_id: string; slug: string }>;
       if (rows.length === 0) {
-        throw new OpError("not_found", `no project "${slug}" in any workspace`);
+        throw new OpError(
+          "not_found",
+          withFixHint(`no project "${slug}" in any workspace`, "list projects with `nova project list` and use an exact slug"),
+        );
       }
       if (rows.length > 1) {
         throw new OpError(

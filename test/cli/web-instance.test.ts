@@ -131,6 +131,7 @@ test("nova web start refuses a busy port naming what holds it — no pid file, n
     assert.match(res.stderr, new RegExp(`port ${port} is already in use`), res.stderr);
     assert.match(res.stderr, /refusing to start pi-web on a busy port/);
     assert.match(res.stderr, /held by /, "the message names the holder");
+    assert.match(res.stderr, / — fix: /, "the busy-port refusal names the next move");
     // the holder is this test process: the pid is discoverable via ss/fuser
     assert.match(res.stderr, new RegExp(String(process.pid)), res.stderr);
     assert.equal(existsSync(pidPath(h)), false, "nothing was launched, so no pid file");

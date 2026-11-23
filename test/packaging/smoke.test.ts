@@ -73,9 +73,16 @@ test("tarball smoke: pack → global install → --version → daemon --migrate 
     // ---- 2. install the artifact into a temp GLOBAL prefix ----------------
     // `-g --prefix` is what puts the bin link at <prefix>/bin/nova; a bare
     // `--prefix` install would only create <prefix>/node_modules/.bin/nova.
-    const install = sh("npm", ["install", "-g", "--prefix", prefix, tgz], dir, env, 600_000);
+    // npm (>= 12) blocks dependency install scripts by default; allowing the
+    // one native dep at install time is the documented route (docs/install.md)
+    // and makes the prebuilt binding land with the install itself.
+    const installEnv = { ...env, npm_config_allow_scripts: "better-sqlite3" };
+    const install = sh("npm", ["install", "-g", "--prefix", prefix, tgz], dir, installEnv, 600_000);
     assert.equal(install.code, 0, `[install] npm install -g failed:\n${install.stdout}\n${install.stderr}`);
     assert.ok(existsSync(nova), "[install] the installed package has no <prefix>/bin/nova");
+    // prove the one native binding actually landed and loads
+    const binding = sh("node", ["-e", `require(${JSON.stringify(join(prefix, "lib", "node_modules", "novaflow", "node_modules", "better-sqlite3"))})`], dir, env, 60_000);
+    assert.equal(binding.code, 0, `[binding] better-sqlite3 does not load from the installed prefix:\n${binding.stdout}\n${binding.stderr}`);
 
     // ---- 3. the packaged CLI runs offline --------------------------------
     const version = sh(nova, ["--version"], dir, env, 60_000);
@@ -106,6 +113,7 @@ test("tarball smoke: pack → global install → --version → daemon --migrate 
         // pi is addressed by its full identity; `provider` above is the same
         // provider recorded on the row (data 4.2 keeps the two fields).
         model: MODEL,
+        thinking_level: "high",
         system_prompt_path: "prompts/smoke_system.md",
         tools_allowlist: ["read", "write", "bash"],
         limits: { max_timeout_sec: 600, max_cost_usd: COST_CAP_USD },
@@ -153,7 +161,9 @@ test("tarball smoke: pack → global install → --version → daemon --migrate 
     };
     assert.equal(data.task.state, "completed", "[status] the task is not in `completed`");
     assert.ok(data.current_run !== null, "[status] the task has no run row");
-    assert.equal(data.current_run?.status, "completed", "[status] the run is not `completed`");
+    // the run row's vocabulary is succeeded/failed/timed_out/cancelled (data §3
+    // task_runs.status CHECK); `completed` is the TASK state, not the run's.
+    assert.equal(data.current_run?.status, "succeeded", "[status] the run is not `succeeded`");
     assert.equal(data.current_run?.cost_basis, "priced", "[status] the cost was not priced from recorded usage");
     assert.ok(
       (data.current_run?.cost_usd ?? Infinity) <= COST_CAP_USD,

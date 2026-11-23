@@ -5,6 +5,7 @@ import { sleep } from "../procs.ts";
 import type { CommandOpts } from "../opts.ts";
 import type { TransitionPage, TransitionRow } from "../watch.ts";
 import { formatTransitionClock } from "../watch.ts";
+import { withFixHint } from "../../fixhint.ts";
 
 /**
  * `nova status [--watch]` — the tier-C live screen (novaflow-v030/panel.md;
@@ -47,7 +48,12 @@ function intervalMs(): number {
   if (raw === undefined) return DEFAULT_INTERVAL_MS;
   const ms = Number(raw);
   if (!Number.isFinite(ms) || ms < 50) {
-    throw new UsageError("NOVAFLOW_STATUS_WATCH_MS must be a number >= 50 (milliseconds)");
+    throw new UsageError(
+      withFixHint(
+        "NOVAFLOW_STATUS_WATCH_MS must be a number >= 50 (milliseconds)",
+        "set it to a whole number of milliseconds >= 50, or unset it for the 2000 ms default",
+      ),
+    );
   }
   return ms;
 }

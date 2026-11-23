@@ -16,6 +16,7 @@ the build when a row is missing or disagrees with the table.
 | --- | --- | --- |
 | `nova <noun> <verb> --help` (or `-h`) | that verb's usage, flags and one example | 0 |
 | `nova <noun> --help` | the noun's verbs, one line each | 0 |
+(a one-verb noun — `status`, `version`, `mcp` — prints that verb's usage)
 | `nova help <noun>` | the same noun list | 0 |
 | `nova help` (or bare `nova`) | the program overview (`nova help` prints it on stdout, bare `nova` on stderr) | 0 (`nova help`), 2 (bare `nova`) |
 | an unknown FLAG on a known verb | that verb's usage | 2 |
@@ -130,20 +131,28 @@ The three worst refusals carry a hint as of v0.3.0 P12:
 | the inert-prices note (`prices.json missing/unparseable — cost budget enforcement inert`) | `src/runs/prices.ts` | write `<prices path>` with the model's per-1M-token rates, re-run the task |
 
 Usage errors are their own fix: exit 2 prints the verb's usage block, which
-IS the next move. The remaining refusals still lack the marker (P13's list —
-reported, not rewritten here):
+IS the next move. The message on the line above it also names the fix
+(` — fix: `), so a script that captures stderr sees the same next move a
+human sees on the screen.
 
-- `nova: a live daemon already answers at <socket> — refusing to start a second one` (`daemon start`)
-- `nova: a live pi-web already answers at <url> (pid N) — refusing to start a second one` (`web start`)
-- `nova: port <port> is already in use — held by …; refusing to start pi-web on a busy port` (`web start`)
-- `nova: pi-web did not answer <url> within 15 s` / `did not answer … — tail of …` (`web start`, `daemon start`) — prints a log tail, no next move
-- `workspace "<slug>" is <status> — task execution is disabled (FR-WS-03); … Unarchive is not a v1 surface.` (`nova_task_run`)
-- `no project "<ident>" in the active workspace` / `no project "<ident>" in workspace <slug>` (task create, project status/phase)
-- `no profile named "<name>" in the current scope` (`profile validate`)
-- `no such task: <id>` (task/schedule/run reads via the wire `not_found`)
-- `profile "<name>" is pinned by N task(s) …` (the FK-safe `profile delete` refusal)
-- `workspace name must be lower-case kebab-case (…), got "<name>"` (`workspace create`)
-- `root_path is not an existing writable directory: <path>` (`workspace create`)
-- `--lines must be an integer 1..1000`, `--retention-days must be a non-negative integer (days)` (usage errors naming the rule, not the valid shape)
-- `NOVAFLOW_STATUS_WATCH_MS must be a number >= 50 (milliseconds)` (`status --watch`)
-- the `web sync --run` live-run refusal: it names the fix in prose (`follow it live with: nova status --watch`) but not the ` — fix: ` marker
+P13 applied the carried list: every refusal on that list now ends with the
+separator, one clause naming the move. On the P13 list, remaining refusals still lack the marker: none. The list and its next moves:
+
+- `a live daemon already answers at <socket> — refusing to start a second one` (`daemon start`) — fix: check it with `nova daemon status`, or stop it with `nova daemon stop`.
+- `a live pi-web already answers at <url> (pid N) — refusing to start a second one` (`web start`) — fix: browse the URL, or stop it with `nova web stop`.
+- `port <port> is already in use — held by …; refusing to start pi-web on a busy port` (`web start`) — fix: stop the process holding the port, or set `NOVAFLOW_PIWEB_PORT` to a free port.
+- `the daemon did not answer <socket> within 15 s` / `pi-web did not answer <url> within 15 s` / `pi-web exited … before answering` (the start commands) — fix: read the log tail below, fix the cause it names, then re-run the start command.
+- `workspace "<slug>" is <status> — task execution is disabled (FR-WS-03); …` (`nova_task_run`) — fix: create a new workspace with `nova workspace create <name> --path <dir>` and re-create the task there.
+- `no project "<ident>" in the active workspace` / `no project "<slug>" in workspace "<slug>"` / `no project "<slug>" in any workspace` (task create, project status/phase, the project lookup) — fix: list projects with `nova project list` and pass the exact slug.
+- `no profile named "<name>" in …` (`profile validate`, enqueue, chain import's project lookup, profile update/delete) — fix: list the profiles in scope with `nova profile list`.
+- `no such task: <id>` / `no task with key "<key>" in workspace "<slug>"` (task/schedule/run reads via the wire `not_found`) — fix: list tasks with `nova task list`.
+- `profile "<name>" (…) is pinned by N task(s) — a pinned profile is never deleted …` (the FK-safe `profile delete` refusal) — fix: pin new tasks to a different profile (`nova task create … --profile <other>`), since v1 has no task reassign or delete.
+- `workspace name must be lower-case kebab-case (…), got "<name>"` / `project name must be lower-case kebab-case (…), got "<name>"` (`workspace create`, `project create`) — fix: use lower-case letters, digits and hyphens, e.g. `my-workspace`.
+- `root_path is not an existing writable directory: <path>` (`workspace create`) — fix: create the directory (`mkdir -p <path>`), make it writable, then re-run the verb.
+- `--lines must be an integer 1..1000` / `--retention-days must be a non-negative integer (days)` (usage errors naming the rule) — fix: pass a value in range, e.g. `--lines 100` / `--retention-days 30`.
+- `NOVAFLOW_STATUS_WATCH_MS must be a number >= 50 (milliseconds)` (`status --watch`) — fix: set a whole number of milliseconds >= 50, or unset it for the 2000 ms default.
+- the `web sync --run` live-run refusal — fix: follow it live with `nova status --watch`, then re-run `nova web sync --run <id|key>` once it settles.
+
+The three refusals fixed in P12 keep their hints and their table above: graph
+import `schema_invalid`, the DEBT-010 unscoped-run refusal, and the
+inert-prices note.

@@ -1,7 +1,7 @@
 {
   "name": "novaflow",
   "version": "0.2.0",
-  "description": "Workflow framework and orchestration toolset around the Pi coding agent harness",
+  "description": "Deterministic orchestration for chains of Pi coding-agent tasks: per-run git worktrees, gates, verification, and a live operator view.",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -14,7 +14,8 @@
     "bin/",
     "src/",
     "extensions/",
-    "docs/"
+    "docs/",
+    "CHANGELOG.md"
   ],
   "repository": {
     "type": "git",
@@ -23,13 +24,16 @@
   "keywords": [
     "pi",
     "coding-agent",
+    "agent-orchestration",
     "orchestration",
     "workflow",
     "fsm",
     "sqlite",
     "cli",
     "mcp",
-    "dag"
+    "dag",
+    "worktree",
+    "task-queue"
   ],
   "scripts": {
     "test": "tsx --test \"test/**/*.test.ts\"",

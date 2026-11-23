@@ -268,6 +268,7 @@ test("nova web sync --run on a live run refuses with the tier-C pointer, exit no
     assert.equal(res.code, 1, `stderr: ${res.stderr}`);
     assert.match(res.stderr, /not settled/);
     assert.match(res.stderr, /nova status --watch/, "the refusal points at the live screen");
+    assert.match(res.stderr, / — fix: /, "the live-run refusal names the next move with the marker");
     assert.match(res.stderr, new RegExp(live.runId));
     assert.equal(existsSync(sessionsRoot(e)), false, "nothing was copied");
 

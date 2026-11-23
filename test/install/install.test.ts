@@ -178,7 +178,8 @@ test("install.sh --from-source: deps + `npm link`, extension, pinned config, the
 
     // the chosen mechanism: `npm install` in the checkout, then `npm link`
     // (a plain `npm install -g .` would omit tsx and break bin/nova)
-    assert.deepEqual(logLines(f, "npm.log"), ["npm install", "npm link"]);
+    // deps, the binding-rebuild belt-and-braces, then the global link
+    assert.deepEqual(logLines(f, "npm.log"), ["npm install", "npm rebuild better-sqlite3", "npm link"]);
 
     // the acquisition route is named on screen (R3.1)
     assert.match(res.stdout, /git clone https:\/\/github\.com\/zlnew\/novaflow && sh novaflow\/install\.sh/);
