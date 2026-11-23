@@ -10,10 +10,10 @@
  * contains {@link FIX_HINT_SEPARATOR}, which is what the remaining-messages
  * audit in docs/cli.md and test/cli/fixhint.test.ts check.
  *
- * Scope, honestly (P12): the three worst refusals carry a hint (graph import
- * schema_invalid, the DEBT-010 unscoped-run refusal, the inert-prices note).
- * The rest of the surface is LISTED as missing in docs/cli.md for P13 rather
- * than rewritten here.
+ * Scope, honestly (P12 → P13): P12 fixed the three worst refusals (graph
+ * import schema_invalid, the DEBT-010 unscoped-run refusal, the inert-prices
+ * note) and LISTED the rest in docs/cli.md; P13 applied the list, so every
+ * refusal in the audit now ends with the marker.
  */
 
 /** The one marker every fix-hinted refusal carries. */

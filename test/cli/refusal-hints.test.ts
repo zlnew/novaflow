@@ -65,6 +65,103 @@ async function forceStopDaemon(h: Home): Promise<void> {
   rmSync(h.dir, { recursive: true, force: true });
 }
 
+test("the P13 refusals name the next move too (daemon, workspace, project, task, profile, flags)", async () => {
+  const h = makeHome();
+  try {
+    assert.equal(runNova(["daemon", "start"], h.env).code, 0);
+
+    // ---- daemon start: a live daemon already answers ----
+    const secondDaemon = runNova(["daemon", "start"], h.env);
+    assert.equal(secondDaemon.code, 1, secondDaemon.stderr);
+    assert.match(secondDaemon.stderr, /live daemon/);
+    assert.match(secondDaemon.stderr, / — fix: /, "the daemon refusal names no fix");
+    assert.match(secondDaemon.stderr, /nova daemon status/, "the fix names the next command");
+
+    // ---- workspace create: the name rule and the path rule ----
+    const badName = runNova(["workspace", "create", "Bad_Name", "--path", h.wsRoot], h.env);
+    assert.equal(badName.code, 3, badName.stderr);
+    assert.match(badName.stderr, /kebab-case/);
+    assert.match(badName.stderr, / — fix: /, "the name refusal names no fix");
+    const badPath = runNova(["workspace", "create", "alpha", "--path", join(h.dir, "absent")], h.env);
+    assert.equal(badPath.code, 3, badPath.stderr);
+    assert.match(badPath.stderr, /root_path/);
+    assert.match(badPath.stderr, / — fix: /, "the path refusal names no fix");
+
+    // a real workspace + profile + project, so the not-found refusals are real
+    assert.equal(runNova(["workspace", "create", "alpha", "--path", h.wsRoot], h.env).code, 0);
+    assert.equal(runNova(["workspace", "switch", "alpha"], h.env).code, 0);
+    const profileSrc = join(h.dir, "dev.json");
+    writeFileSync(
+      profileSrc,
+      JSON.stringify({
+        name: "dev",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet-20241022",
+        thinking_level: "medium",
+        system_prompt_path: "prompts/dev_system.md",
+        tools_allowlist: ["bash", "read"],
+        limits: { max_timeout_sec: 3600, max_cost_usd: 5 },
+      }),
+    );
+    assert.equal(runNova(["profile", "create", "--file", profileSrc], h.env).code, 0);
+    assert.equal(
+      runNova(["project", "create", "app", "--objective", "Ship it.", "--target", `code=${h.wsRoot}`], h.env).code,
+      0,
+    );
+
+    // ---- no project, no such task, pinned profile ----
+    const noProject = runNova(
+      ["task", "create", "K2", "--title", "Do it", "--objective", "Do it.", "--profile", "dev", "--project", "nope"],
+      h.env,
+    );
+    assert.equal(noProject.code, 4, noProject.stderr);
+    assert.match(noProject.stderr, /no project "nope"/);
+    assert.match(noProject.stderr, / — fix: /, "the project refusal names no fix");
+
+    const noTask = runNova(["task", "status", "NOPE"], h.env);
+    assert.equal(noTask.code, 4, noTask.stderr);
+    assert.match(noTask.stderr, /no (such task|task with key)/);
+    assert.match(noTask.stderr, / — fix: /, "the task refusal names no fix");
+
+    const created = runNova(
+      ["task", "create", "K1", "--title", "Do it", "--objective", "Do it.", "--profile", "dev", "--project", "app"],
+      h.env,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const pinned = runNova(["profile", "delete", "dev"], h.env);
+    assert.equal(pinned.code, 3, pinned.stderr);
+    assert.match(pinned.stderr, /pinned by 1 task/);
+    assert.match(pinned.stderr, / — fix: /, "the pinned-profile refusal names no fix");
+
+    // ---- usage flags: each names the rule AND the move ----
+    const retention = runNova(["daemon", "prune", "--retention-days", "-1"], h.env);
+    assert.equal(retention.code, 2, retention.stderr);
+    assert.match(retention.stderr, /--retention-days/);
+    assert.match(retention.stderr, / — fix: /, "the retention flag names no fix");
+    const lines = runNova(["daemon", "logs", "--lines", "0"], h.env);
+    assert.equal(lines.code, 2, lines.stderr);
+    assert.match(lines.stderr, /--lines/);
+    assert.match(lines.stderr, / — fix: /, "the --lines flag names no fix");
+    const watchMs = runNova(["status", "--watch"], { ...h.env, NOVAFLOW_STATUS_WATCH_MS: "10" });
+    assert.equal(watchMs.code, 2, watchMs.stderr);
+    assert.match(watchMs.stderr, /NOVAFLOW_STATUS_WATCH_MS/);
+    assert.match(watchMs.stderr, / — fix: /, "the watch-interval flag names no fix");
+
+    // ---- disabled workspace: archived execution is refused before any write ----
+    assert.equal(runNova(["workspace", "archive", "alpha"], h.env).code, 0);
+    const disabled = runNova(["task", "run", "K1"], h.env);
+    assert.equal(disabled.code, 1, disabled.stderr);
+    assert.match(disabled.stderr, /execution is disabled/);
+    assert.match(disabled.stderr, / — fix: /, "the archived-workspace refusal names no fix");
+    const status = JSON.parse(runNova(["task", "status", "K1", "--json"], h.env).stdout) as {
+      task: { state: string };
+    };
+    assert.equal(status.task.state, "draft", "the refused run wrote nothing");
+  } finally {
+    await forceStopDaemon(h);
+  }
+});
+
 test("the two worst CLI refusals name the next move (import schema_invalid, unscoped run)", async () => {
   const h = makeHome();
   try {

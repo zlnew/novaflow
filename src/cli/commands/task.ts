@@ -5,6 +5,7 @@ import { operatorActor, resolveTaskIdent, workspaceContext } from "../context.ts
 import { EXIT_OK, EXIT_OPERATION_FAILED } from "../exitcode.ts";
 import { drainTransitions, FOLLOW_INTERVAL_MS, isTerminalState, pollIntervalMs, sleep } from "../watch.ts";
 import type { CommandOpts } from "../opts.ts";
+import { withFixHint } from "../../fixhint.ts";
 
 /**
  * `nova task …` (srs 4.1.1): create/list/run/status/result/logs/abort/
@@ -163,7 +164,13 @@ async function resolveProjectIdent(ident: string, workspaceId: string): Promise<
   };
   const row = data.projects.find((x) => x.slug === ident || x.id === ident);
   if (row === undefined) {
-    throw new OpFailureError("not_found", `no project "${ident}" in the active workspace`);
+    throw new OpFailureError(
+      "not_found",
+      withFixHint(
+        `no project "${ident}" in the active workspace`,
+        "list projects with `nova project list` and pass the exact slug",
+      ),
+    );
   }
   return row.id;
 }
@@ -375,7 +382,12 @@ async function logs(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise
   if (linesFlag !== undefined) {
     const n = Number(linesFlag);
     if (!Number.isInteger(n) || n < 1 || n > 1000) {
-      throw new UsageError("--lines must be an integer 1..1000");
+      throw new UsageError(
+        withFixHint(
+          "--lines must be an integer 1..1000",
+          "pass an integer between 1 and 1000, e.g. `--lines 100`",
+        ),
+      );
     }
     tailLines = n;
   }

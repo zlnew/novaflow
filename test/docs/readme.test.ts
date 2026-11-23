@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { MCP_TOOLS } from "../../src/mcp/catalog.ts";
 import { DEFAULT_RETENTION_DAYS } from "../../src/daemon/maintenance.ts";
 import { DISK_FREE_FLOOR_BYTES } from "../../src/runs/preflight.ts";
+import { DEFAULT_CONCURRENCY_WORKSPACE } from "../../src/config.ts";
+import { DEFAULT_CONCURRENCY_GLOBAL } from "../../src/daemonconfig.ts";
 
 /**
  * README honesty pin.
@@ -73,6 +75,36 @@ test("README's install route is the installer this repo ships (R3.1)", () => {
   assert.match(installer, /--start/);
   assert.match(installer, /\.novaflow/, "the config directory it writes once");
   assert.match(installer, /config\.yaml/);
+});
+
+test("README's measured cost facts name both runs, both denominators, and their sources", () => {
+  // the two facts are different runs with different denominators: the README
+  // must state both exactly, so neither can be quoted as the other.
+  assert.match(README, /v0\.2\.0 dogfood trial/);
+  assert.match(README, /3 runs/);
+  assert.match(README, /\$0\.0643/);
+  assert.match(README, /88\.8% of\s+the trial's prompt tokens/);
+  assert.match(README, /1,230,016 of 1,384,732/);
+  assert.match(README, /DEBT-009-era GLM run/);
+  assert.match(README, /88% of\s+the COST/);
+  assert.match(README, /13,652,160/);
+  assert.match(README, /98\.8% of that run's prompt tokens/);
+});
+
+test("README's isolation, concurrency and live-view claims are the shipped shapes", () => {
+  // worktree path + branch command are the engine's (src/runs/worktrees.ts)
+  assert.match(README, /\.novaflow\/worktrees\/<run_id>\/<alias>\//);
+  assert.match(README, /git worktree add -b novaflow\/run-<run_id>/);
+  assert.match(README, /migration 0004/i);
+  // the concurrency defaults are the constants the dispatcher reads
+  assert.equal(DEFAULT_CONCURRENCY_WORKSPACE, 2);
+  assert.equal(DEFAULT_CONCURRENCY_GLOBAL, 4);
+  assert.match(README, /concurrency\.workspace` defaults to \*\*2\*\*/);
+  assert.match(README, /concurrency\.global` to\s+\*\*4\*\*/);
+  // tier D's port and its one absolute mirror rule
+  assert.match(README, /30142/);
+  assert.match(README, /events\.raw\.jsonl` is never copied/);
+  assert.match(README, /\[novaflow\]/);
 });
 
 test("README's storage numbers are the numbers the code enforces (no marketing drift)", () => {

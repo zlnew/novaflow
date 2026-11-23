@@ -5,6 +5,7 @@ import { renderTable } from "../format.ts";
 import { readActiveWorkspace } from "../active.ts";
 import { workspaceContext } from "../context.ts";
 import type { CommandOpts } from "../opts.ts";
+import { withFixHint } from "../../fixhint.ts";
 
 /**
  * `nova profile …` (srs 4.1.1): create/list/validate/update/delete.
@@ -212,7 +213,10 @@ async function validate(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Pro
   };
   const row = data.profiles.find((x) => x.name === name);
   if (row === undefined) {
-    throw new OpFailureError("not_found", `no profile named "${name}" in the current scope`);
+    throw new OpFailureError(
+      "not_found",
+      withFixHint(`no profile named "${name}" in the current scope`, "list the profiles in scope with `nova profile list`"),
+    );
   }
   const result = (await daemonRequest("nova_profile_validate", { profile_id: row.id })) as {
     ok: boolean;

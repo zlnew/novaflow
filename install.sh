@@ -136,8 +136,13 @@ check_sqlite3() {
 install_from_source() {
   [ -f "$repo_root/package.json" ] ||
     die "no package.json in $repo_root — run install.sh from the novaflow checkout, or use --from-tarball <pkg.tgz>."
+  # npm (>= 12) blocks dependency install scripts by default; allowing the one
+  # native dep makes its prebuilt binding land with the install itself.
   note "installing dependencies in $repo_root"
-  ( cd "$repo_root" && npm install ) || die "npm install failed — fix the error above and re-run this script."
+  ( cd "$repo_root" && npm_config_allow_scripts=better-sqlite3 npm install ) || die "npm install failed — fix the error above and re-run this script."
+  # belt and braces: the binding is load-bearing, rebuild if it did not land.
+  ( cd "$repo_root" && npm rebuild better-sqlite3 ) || printf '%s
+' "install.sh: warning: npm rebuild better-sqlite3 failed — if 'nova daemon start' reports a better_sqlite3.node error, see docs/install.md (The native binding)." >&2
   note "linking nova onto PATH from this checkout"
   ( cd "$repo_root" && npm link ) || die "npm link failed — check that npm's global prefix is writable (npm prefix -g) and re-run."
 }
@@ -147,7 +152,13 @@ install_from_tarball() {
   [ -f "$_tgz" ] || die "tarball not found: $_tgz — build one from the checkout with: npm pack"
   _abs="$(CDPATH= cd -- "$(dirname -- "$_tgz")" && pwd)/$(basename -- "$_tgz")"
   note "installing $_abs globally"
-  npm install -g "$_abs" || die "npm install -g failed — fix the error above and re-run this script."
+  # npm (>= 12) blocks dependency install scripts by default; allowing the one
+  # native dep makes its prebuilt binding land with the install itself.
+  if ! npm_config_allow_scripts=better-sqlite3 npm install -g "$_abs"; then
+    # older/blocked npm: plain install, then the documented rebuild fallback
+    npm install -g "$_abs" || die "npm install -g failed — fix the error above and re-run this script."
+    npm rebuild -g better-sqlite3 || printf '%s\n' "install.sh: warning: npm rebuild -g better-sqlite3 failed — if 'nova daemon start' reports a better_sqlite3.node error, see docs/install.md (The native binding)." >&2
+  fi
 }
 
 reload_note() {

@@ -19,6 +19,7 @@ import {
   tailFile,
 } from "../procs.ts";
 import type { CommandOpts } from "../opts.ts";
+import { withFixHint } from "../../fixhint.ts";
 
 /**
  * `nova web …` (srs 4.1.1's web verbs, novaflow-v030/panel.md tier D).
@@ -344,7 +345,10 @@ async function sync(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise
     if (live.length > 0) {
       for (const target of live) {
         console.error(
-          `nova: run ${target.entry.runId} (${target.key}) is running, not settled — refusing to mirror a transcript still being written; follow it live with: nova status --watch`,
+          withFixHint(
+            `nova: run ${target.entry.runId} (${target.key}) is running, not settled — refusing to mirror a transcript still being written`,
+            "follow it live with `nova status --watch`, then re-run `nova web sync --run <id|key>` once it settles",
+          ),
         );
       }
       console.error("nova: nothing was copied");
@@ -464,7 +468,10 @@ async function startInstance(opts: CommandOpts): Promise<number> {
   if (existing !== null) {
     if (pidAlive(existing) && (await apiAnswers(port))) {
       console.error(
-        `nova: a live pi-web already answers at ${url} (pid ${existing}) — refusing to start a second one`,
+        withFixHint(
+          `nova: a live pi-web already answers at ${url} (pid ${existing}) — refusing to start a second one`,
+          `browse ${url}, or stop it with \`nova web stop\``,
+        ),
       );
       return EXIT_OPERATION_FAILED;
     }
@@ -474,7 +481,10 @@ async function startInstance(opts: CommandOpts): Promise<number> {
   // a busy port is somebody else's server: name it, never kill it
   if (await portBusy(port)) {
     console.error(
-      `nova: port ${port} is already in use — held by ${portHolder(port)}; refusing to start pi-web on a busy port`,
+      withFixHint(
+        `nova: port ${port} is already in use — held by ${portHolder(port)}; refusing to start pi-web on a busy port`,
+        `stop the process holding port ${port}, or set NOVAFLOW_PIWEB_PORT to a free port`,
+      ),
     );
     return EXIT_OPERATION_FAILED;
   }
@@ -502,13 +512,23 @@ async function startInstance(opts: CommandOpts): Promise<number> {
     if (await apiAnswers(port)) break;
     if (child.exitCode !== null) {
       await reapGroup(child.pid);
-      console.error(`nova: pi-web exited (code ${child.exitCode}) before answering ${url} — tail of ${logPath}:`);
+      console.error(
+        withFixHint(
+          `nova: pi-web exited (code ${child.exitCode}) before answering ${url}`,
+          "read the log tail below, fix the cause it names, then re-run `nova web start`",
+        ) + ` — tail of ${logPath}:`,
+      );
       console.error(existsSync(logPath) ? tailFile(logPath, 10) : "(no log)");
       return EXIT_OPERATION_FAILED;
     }
     if (Date.now() > deadline) {
       await reapGroup(child.pid);
-      console.error(`nova: pi-web did not answer ${url} within ${START_BOUND_MS / 1000} s — tail of ${logPath}:`);
+      console.error(
+        withFixHint(
+          `nova: pi-web did not answer ${url} within ${START_BOUND_MS / 1000} s`,
+          "read the log tail below, fix the cause it names, then re-run `nova web start`",
+        ) + ` — tail of ${logPath}:`,
+      );
       console.error(existsSync(logPath) ? tailFile(logPath, 10) : "(no log)");
       return EXIT_OPERATION_FAILED;
     }
