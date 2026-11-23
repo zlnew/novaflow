@@ -4,6 +4,7 @@ import { EXIT_OK } from "../exitcode.ts";
 import { sleep } from "../procs.ts";
 import type { CommandOpts } from "../opts.ts";
 import type { TransitionPage, TransitionRow } from "../watch.ts";
+import { formatTransitionClock } from "../watch.ts";
 
 /**
  * `nova status [--watch]` — the tier-C live screen (novaflow-v030/panel.md;
@@ -51,9 +52,9 @@ function intervalMs(): number {
   return ms;
 }
 
-/** `HH:MM:SS UTC KEY from→to` (the clock is the transition's own UTC stamp). */
+/** `HH:MM:SS UTC KEY from→to` — the clock/label come from the shared formatter. */
 function formatTransition(row: TransitionRow): string {
-  return `${row.created_at.slice(11, 19)} UTC ${row.task_key} ${row.from_state}→${row.to_state}`;
+  return `${formatTransitionClock(row.created_at)} ${row.task_key} ${row.from_state}→${row.to_state}`;
 }
 
 function money(usd: number): string {

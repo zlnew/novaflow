@@ -64,16 +64,29 @@ export function sleep(ms: number): Promise<void> {
  * The pinned transition line (watch.md "Formatting discipline"), one line,
  * human-greppable:
  *
- *   `12:06:54 WC2 queued→running (engine, daemon-dispatch) run=01M81…`
+ *   `12:06:54 UTC WC2 queued→running (engine, daemon-dispatch) run=01M81…`
  *
- * The clock is the transition's OWN `created_at` (UTC, the store's format),
- * not the reader's wall clock: a line printed late still carries the time the
- * edge actually happened. `run=-` when the row names no run (an engine
- * envelope move like draft→queued has none).
+ * The clock is the transition's OWN `created_at` (the store's UTC format), not
+ * the reader's wall clock: a line printed late still carries the time the edge
+ * actually happened. The zone is LABELLED (`UTC`) rather than left implicit:
+ * an unlabelled `HH:MM:SS` on a UTC+7 box invites a manual conversion (DEBT-012),
+ * and keeping the stamp in UTC stays machine-friendly and unambiguous. Both
+ * `--watch` verbs (task and chain) print through THIS function, so the label
+ * cannot exist on one surface and not the other. `run=-` when the row names no
+ * run (an engine envelope move like draft→queued has none).
  */
 export function formatTransitionLine(row: TransitionRow): string {
-  const clock = row.created_at.slice(11, 19);
-  return `${clock} ${row.task_key} ${row.from_state}→${row.to_state} (${row.trigger_type}, ${row.actor}) run=${row.run_id ?? "-"}`;
+  return `${formatTransitionClock(row.created_at)} ${row.task_key} ${row.from_state}→${row.to_state} (${row.trigger_type}, ${row.actor}) run=${row.run_id ?? "-"}`;
+}
+
+/**
+ * `HH:MM:SS UTC` from a row's `created_at` (`YYYY-MM-DDTHH:MM:SS.sssZ`). ONE
+ * spelling of the clock and its zone label for every live surface that shows a
+ * transition stamp — the `--watch` line above and the tier-C panel below — so
+ * the label is never re-typed (DEBT-012: one format, one label, one place).
+ */
+export function formatTransitionClock(createdAt: string): string {
+  return `${createdAt.slice(11, 19)} UTC`;
 }
 
 /**
