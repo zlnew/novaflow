@@ -3,7 +3,7 @@
 What changed for the operator, release by release. The numbers are the ones the code and the
 run records enforce; the repository history is the PR list.
 
-## [0.3.0] — unreleased
+## [0.3.0] — 2026-11-24
 
 The release that makes NovaFlow handable to someone else: work runs in the background, in its own
 tree, and a settled run can be read in a browser.
