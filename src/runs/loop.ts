@@ -13,13 +13,14 @@ import {
 import { finalizeRunRecord, intakeSettledRun } from "./settle-replay.ts";
 import { buildEngineContext, writeEngineContext } from "./context.ts";
 import { writeProtectedDigests } from "../verify/protected.ts";
-import { composePrompt, type ComposedPrompt } from "./prompt.ts";
+import { composePrompt, type ComposedPrompt, type RepairWorktreePointer } from "./prompt.ts";
 import { buildRunArgv, defaultExtensionPath, runDirPath } from "./spawn.ts";
 import {
   appendWorktreeReport,
   provisionRunWorktrees,
   recordRunWorktreeArtifacts,
   rollbackProvisionedOutcome,
+  runWorkspacePatchPath,
   type ProvisionOutcome,
 } from "./worktrees.ts";
 import { appendRunEngineFrame, createPump } from "./pump.ts";
@@ -321,6 +322,9 @@ export async function startRun(
 
   let attemptKind: "execution" | "repair" = "execution";
   let repairFeedback: string | undefined;
+  // DEBT-014: the previous attempt's worktree (and its persisted diff), when
+  // that attempt ran in one — absent for an in-place previous attempt
+  let repairWorktree: RepairWorktreePointer | undefined;
 
   for (;;) {
     const runId = ulid();
@@ -384,6 +388,9 @@ export async function startRun(
           workspaceRoot: task.workspace_root,
           ...(attemptKind === "repair" && repairFeedback !== undefined
             ? { repairFeedback }
+            : {}),
+          ...(attemptKind === "repair" && repairWorktree !== undefined
+            ? { repairWorktree }
             : {}),
         });
       } catch (err) {
@@ -905,6 +912,19 @@ export async function startRun(
       });
       attemptKind = "repair";
       repairFeedback = error;
+      // DEBT-014: a repair starts from a FRESH tree, so point it at the
+      // previous attempt's work: its persisted `worktree_root` (migration
+      // 0004, the just-settled run's row — NULL for an in-place run) and its
+      // run dir's `workspace_diff.patch`. The tree is read-only evidence.
+      const previousRun = db
+        .prepare("SELECT worktree_root FROM task_runs WHERE id = ?")
+        .get(runId) as { worktree_root: string | null } | undefined;
+      if (previousRun !== undefined && previousRun.worktree_root !== null) {
+        repairWorktree = {
+          worktreeRoot: previousRun.worktree_root,
+          patchPath: runWorkspacePatchPath(runDir),
+        };
+      }
       continue;
     }
 

@@ -27,7 +27,35 @@ export type ComposePromptInput = {
   workspaceRoot: string;
   /** Present only on repair attempts. */
   repairFeedback?: string;
+  /**
+   * Present only when the PREVIOUS attempt ran in a worktree (its
+   * `task_runs.worktree_root` is non-null). The repair starts from a fresh
+   * tree, so the prompt points at the prior work instead of redoing it
+   * (DEBT-014).
+   */
+  repairWorktree?: RepairWorktreePointer | undefined;
 };
+
+/** Where the previous attempt's work — and its persisted diff — live. */
+export type RepairWorktreePointer = {
+  /** The previous attempt's worktree root (migration 0004). */
+  worktreeRoot: string;
+  /** The previous attempt's `workspace_diff.patch` in its run dir. */
+  patchPath: string;
+};
+
+/**
+ * The one repair pointer sentence (DEBT-014): exactly three facts — the
+ * tree's path, its persisted diff's path, and that the tree is read-only
+ * evidence. No guidance beyond them.
+ */
+export function repairWorktreeClause(pointer: RepairWorktreePointer): string {
+  return (
+    `The previous attempt's worktree is ${pointer.worktreeRoot}, ` +
+    `its workspace_diff.patch is ${pointer.patchPath}; ` +
+    `that tree is read-only evidence — inspect it; do not write to it.`
+  );
+}
 
 export type ComposedPrompt = {
   message: string;
@@ -71,6 +99,11 @@ export function composePrompt(input: ComposePromptInput): ComposedPrompt {
 
   if (input.repairFeedback !== undefined) {
     message += `\n\nRepair feedback from the previous attempt:\n${input.repairFeedback}`;
+    // DEBT-014: an in-place previous attempt (worktree_root NULL) adds
+    // nothing — the sentence is ABSENT, never an empty clause
+    if (input.repairWorktree !== undefined) {
+      message += `\n\n${repairWorktreeClause(input.repairWorktree)}`;
+    }
   }
 
   return { message, files };

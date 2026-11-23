@@ -447,6 +447,15 @@ export function pruneWorktrees(repoRoot: string, opts: { timeoutMs?: number | un
  */
 export type RunWorktreeArtifactTarget = { alias: string; path: string; base_sha: string | null };
 
+/**
+ * The run's persisted diff artifact: `<run dir>/workspace_diff.patch`. The
+ * ONE formula for that path — the writer (`recordRunWorktreeArtifacts`) and
+ * the repair pointer (DEBT-014) both go through it.
+ */
+export function runWorkspacePatchPath(runDir: string): string {
+  return join(runDir, "workspace_diff.patch");
+}
+
 export function recordRunWorktreeArtifacts(
   db: Db,
   runId: string,
@@ -470,7 +479,7 @@ export function recordRunWorktreeArtifacts(
     }
     commits[target.alias] = runCommitsSince(target, timeoutMs);
   }
-  const patchPath = join(runDir, "workspace_diff.patch");
+  const patchPath = runWorkspacePatchPath(runDir);
   writeFileSync(patchPath, patches.join(""));
   db.prepare("UPDATE task_runs SET git_commits_json = ? WHERE id = ?").run(JSON.stringify(commits), runId);
   return { patchPath, commits, warnings };

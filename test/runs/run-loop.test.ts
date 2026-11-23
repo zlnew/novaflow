@@ -395,6 +395,10 @@ test("run-repair-ok: execution settles missing → FR-TSK-06 repair run → vali
       repairFeedback: "result.json missing after agent_settled",
     });
     assert.equal(rec.prompt, expected.message);
+    // DEBT-014: an in-place attempt (worktree_root NULL) adds NO pointer —
+    // the one repair sentence is absent, not merely empty
+    assert.equal(first.worktree_root, null);
+    assert.equal(String(rec.prompt).includes("read-only evidence"), false);
     // and the repair run's engine-context says attempt_kind repair
     assert.equal((rec.context as Record<string, unknown>)["attempt_kind"], "repair");
 
