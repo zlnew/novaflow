@@ -61,6 +61,19 @@ test("README's quickstart references only verbs the CLI actually has", () => {
   }
 });
 
+test("README's install route is the installer this repo ships (R3.1)", () => {
+  // the acquisition step is one command, and it is the script in this repo
+  assert.match(README, /git clone https:\/\/github\.com\/zlnew\/novaflow && sh novaflow\/install\.sh/);
+  assert.ok(existsSync(join(REPO, "install.sh")), "the installer the README names exists");
+  const installer = readFileSync(join(REPO, "install.sh"), "utf8");
+  // the README describes this mechanism and these flags; the script must have them
+  assert.match(installer, /npm link/);
+  assert.match(installer, /--from-tarball/);
+  assert.match(installer, /--start/);
+  assert.match(installer, /\.novaflow/, "the config directory it writes once");
+  assert.match(installer, /config\.yaml/);
+});
+
 test("README's storage numbers are the numbers the code enforces (no marketing drift)", () => {
   assert.equal(DEFAULT_RETENTION_DAYS, 30);
   assert.match(README, /retention/i, "the prune retention story is stated");

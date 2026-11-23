@@ -115,22 +115,29 @@ The destination is Pi Web's own layout, derived from the session's recorded cwd:
 
 ## Install
 
-Requires **Node.js ≥ 22** and a working **Pi** installation (`pi` on `PATH`).
+Requires **Node.js ≥ 22**, a working **Pi** installation (`pi` on `PATH`) — the engine spawns
+it for every run — and **git ≥ 2.40** (per-run worktrees). The installer checks all three and
+refuses with the fix in the message.
 
 ```bash
-git clone <this repo> && cd novaflow
-npm install          # also builds better-sqlite3
+git clone https://github.com/zlnew/novaflow && sh novaflow/install.sh
 ```
 
-Start the daemon (it persists across CLI invocations):
+That one command runs `npm install` in the checkout, links `nova` onto your `PATH` with
+`npm link` (a symlink to this checkout, so `git pull && sh novaflow/install.sh` upgrades it
+in place — `npm install -g .` would copy a tree without the `tsx` loader `bin/nova` drives),
+copies the extension to `~/.pi/agent/extensions/novaflow.ts` (only when absent, so reload Pi
+with `/reload` to pick up a fresh deploy), writes `~/.novaflow/config.yaml` once (only when
+absent), and prints the three commands that come next. `--start` also starts the daemon;
+`--from-tarball <pkg.tgz>` installs a packed artifact instead of this checkout. A second run
+with the same flags changes nothing, and an existing store is never touched.
+
+The same steps by hand:
 
 ```bash
-bin/nova daemon start
-```
-
-Then install the extension so spawned sessions enforce scope and can submit results:
-
-```bash
+cd novaflow
+npm install             # also builds better-sqlite3
+bin/nova daemon start   # it persists across CLI invocations
 mkdir -p ~/.pi/agent/extensions
 cp extensions/novaflow.ts ~/.pi/agent/extensions/novaflow.ts
 ```
