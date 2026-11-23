@@ -22,19 +22,20 @@ test("migrate applies every migration in filename order and records filename + s
   const dir = mkdtempSync(join(tmpdir(), "novaflow-"));
   const db = openDb(join(dir, "state.db"));
   const applied = migrate(db);
-  assert.equal(applied, 2); // 0001_init + 0002_project_phase_log
+  assert.equal(applied, 3); // 0001_init + 0002_project_phase_log + 0003_cache_tokens
   const rows = db.prepare("SELECT filename, sha256 FROM schema_migrations").all() as Array<{
     filename: string;
     sha256: string;
   }>;
-  assert.equal(rows.length, 2);
+  assert.equal(rows.length, 3);
   assert.equal(rows[0]?.filename, "0001_init.sql");
   assert.equal(rows[1]?.filename, "0002_project_phase_log.sql");
+  assert.equal(rows[2]?.filename, "0003_cache_tokens.sql");
   for (const row of rows) {
     const sql = readFileSync(join(MIGRATIONS_DIR, row.filename), "utf8");
     assert.equal(row.sha256, createHash("sha256").update(sql).digest("hex"));
   }
-  // 0001's twelve tables plus 0002's project_phase_logs
+  // 0001's twelve tables plus 0002's project_phase_logs (0003 ALTERs task_runs)
   const tables = db
     .prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='table'")
     .get()?.["n"];

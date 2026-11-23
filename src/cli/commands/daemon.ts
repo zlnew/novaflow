@@ -33,7 +33,7 @@ import type { CommandOpts } from "../opts.ts";
  */
 
 const SPEC: ArgSpec = {
-  booleanFlags: ["foreground"],
+  booleanFlags: ["foreground", "migrate"],
   valueFlags: ["lines", "workspace", "out", "retention-days"],
 };
 
@@ -116,7 +116,14 @@ async function start(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promis
   const child = spawn(
     process.execPath,
     [launcherPath(), "daemon", "start", "--foreground"],
-    { detached: true, stdio: ["ignore", logFd, logFd], env: { ...process.env } },
+    {
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+      // --migrate reaches the daemon (the ONLY store owner) as an env knob:
+      // version skew is exactly the state where the daemon refuses to boot,
+      // so the upgrade must happen inside the daemon process, never in the CLI
+      env: { ...process.env, ...(p.flags.has("migrate") ? { NOVAFLOW_MIGRATE_ON_BOOT: "1" } : {}) },
+    },
   );
   child.unref();
   closeSync(logFd);
@@ -179,6 +186,7 @@ async function runForeground(sock: string, home: string, json: boolean): Promise
   const runArgs = parseEnvJsonArray("NOVAFLOW_RUN_ARGS");
   const probeTimeoutMs = process.env["NOVAFLOW_PROBE_TIMEOUT_MS"];
   const handle = await startDaemon({
+    migrateOnBoot: process.env["NOVAFLOW_MIGRATE_ON_BOOT"] === "1",
     dbPath,
     socketPath: sock,
     ...(process.env["NOVAFLOW_DAEMON_CONFIG"] !== undefined
