@@ -2,7 +2,7 @@ import { daemonRequest } from "../client.ts";
 import { parseArgs, UsageError, type ArgSpec } from "../args.ts";
 import { renderKv, renderTable } from "../format.ts";
 import { operatorActor, workspaceContext } from "../context.ts";
-import { EXIT_OPERATION_FAILED, EXIT_OK } from "../exitcode.ts";
+import { EXIT_ENGINE_STATE, EXIT_OPERATION_FAILED, EXIT_OK } from "../exitcode.ts";
 import { drainTransitions, isTerminalState, pollIntervalMs, sleep } from "../watch.ts";
 import type { CommandOpts } from "../opts.ts";
 
@@ -32,6 +32,22 @@ import type { CommandOpts } from "../opts.ts";
  * their own), then the unchanged v1 chain block. Completion is therefore
  * INFERRED from the member rows plus the chain row, never captured as a
  * chain transition the store does not have.
+ *
+ * `verify <chain_id>` (v0.3.0 W2, novaflow-v030 amendments row 4 — DEBT-006)
+ * is the operator surface for FR-TSK-12's `verification_commands`: per member
+ * run it prints CONFIGURED versus ACTUALLY EXECUTED (with exit status). Exit
+ * codes, all named here because the read succeeded either way:
+ *   0 — every configured command has an executed record;
+ *   3 — a configured command has NO executed record (``UNEXECUTED``): the
+ *       chain's recorded verification is not in the state the operator must
+ *       assume, so the verb answers with the engine-state row (srs 4.1.1
+ *       row 3, the invalid_transition precedent — a state rejection, which
+ *       this actually is: the chain is not verified, not "failed": row 1's
+ *       "verification failed" is a command that RAN and exited non-zero,
+ *       and every such command is printed with its exit status instead of
+ *       being re-judged here);
+ *   4 — unknown chain (not_found, via the wire taxonomy).
+ * The report itself is always `ok` on the wire, so `--json` stays parseable.
  */
 
 const SPEC: ArgSpec = {
@@ -70,9 +86,11 @@ export async function chainCommand(argv: string[], opts: CommandOpts): Promise<n
       return resume(p, opts);
     case "clean":
       return clean(p, opts);
+    case "verify":
+      return verify(p, opts);
     default:
       throw new UsageError(
-        `nova chain [list|status|abort|pause|resume|clean]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`,
+        `nova chain [list|status|abort|pause|resume|clean|verify]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`,
       );
   }
 }
@@ -264,6 +282,89 @@ async function resume(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promi
     `chain ${chainRunId} resumed — readiness evaluated immediately: ${enqueued} member${enqueued === 1 ? "" : "s"} enqueued`,
   );
   return 0;
+}
+
+type ChainVerifyData = {
+  chain_run_id: string;
+  project_id: string;
+  state: string;
+  members: Array<{
+    task_id: string;
+    key: string;
+    state: string;
+    run_id: string | null;
+    attempt_number: number | null;
+    configured: Array<{ command: string; cwd: string | null }>;
+    executed: Array<{ command: string; exit: number; cwd: string | null }>;
+    unexecuted: string[];
+    notes: string[];
+  }>;
+  unexecuted: Array<{ task_id: string; key: string; command: string }>;
+};
+
+/** The report block — configured versus executed, one line per configured command. */
+function printChainVerify(data: ChainVerifyData): void {
+  console.log(`chain ${data.chain_run_id}: ${data.state}`);
+  for (const m of data.members) {
+    if (m.run_id === null) {
+      console.log(`member ${m.key} (${m.task_id}): ${m.state} — no run yet`);
+      for (const note of m.notes) console.log(`  note: ${note}`);
+      continue;
+    }
+    console.log(
+      `member ${m.key} (${m.task_id}): ${m.state} — run ${m.run_id} (attempt ${String(m.attempt_number)}), ` +
+        `${m.configured.length} configured, ${m.executed.length} executed`,
+    );
+    for (const c of m.configured) {
+      const hit = m.executed.find((e) => e.command === c.command);
+      if (hit === undefined) {
+        console.log(`  configured  ${c.command}  →  UNEXECUTED`);
+      } else {
+        console.log(`  configured  ${c.command}  →  executed  exit ${hit.exit}  cwd=${hit.cwd ?? "—"}`);
+      }
+    }
+    // an executed command the run's configured set does not carry (the config
+    // changed mid-run) is still a FACT — printed, never hidden
+    for (const e of m.executed) {
+      if (m.configured.some((c) => c.command === e.command)) continue;
+      console.log(
+        `  executed    ${e.command}  exit ${e.exit}  cwd=${e.cwd ?? "—"}  (not in the run's configured set)`,
+      );
+    }
+    // nothing configured is a plain answer, not an error (and never printed
+    // when a NOTE explains that the record itself is missing)
+    if (m.configured.length === 0 && m.executed.length === 0 && m.notes.length === 0) {
+      console.log("  no verification commands configured for this run");
+    }
+    for (const note of m.notes) console.log(`  note: ${note}`);
+  }
+  if (data.unexecuted.length > 0) {
+    const members = new Set(data.unexecuted.map((u) => u.key)).size;
+    console.log(
+      `${data.unexecuted.length} configured command${data.unexecuted.length === 1 ? "" : "s"} never executed on ` +
+        `${members} member${members === 1 ? "" : "s"} — this chain's verification is not in the state you think (exit 3)`,
+    );
+  }
+}
+
+/**
+ * `nova chain verify <chain-run-id>` (v0.3.0 W2, amendments row 4 — DEBT-006).
+ * One daemon read, one printed report; the exit code carries the only verdict
+ * the verb owns (see the module doc: 0 verified-by-record, 3 UNEXECUTED,
+ * 4 unknown chain via the wire taxonomy).
+ */
+async function verify(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
+  const chainRunId = chainIdArg(p);
+  const data = (await daemonRequest("nova_chain_verify", {
+    chain_run_id: chainRunId,
+  })) as ChainVerifyData;
+  const exit = data.unexecuted.length > 0 ? EXIT_ENGINE_STATE : EXIT_OK;
+  if (opts.json) {
+    console.log(JSON.stringify(data));
+    return exit;
+  }
+  printChainVerify(data);
+  return exit;
 }
 
 /**

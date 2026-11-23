@@ -200,6 +200,8 @@ For a **chain** instead of a single task, describe the graph and import it:
 ```bash
 bin/nova project import-dag chain.yaml --project app
 bin/nova chain status <chain-run-id>
+# did the members' configured verification commands actually RUN?
+bin/nova chain verify <chain-run-id>
 ```
 
 `bin/nova help` prints every noun and verb. The pinned specification lives in the workspace

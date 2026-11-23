@@ -76,6 +76,9 @@ const USAGE = `USAGE: nova <noun> <sub> [args] [flags]
   nova schedule pause <schedule-id> | resume <schedule-id>
   nova chain list | status <chain-run-id> [--watch]
   nova chain abort | pause | resume <chain-run-id>
+  nova chain verify <chain-run-id>   (configured vs executed verification commands,
+                                      per member run; exit 3 when one is UNEXECUTED)
+  nova chain clean <chain-run-id> [--force]
   nova mcp            (MCP server on stdio; runs until its client disconnects)`;
 
 /**
