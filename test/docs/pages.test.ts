@@ -54,7 +54,13 @@ test("the README points at the docs index and the CLI audit page", () => {
 });
 
 test("CHANGELOG keeps the frozen 0.3.0 section and the user-facing history", () => {
-  assert.match(CHANGELOG, /^## \[0\.3\.0\] — unreleased$/m, "the 0.3.0 heading is the frozen one");
+  // the number was frozen before the file was written; at release the section
+  // carries the date. Either form is the frozen claim; a THIRD heading is not.
+  assert.match(
+    CHANGELOG,
+    /^## \[0\.3\.0\] — (unreleased|\d{4}-\d{2}-\d{2})$/m,
+    "the 0.3.0 heading is the frozen number, unreleased or dated",
+  );
   assert.match(CHANGELOG, /^## \[0\.2\.0\] — 2026-11-23$/m);
   for (const item of ["0.1.4", "0.1.3", "0.1.2", "0.1.1"]) {
     assert.match(CHANGELOG, new RegExp(`\\*\\*${item.replace(/\./g, "\\.")}\\*\\*`), `0.1.x is missing ${item}`);
