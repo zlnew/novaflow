@@ -182,8 +182,8 @@ test("nova project import-dag + nova chain end to end through the binary", async
         version: "1.0.0",
         project_slug: "app",
         tasks: [
-          { key: "C1", title: "Cycle one", objective: "The objective of task C1.", profile_name: "dev" },
-          { key: "C2", title: "Cycle two", objective: "The objective of task C2.", profile_name: "dev" },
+          { key: "C1", title: "Cycle one", objective: "The objective of task C1.", profile_name: "dev", target_scopes: [{ repo_alias: "code", access_mode: "read_write" }] },
+          { key: "C2", title: "Cycle two", objective: "The objective of task C2.", profile_name: "dev", target_scopes: [{ repo_alias: "code", access_mode: "read_write" }] },
         ],
         edges: [
           { source_key: "C1", target_key: "C2", edge_type: "depends_on" },

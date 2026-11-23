@@ -58,6 +58,14 @@ function seed(): {
   return { db, workspaceId, otherWorkspaceId, localProfileId, globalProfileId };
 }
 
+/**
+ * Every member's scope set (v0.3.0 amendment row 5, DEBT-011: the import
+ * REQUIRES target_scopes on every member). The validator does not resolve
+ * repo_alias — that is the importer's read-only pre-block step — so any
+ * alias names a scope here.
+ */
+const SCOPES = [{ repo_alias: "code", access_mode: "read_only" as const }];
+
 function graph(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     version: "1.0.0",
@@ -68,12 +76,14 @@ function graph(over: Record<string, unknown> = {}): Record<string, unknown> {
         title: "Plan the work",
         objective: "Write the implementation plan end to end.",
         profile_name: "dev",
+        target_scopes: SCOPES,
       },
       {
         key: "WORK",
         title: "Do the work",
         objective: "Implement the planned feature end to end.",
         profile_name: "globaldev",
+        target_scopes: SCOPES,
       },
     ],
     edges: [{ source_key: "PLAN", target_key: "WORK", edge_type: "depends_on" }],
@@ -102,6 +112,10 @@ test("a well-formed graph validates and resolves profiles (local first, then glo
     assert.equal(chain.tasks[0]?.profileId, localProfileId, "workspace-local profile wins");
     assert.equal(chain.tasks[1]?.profileId, globalProfileId, "global fallback resolves");
     assert.equal(chain.edges[0]?.edgeType, "depends_on");
+    // PRESERVE: a scopeful member still carries its scopes through unchanged
+    assert.deepEqual(chain.tasks[0]?.targetScopes, [
+      { repoAlias: "code", accessMode: "read_only" },
+    ]);
   } finally {
     db.close();
   }
@@ -184,8 +198,55 @@ function task(key: string): Record<string, unknown> {
     title: "Do the thing",
     objective: "A sufficiently long objective text.",
     profile_name: "dev",
+    target_scopes: SCOPES,
   };
 }
+
+test("DEBT-011: a member without target_scopes refuses as schema_invalid, naming the member key and the fix", () => {
+  const { db, workspaceId } = seed();
+  try {
+    const scopeless = task("IMPL");
+    delete scopeless["target_scopes"]; // the shape the import used to accept
+    const err = expectCode("schema_invalid", () =>
+      validateChainGraph(db, workspaceId, graph({ tasks: [scopeless], edges: [] })));
+    // the refusal names the member KEY and the fix the operator must apply
+    assert.match(err.message, /IMPL/);
+    assert.match(err.message, /add target_scopes to member IMPL/);
+    assert.match(err.message, /target_scopes/);
+    // it is NOT inferred (a project may bind N targets — no inheritance)
+    assert.match(err.message, /never in|no inheritance|N targets/);
+  } finally {
+    db.close();
+  }
+});
+
+test("DEBT-011: an empty target_scopes list refuses the same way (zero scopes can never be enqueued)", () => {
+  const { db, workspaceId } = seed();
+  try {
+    const err = expectCode("schema_invalid", () =>
+      validateChainGraph(db, workspaceId, graph({ tasks: [{ ...task("IMPL"), target_scopes: [] }], edges: [] })));
+    assert.match(err.message, /IMPL/);
+    assert.match(err.message, /add target_scopes to member IMPL/);
+    assert.match(err.message, /at least one/);
+  } finally {
+    db.close();
+  }
+});
+
+test("zero edges is schema-legal: §4.3 sets no minItems on edges (the one-task chain)", () => {
+  const { db, workspaceId } = seed();
+  try {
+    const chain = validateChainGraph(db, workspaceId, graph({ edges: [] }));
+    assert.deepEqual(chain.edges, []);
+    assert.equal(chain.tasks.length, 2);
+    // the import the parser now enables: one member, no edges
+    const single = validateChainGraph(db, workspaceId, graph({ tasks: [task("SOLO")], edges: [] }));
+    assert.equal(single.tasks.length, 1);
+    assert.deepEqual(single.edges, []);
+  } finally {
+    db.close();
+  }
+});
 
 test("duplicate task keys refuse as duplicate, naming the key", () => {
   const { db, workspaceId } = seed();
@@ -356,6 +417,7 @@ test("review round: a 10000-member linear chain validates and imports — no rec
       title: `Task ${i}`,
       objective: `Objective for task number ${i} in the long linear chain.`,
       profile_name: "dev",
+      target_scopes: SCOPES,
     });
     if (i > 0) edges.push({ source_key: `T${i - 1}`, target_key: `T${i}`, edge_type: "depends_on" });
   }

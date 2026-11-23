@@ -178,6 +178,72 @@ test("CRLF line endings are tolerated", () => {
   assert.deepEqual(parseYaml("a: 1\r\nb: two\r\n"), { a: 1, b: "two" });
 });
 
+/* ------------------- empty block lists (amendment row 8) ------------------- */
+
+test("a bare array-typed key is an EMPTY LIST — §4.3's parser note, and ONLY for those keys", () => {
+  // every §4.3 key whose schema type is `array`, bare, with no nested
+  // block: the zero-edge single-task graph the schema allows (DEBT-013)
+  assert.deepEqual(
+    parseYaml(["tasks:", "edges:", "context_files:", "target_scopes:"].join("\n")),
+    { tasks: [], edges: [], context_files: [], target_scopes: [] },
+  );
+  // the scope-level arrays too
+  assert.deepEqual(parseYaml("write_scope_globs:\nprotected_test_globs:\nverification_commands:\n"), {
+    write_scope_globs: [],
+    protected_test_globs: [],
+    verification_commands: [],
+  });
+  // nested and dedented: a bare context_files ends the member as []
+  assert.deepEqual(
+    parseYaml(["tasks:", "  - key: A", "    context_files:", "edges:"].join("\n")),
+    { tasks: [{ key: "A", context_files: [] }], edges: [] },
+  );
+  // the rule is driven by the declared list keys, never guessed: the same
+  // text with an empty key set keeps the empty-value refusal
+  assert.throws(
+    () => parseYaml("edges:\n", { emptyListKeys: new Set<string>() }),
+    (err: unknown) =>
+      err instanceof YamlParseError && /no value and no nested block/.test(err.message),
+  );
+});
+
+test("`edges: []` still refuses — and the refusal teaches the working form", () => {
+  assert.throws(
+    () => parseYaml("edges: []\n"),
+    (err: unknown) => {
+      assert.ok(err instanceof YamlParseError, `expected YamlParseError, got ${String(err)}`);
+      assert.equal(
+        err.message,
+        "line 1: flow lists ([…]) are not part of the subset — use block lists — write `edges:` with no items for an empty list",
+      );
+      return true;
+    },
+  );
+  // the suffix names the key it teaches, never a hard-coded `edges`
+  assert.throws(
+    () => parseYaml("context_files: []\n"),
+    (err: unknown) =>
+      err instanceof YamlParseError &&
+      err.message.endsWith("— write `context_files:` with no items for an empty list"),
+  );
+  // a NON-empty flow list keeps the plain refusal (nothing to teach: the
+  // subset has no inline form for it)
+  assert.throws(
+    () => parseYaml("edges: [{source_key: A}]\n"),
+    (err: unknown) =>
+      err instanceof YamlParseError &&
+      !err.message.includes("with no items for an empty list"),
+  );
+});
+
+test("a bare NON-array key still refuses — `wake:` never silently means []", () => {
+  for (const key of ["wake", "project_slug", "version", "overrides", "enabled"]) {
+    expectReject(`${key}:\n`, 1, /no value and no nested block/);
+  }
+  // nested, followed by a sibling key at the same indent: still refused
+  expectReject("tasks:\n  - key: A\n    overrides:\n    wake: 1\n", 3, /no value and no nested block/);
+});
+
 /* ------------------------- the adversarial battery ------------------------- */
 
 function expectReject(text: string, line: number, pattern: RegExp): void {

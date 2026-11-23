@@ -68,6 +68,11 @@ function fixture(): Fixture {
           max_timeout_sec, max_cost_usd)
        VALUES (?, ?, 'dev', 'anthropic', 'm', 'medium', 'prompts/dev_system.md', 3600, 5)`,
     ).run(ulid(), workspaceId2);
+    // the FK the imported chain's target_scopes resolve against (every
+    // member REQUIRES scopes — v0.3.0 amendment row 5, DEBT-011)
+    db.prepare(
+      "INSERT INTO project_targets (id, project_id, alias, target_type, root_path) VALUES (?, ?, 'app', 'directory', ?)",
+    ).run(ulid(), projectId2, quietRoot);
   } finally {
     db.close();
   }
@@ -418,12 +423,19 @@ test("chain_run_id scopes to the chain's member tasks, with the chain slug proje
           version: "1.0.0",
           project_slug: "prj2",
           tasks: [
-            { key: "PLAN", title: "Plan", objective: "Plan the work end to end.", profile_name: "dev" },
+            {
+              key: "PLAN",
+              title: "Plan",
+              objective: "Plan the work end to end.",
+              profile_name: "dev",
+              target_scopes: [{ repo_alias: "app", access_mode: "read_only" }],
+            },
             {
               key: "WORK",
               title: "Work",
               objective: "Do the work end to end.",
               profile_name: "dev",
+              target_scopes: [{ repo_alias: "app", access_mode: "read_write" }],
             },
           ],
           edges: [{ source_key: "PLAN", target_key: "WORK", edge_type: "depends_on" }],
