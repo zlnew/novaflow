@@ -389,6 +389,52 @@ test("recovery is idempotent: a second pass finds no orphans", () => {
   }
 });
 
+test("recovery records CACHE tokens, not just fresh input (p1 review finding 2)", () => {
+  // The live settle path is covered by run-cache; this pins the RECOVERY path
+  // (boot replay of an orphaned run) against the same money-path accounting.
+  // If recovery zeroed or swapped the cache columns, this fails.
+  const s = seed();
+  try {
+    applyTransition(s.db, s.taskId, START_TRIGGER, { triggerType: "engine", actor: "test" });
+    const runId = ulid();
+    const runDir = join(s.wsRoot, ".novaflow", "runs", s.taskId, runId);
+    mkdirSync(runDir, { recursive: true });
+    const lines = [
+      JSON.stringify({ type: "message_update", usage: { input: 0, output: 0 } }),
+      JSON.stringify({
+        type: "message_end",
+        usage: { input: 10_000, output: 2_000, cacheRead: 500_000, cacheWrite: 80_000 },
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ];
+    writeFileSync(join(runDir, "events.raw.jsonl"), lines.join("\n") + "\n", { mode: 0o600 });
+    writeFileSync(join(runDir, "result.json"), validArtifact(s.taskId, runId));
+    s.db
+      .prepare(
+        `INSERT INTO task_runs
+           (id, task_id, profile_id, attempt_number, attempt_kind, pi_session_id,
+            pi_session_dir, status, preflight_status, model_used, events_log_path)
+           VALUES (?, ?, (SELECT id FROM agent_profiles), 1, 'execution', ?, ?,
+              'running', 'passed', ?, ?)`,
+      )
+      .run(runId, s.taskId, runId, runDir, MODEL, join(runDir, "events.jsonl"));
+
+    recoverOrphanedRuns(s.db, { pricesPath: s.pricesPath });
+    const row = s.db
+      .prepare("SELECT * FROM task_runs WHERE id = ?")
+      .get(runId) as TaskRunRecord & { cache_read_tokens: number; cache_write_tokens: number; input_tokens: number };
+    assert.equal(row.status, "succeeded", "the orphan replayed");
+    assert.equal(row.input_tokens, 10_000, "fresh input only — never conflated with cache");
+    assert.equal(row.cache_read_tokens, 500_000, "recovery records cache read");
+    assert.equal(row.cache_write_tokens, 80_000, "recovery records cache write");
+    // PRICES is input 3 / output 15 and has NO cache rates: cache prices at 0,
+    // so cost = 10k*3/1e6 + 2k*15/1e6 — the same numbers the live path gives.
+    assert.ok(Math.abs(row.cost_usd - (0.03 + 0.03)) < 1e-9, `cost ${row.cost_usd}`);
+  } finally {
+    cleanup(s);
+  }
+});
+
 test("suite cleanup: zero temp dirs leaked (before/after delta 0)", () => {
   // every seed() in this suite cleans its wsRoot AND its prices dir —
   // the leak this pins was ~6 workspace+prices roots per run

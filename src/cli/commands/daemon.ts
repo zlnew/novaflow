@@ -4,6 +4,8 @@ import { connect } from "node:net";
 import { dirname, join } from "node:path";
 import { parseArgs, UsageError, type ArgSpec } from "../args.ts";
 import { daemonRequest, defaultDbPath, novaHome, socketPath } from "../client.ts";
+import { applyPending } from "../../store/migrate.ts";
+import { openDb } from "../../store/db.ts";
 import { renderKv } from "../format.ts";
 import { EXIT_NOT_FOUND, EXIT_OK, EXIT_OPERATION_FAILED } from "../exitcode.ts";
 import type { CommandOpts } from "../opts.ts";
@@ -62,8 +64,10 @@ export async function daemonCommand(argv: string[], opts: CommandOpts): Promise<
       return prune(p, opts);
     case "logs":
       return logs(p, opts);
+    case "migrate":
+      return migrateStore(opts);
     default:
-      throw new UsageError(`nova daemon [start|stop|status|pause|resume|kill-all|backup|prune|logs]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`);
+      throw new UsageError(`nova daemon [start|stop|status|pause|resume|kill-all|backup|prune|logs|migrate]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`);
   }
 }
 
@@ -401,4 +405,43 @@ function tailFile(path: string, n: number): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/* ---------------------------------- migrate ---------------------------------- */
+
+/**
+ * `nova daemon migrate` — the upgrade path (p1 review finding 1). This is the
+ * ONE verb that opens the store from the CLI, and it must: version skew is
+ * exactly the state in which the daemon refuses to boot, so nothing else can
+ * apply the fix. Preconditions, both refused loudly rather than guessed:
+ *   - no daemon answering on the socket (exclusive-ish access; the store is
+ *     WAL, so two writers would "work" and be wrong);
+ *   - the store exists (a fresh install is `nova daemon start`'s first boot).
+ * The upgrade itself is transactional and drift-checked (applyPending).
+ */
+async function migrateStore(opts: CommandOpts): Promise<number> {
+  const sock = socketPath();
+  if (existsSync(sock) && (await liveDaemonAnswers(sock))) {
+    throw new UsageError(
+      "a daemon is answering on the socket — stop it first (nova daemon stop), then migrate",
+    );
+  }
+  const storePath = defaultDbPath();
+  if (!existsSync(storePath)) {
+    throw new UsageError(`no store at ${storePath} — a fresh install migrates on 'nova daemon start'`);
+  }
+  const db = openDb(storePath);
+  try {
+    const report = applyPending(db);
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({ store: storePath, ...report }, null, 2) + "\n");
+    } else if (report.applied.length === 0) {
+      process.stdout.write(`store ${storePath}: already at the latest schema (${report.alreadyApplied} migrations)\n`);
+    } else {
+      process.stdout.write(`store ${storePath}: applied ${report.applied.join(", ")}\n`);
+    }
+    return 0;
+  } finally {
+    db.close();
+  }
 }
