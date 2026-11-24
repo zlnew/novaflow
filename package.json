@@ -1,6 +1,6 @@
 {
   "name": "novaflow",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Deterministic orchestration for chains of Pi coding-agent tasks: per-run git worktrees, gates, verification, and a live operator view.",
   "type": "module",
   "license": "MIT",
@@ -52,7 +52,7 @@
     "typescript": "^5.9.0"
   },
   "allowScripts": {
-    "better-sqlite3": true,
-    "esbuild": true
+    "esbuild@0.28.2": true,
+    "better-sqlite3@12.11.1": true
   }
 }
