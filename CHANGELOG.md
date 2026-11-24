@@ -3,6 +3,20 @@
 What changed for the operator, release by release. The numbers are the ones the code and the
 run records enforce; the repository history is the PR list.
 
+## [0.3.2] — 2026-11-24
+
+**Fix:** `nova web start` now passes the bind host explicitly and probes it. Found live: the
+command spawned `pi-web --port N --no-open` with no hostname, so an exported
+`PI_WEB_HOSTNAME=0.0.0.0` in the operator's shell (inherited by the child) served every mirrored
+transcript to the LAN with authentication off. It also hardcoded the readiness probe to
+`127.0.0.1`, so an instance bound elsewhere started and was then killed as "not answering".
+
+Now: host = `PI_WEB_HOSTNAME` or loopback, passed to pi-web, used by the probe and reported by
+`nova web status` (a wildcard bind is probed on loopback, and the printed URL says loopback).
+`docs/live-view.md` gains **Access from the tailnet**: keep the bind on loopback and publish it
+with `tailscale serve --bg --https=443 http://127.0.0.1:30142` — TLS, tailnet-only, no LAN
+exposure.
+
 ## [0.3.1] — 2026-11-24
 
 **Fix:** `install.sh`'s default route (`git clone … && sh novaflow/install.sh`) did not work on

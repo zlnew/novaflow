@@ -148,11 +148,11 @@ test("the package declares allowScripts for the one native dep (npm >= 12 blocks
   const pkg = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8")) as {
     allowScripts?: Record<string, unknown>;
   };
-  assert.equal(
-    pkg.allowScripts?.["better-sqlite3"],
-    true,
-    "package.json must allow install scripts for better-sqlite3",
-  );
+  // npm rewrites this field to PINNED keys (`better-sqlite3@12.11.1`) the first
+  // time it approves the script, so both spellings must satisfy the pin.
+  const keys = Object.keys(pkg.allowScripts ?? {});
+  const allowed = keys.some((k) => k === "better-sqlite3" || k.startsWith("better-sqlite3@"));
+  assert.ok(allowed, `package.json must allow install scripts for better-sqlite3 (got ${keys.join(", ")})`);
 });
 
 });
