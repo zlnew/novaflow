@@ -1,91 +1,97 @@
-# The live view — tier C and tier D
+# Live view — the terminal screen and the browser
 
-Two tiers, no plugin. The installed Pi Web (0.18.0, spiked 2026-11-23) exposes no plugin surface,
-so NovaFlow does not pretend to own a panel: tier C is the terminal, tier D is Pi Web's own
-renderer reading a private mirror. There is no NovaFlow web UI, no REST/SSE server, and no token
-stream to a dashboard.
+There are two ways to watch work, and neither is a dashboard that can change anything:
 
-## Tier C — `nova status --watch`
+| | what it is | what it costs |
+| --- | --- | --- |
+| **the screen** | `nova status`, one block of text about the daemon, the queue, money and the last three state changes | one daemon call |
+| **the browser** | your run transcripts, rendered by Pi Web from a private directory of **copied** files | one Pi Web process on loopback |
 
-`nova status` prints one screen an operator can paste:
+A gate is still approved from the CLI or over MCP. The browser reads files; it never decides
+anything, and there is no NovaFlow web UI, HTTP API or telemetry.
+
+## The screen
 
 ```text
-daemon: running (v…, started 2026-11-23T…)
-scheduler: inflight 2 queued 3 paused false live WC2,WC3
+daemon: running (v<version>, started <iso-timestamp>)
+scheduler: inflight 2 queued 3 paused false live CHECKOUT-1,CHECKOUT-2
 spend: today $0.4200 (3 runs), month $1.1000 (9 runs), prices_armed true, inert_models -
 transitions (last 3):
-  12:06:54 UTC WC2 queued→running
+  12:06:54 UTC CHECKOUT-1 queued→running
+  12:09:02 UTC CHECKOUT-2 running→validating
+  12:09:44 UTC CHECKOUT-2 validating→completed
 ```
 
-`nova status --watch` reprints only when the screen changes: the transition cursor advances every
-2 s, so a quiet daemon costs one socket op per tick and no terminal writes. Every transition line
-prints `HH:MM:SS UTC` with the zone on the line (DEBT-012). `NOVAFLOW_STATUS_WATCH_MS` overrides
-the interval for tests and operators (a number ≥ 50, in milliseconds); a bad value is a usage
-error with the fix in the message. `nova status --json` is the same data as one document.
+Five facts, and nothing that moves on a clock: daemon state, in-flight and queued runs, whether
+dispatch is paused, today's and this month's spend with the two pricing flags, and the last three
+transitions. Uptime is deliberately absent — a field that changes every second would force a redraw
+every second.
 
-The five facts on the screen: daemon state, scheduler in-flight/queued/paused/live tasks, today
-and month spend with `prices_armed` and `inert_models`, and the last three transitions. Uptime is
-deliberately absent — a field that moves every second would reprint forever.
+`nova status --watch` reprints only when the screen changes. It advances a cursor every two seconds,
+so a quiet daemon costs one daemon call per tick and no terminal output. `NOVAFLOW_STATUS_WATCH_MS`
+overrides the interval (a whole number of milliseconds, 50 or more); anything else is a usage error
+that names the fix. `nova status --json` is the same data as one document, for a script.
 
-## Tier D — the private Pi Web mirror
+Every transition line carries its zone (`HH:MM:SS UTC`), so a log pasted into a chat is not
+ambiguous.
+
+## The browser
 
 ```bash
-bin/nova web sync --all          # mirror every SETTLED run's session file
-bin/nova web sync --run FEAT-1   # one task (key) — or a bare run ULID
-bin/nova web start               # dedicated Pi Web on http://127.0.0.1:30142
-bin/nova web status              # pid liveness, port, answering, mirrored-run count, URL
-bin/nova web stop
+nova web start                  # start the dedicated Pi Web on http://127.0.0.1:30142
+nova web sync --all             # copy every settled run's transcript into it
+nova web status                 # pid, port, whether it answers, how many runs are mirrored
+nova web stop                   # stop the instance this verb started
 ```
 
-`nova web start` needs `pi-web` on `PATH` (`npm install -g @agegr/pi-web`; a missing binary is
-refused naming that command). It sets `PI_CODING_AGENT_DIR=~/.novaflow/piweb`, writes
-`~/.novaflow/piweb/piweb.log` and `piweb.pid`, and waits for `GET /api/sessions` before printing
-the URL. `NOVAFLOW_PIWEB_PORT` changes the port, `NOVAFLOW_PIWEB_BIN` changes the binary. It
-refuses a busy port naming what holds it and refuses to start a second instance over a live one —
-each refusal ends with the next move.
+`nova web start` needs `pi-web` on your `PATH` (`npm install -g @agegr/pi-web`). It runs Pi Web in a
+private agent directory, `~/.novaflow/piweb`, writes `piweb.log` and `piweb.pid` there, and waits
+for the instance's session list to answer before printing the URL. `NOVAFLOW_PIWEB_PORT` changes the
+port and `NOVAFLOW_PIWEB_BIN` names a different binary.
 
-### Mirror rules
+### What gets copied
 
-- **Copies, never links.** A hardlink would let Pi Web's rename/delete/resume write through to a
-  run's record. `sync` writes an independent byte copy and rewrites it only when the source
-  changed; a second `sync` changes nothing, not even an mtime.
-- **Settled runs only.** A live run's transcript is still being written, so copying it is a torn
-  read: `--run` on a live run refuses (exit 1, pointing at `nova status --watch`) and copies
-  nothing. `--all` is a workspace sweep where in-flight work is expected, so it mirrors the
-  settled runs and reports the live ones as `refused`.
-- **No raw stream, ever.** `events.raw.jsonl` is never copied by any path; the redacted
-  `events.jsonl` is not the mirror's unit either — only the run's own Pi session file is. The run
-  directory is opened read-only.
-- **No implicit prune.** The mirror only grows with `sync`; delete `~/.novaflow/piweb/sessions`
-  by hand to empty it. Nothing in NovaFlow ever deletes it.
+| rule | why |
+| --- | --- |
+| copies, never links | Pi Web renames and deletes what it lists; a hardlink would write through to a run's own record |
+| settled runs only | a live run's transcript is still being written, so copying it is a torn read |
+| `--run` on a live run refuses, and copies nothing | half a transcript is worse than none; `--all` reports the live runs as `refused` and copies the settled ones |
+| one file per run: the run's own Pi session file | the event logs are not the mirror's unit |
+| `events.raw.jsonl` is never copied, by any path | it is the verbatim log; the mirror holds only what Pi already wrote |
+| no implicit prune | the mirror grows only when you sync; delete `~/.novaflow/piweb/sessions` by hand to empty it |
 
-The destination is Pi Web's own layout, derived from the session's recorded cwd:
-`~/.novaflow/piweb/sessions/--home-x-y--/<ts>_<run id>.jsonl` for a run started in `/home/x/y`.
+A second `nova web sync` of unchanged runs copies nothing, not even a timestamp. The destination is
+Pi Web's own layout, derived from the directory the run recorded inside its transcript:
+`~/.novaflow/piweb/sessions/--home-x-y--/<session-file>.jsonl` for a run started in `/home/x/y`.
 
-Pi Web stays **read-only** for NovaFlow. Gate approvals, aborts, retries and follow-ups stay on
-the CLI, MCP and the chat; the browser is a transcript view over copied files.
+## Watching from another device
 
-## Access from the tailnet
-
-The instance belongs on loopback. To read runs from a phone or another machine, let
-Tailscale publish it — never widen the bind:
+The instance belongs on loopback. To read runs from a phone or another machine, publish it with
+Tailscale rather than widening the bind:
 
 ```bash
-nova web start                                   # binds 127.0.0.1:30142
+nova web start                                          # binds 127.0.0.1:30142
 tailscale serve --bg --https=443 http://127.0.0.1:30142
-tailscale serve status                           # shows https://<node>.<tailnet>.ts.net
+tailscale serve status                                  # prints https://<node>.<tailnet>.ts.net
 ```
 
-That gives you `https://<node>.<tailnet>.ts.net/` with Tailscale's own TLS, reachable only from
-devices on your tailnet (nothing is exposed to the LAN or the internet).
+That gives you TLS from Tailscale and access from your tailnet devices only — nothing is exposed to
+the LAN or the internet. `tailscale serve` needs HTTPS enabled for the tailnet; `--bg` keeps the
+mapping across restarts, and `tailscale serve reset` removes it.
 
-**Why not `--hostname 0.0.0.0`:** with Pi Web's authentication off by default, a wildcard bind
-serves every mirrored transcript to anything on the same network — a real exposure found on
-2026-11-24 (DEBT-016). `nova web start` therefore always passes the bind host explicitly
-(loopback unless you set `PI_WEB_HOSTNAME`), probes that host for readiness, and reports it in
-`nova web status`. If you have `PI_WEB_HOSTNAME=0.0.0.0` exported in your shell for a
-hand-run Pi Web, unset it before `nova web start` — your environment is inherited by the child.
+Do **not** bind `0.0.0.0`. Pi Web has authentication off by default, so a wildcard bind serves every
+mirrored transcript to anything on the same network. `nova web start` always passes the bind host
+explicitly — loopback unless you set `PI_WEB_HOSTNAME` — probes that host, and reports it in
+`nova web status`. If `PI_WEB_HOSTNAME=0.0.0.0` is exported in your shell for a hand-run Pi Web, it
+will be inherited by the child: unset it before `nova web start`.
 
-`tailscale serve` needs HTTPS enabled for the tailnet (admin console → DNS → HTTPS
-Certificates). `--bg` persists across restarts; `tailscale serve reset` removes it.
+## Common problems
 
+| symptom | cause | the command that fixes it |
+| --- | --- | --- |
+| `nova web start`: `pi-web is not on PATH` | the renderer is a separate package | `npm install -g @agegr/pi-web`, then `nova web start` |
+| `a live pi-web already answers at <url> (pid N)` | an instance is already running | open that URL, or `nova web stop` |
+| `port 30142 is already in use` | something else holds the port | the message names the holder; stop it, or `NOVAFLOW_PIWEB_PORT=30143 nova web start` |
+| `run <id> is running, not settled` | you asked to mirror a run that is still writing | `nova task status <id> --watch`, then `nova web sync --run <id>` once it settles |
+| the browser lists no runs | nothing has been mirrored yet | `nova web sync --all`, then reload the page |
+| `nova status --watch` never changes | nothing is happening — the screen only repaints on change | `nova task list --state queued` to confirm the queue is empty |

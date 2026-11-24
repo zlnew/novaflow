@@ -1,79 +1,51 @@
 # NovaFlow
 
-NovaFlow is a workflow framework and orchestration toolset, not a harness. Pi is the harness:
-NovaFlow gives an operator a deterministic engine for chains of bounded coding-agent tasks,
-isolated git worktrees per run, and verification a task cannot skip.
+**Run coding agents in the background, in their own git worktrees, and see exactly what they spent.**
 
-## Why it exists
+NovaFlow is a local orchestrator for [Pi](https://github.com/earendil-works/pi) coding-agent
+sessions. You describe work as tasks or as a chain of tasks, hand it to a small daemon, and get on
+with something else. Each run gets its own worktree, its own budget, and an engine that verifies the
+result instead of trusting it. When a run needs a human — a gate, a failure, a finished chain —
+your editor session is told, and you decide.
 
-The v0.3.0 work started from two observed failures.
+If you have ever watched an agent drift for twenty minutes and then wondered what it cost, that is
+the problem this solves.
 
-**A session that sleeps is not a session that can talk to you.** The orchestrator (a Pi session)
-sat in a `sleep` loop watching a chain. Execution belongs in the daemon: the session's job is to
-enqueue, end its turn, and be woken when a transition needs a human. That is the operator
-contract, and v0.3.0 makes it the shape of the tool rather than a habit.
+## Quick start
 
-**Spend you cannot see is spend you cannot budget.** Two recorded runs, two different
-denominators — stated exactly so neither can be misquoted:
-
-- The **v0.2.0 dogfood trial** (2026-11-23, 3 runs, `$0.0643` total): cache reads were **88.8% of
-  the trial's prompt tokens** — 1,230,016 of 1,384,732.
-- A separate **DEBT-009-era GLM run**: **88% of the COST** was cache reads — 13,652,160
-  cache-read tokens, 98.8% of that run's prompt tokens.
-
-NovaFlow records the cache-aware usage and the cost basis per run, so the number you budget
-against is the number the run recorded.
-
-## The three rulings
-
-1. **Profiles are free-form.** A profile is a named bundle: model identity, system prompt, tool
-   allowlist, limits. Model identity is validated against the live Pi model catalog — Pi is the
-   identity truth. Role labels are optional conventions; there is no role taxonomy and no trust
-   tiers.
-2. **Chains are the core feature.** The caller owns topology: any DAG shape, per-task profiles,
-   gates, priorities, context files. The engine imposes only acyclic validation, bounded retry
-   loops, and gate semantics — rules, not shapes.
-3. **The engine rules; everyone else proposes.** Humans and orchestrator agents reach the engine
-   through the CLI, MCP, or the Pi extension, and every transition passes the same FSM validation
-   regardless of who called. No surface gets a shortcut.
-
-## 60-second start
-
-Requirements: **Node.js ≥ 22**, **`pi` on `PATH`**, and **git ≥ 2.40** (per-run worktrees). The
-installer checks all three, warns about `sqlite3` (the bundled driver carries its own SQLite),
-and refuses with the fix in the message.
+Requires **Node.js 22+**, the **`pi` coding agent on your `PATH`**, and **git 2.40+**.
 
 ```bash
-git clone https://github.com/zlnew/novaflow && sh novaflow/install.sh
+git clone https://github.com/zlnew/novaflow
+sh novaflow/install.sh
 ```
 
-The default route is `--from-source`: `npm install` in the checkout, then `npm link` (a symlink,
-so `git pull && sh novaflow/install.sh` upgrades in place; `npm install -g .` would copy a tree
-without the `tsx` loader `bin/nova` drives). `--from-tarball <pkg.tgz>` installs a packed
-artifact, `--start` also starts the daemon, and `--force-ext` replaces a different Pi extension.
-The installer copies the extension to `~/.pi/agent/extensions/novaflow.ts` only when absent
-(reload Pi with `/reload` to pick it up) and writes `~/.novaflow/config.yaml` once, only when
-absent. A second run with the same flags changes nothing, and an existing store is never touched.
+The installer checks Node, npm, `pi`, git and `sqlite3`, copies the Pi extension into place,
+writes a config file once, and prints the next three commands.
 
-It then prints the three commands that come next:
+### Try it on a throwaway project
 
 ```bash
+# 0. start the daemon (it owns the store and the state machine)
 nova daemon start --migrate
-nova workspace create <name> --path <dir>
-nova project create <name> --objective "<text>"
-```
 
-From this checkout the same CLI is `bin/nova`; the examples below use that path, so they run
-without a global link. (`bin/nova --help` prints every noun and verb.)
+# 1. a workspace is an ordinary directory: NovaFlow keeps its state and your docs there
+mkdir -p ~/work
+nova workspace create my-work --path ~/work
+nova workspace switch my-work
 
-A single task, end to end:
+# 2. a project points at targets; :git_repo is what gets per-run worktrees,
+#    and its base must be a clean git repo (no uncommitted files)
+git init -q ~/work/app-src && cd ~/work/app-src \
+  && printf '# app\n' > README.md && git add . \
+  && git -c user.email=you@example.com -c user.name=you commit -qm init && cd - >/dev/null
+nova project create app --objective "Ship the feature." --target code=~/work/app-src:git_repo
 
-```bash
-bin/nova daemon start --migrate
-bin/nova workspace create my-ws --path ~/work/my-ws
-bin/nova workspace switch my-ws
-bin/nova project create app --objective "Ship the feature." --target code=~/work/my-ws
-
+# 3. a profile is a named bundle: model, prompt, tools, limits.
+#    system_prompt_path resolves under the WORKSPACE root, so create it first.
+mkdir -p ~/work/prompts
+printf 'You are a careful developer. Make the smallest change that works.\n' \
+  > ~/work/prompts/dev_system.md
 cat > dev.json <<'JSON'
 {
   "name": "dev",
@@ -85,182 +57,142 @@ cat > dev.json <<'JSON'
   "limits": { "max_timeout_sec": 3600, "max_cost_usd": 5 }
 }
 JSON
-bin/nova profile create --file dev.json
+nova profile create --file dev.json
 
-bin/nova task create FEAT-1 --title "Add PKCE" --objective "Implement PKCE." \
-  --profile dev --project app --context docs/spec.md --scope code
-bin/nova task run FEAT-1 --watch
-bin/nova task result FEAT-1
+# 4. a task, bound to the target it may touch
+nova task create FEAT-1 --title "Add PKCE" --objective "Implement PKCE end to end." \
+  --profile dev --project app --scope code
+nova task run FEAT-1
 ```
 
-`--scope code` names the project target the run is confined to. A run with no scopes is refused
-before any token is spent. `task run` returns at enqueue; `--watch` is the opt-in human view.
+`nova task run` returns immediately. The work continues in the background; `nova status --watch`
+shows it, and the Pi extension wakes your session (see [operations](docs/operations.md)) when
+something needs you. The run's changes land in its own worktree — NovaFlow never commits to your
+branch.
 
-## One worked chain
+## What it does for you
 
-A two-task chain: a read-only plan, then a write task behind a human gate. The graph is the
-`data` §4.3 shape, and every member must name its `target_scopes` (a member without scopes is
-refused at import, naming the member). An empty `edges:` list is legal, so a one-task chain also
-imports.
+| | |
+|---|---|
+| **Work runs without you holding it open** | Runs live in a daemon. You enqueue, end your turn, and get woken on the events that matter. |
+| **Two agents cannot collide** | Each run on a writable git target works in its own `git worktree`, from a commit of that target's base branch. Read-only git targets and plain directories run in place, and the runner says so. |
+| **A task cannot pass itself** | The engine runs the verification commands you configure, then checks protected test files and write scopes after the agent settles. Completion is the engine's verdict, not the agent's claim. |
+| **Cost is recorded, not estimated** | Every run stores fresh input, cache read, cache write and output tokens, priced from a local table. `nova status` shows today and this month, and names any model that has no price, so a silent zero cannot happen. |
+| **You can read any run afterwards** | Each run's transcript is kept: a redacted event log for reading, and a verbatim one kept `0600` and never served. |
 
-```yaml
-version: "1.0.0"
-project_slug: app
-tasks:
-  - key: PLAN
-    title: Plan the change
-    objective: Write the implementation plan end to end.
-    profile_name: dev
-    target_scopes:
-      - repo_alias: code
-        access_mode: read_only
-  - key: WORK
-    title: Do the work
-    objective: Implement the planned change end to end.
-    profile_name: dev
-    requires_human_gate: true
-    context_files: ["docs/spec.md"]
-    target_scopes:
-      - repo_alias: code
-        access_mode: read_write
-        write_scope_globs: ["src/**"]
-        verification_commands: ["npm test"]
-edges:
-  - source_key: PLAN
-    target_key: WORK
-    edge_type: depends_on
+## How it works
+
 ```
+   your Pi session  ──┐
+   an agent via MCP  ─┼──►  nova daemon  ──►  run 1 ─► worktree A ─► verify ─► result
+   your shell (CLI)  ─┘        │             run 2 ─► worktree B ─► verify ─► result
+                               └── one SQLite store, one writer, one state machine
+```
+
+The daemon owns the store and the state machine. The CLI, the MCP server, and the Pi extension are
+thin clients of one Unix socket at `~/.novaflow/novaflow.sock` — no TCP port, no HTTP, no telemetry.
+Every state change passes the same validation whoever asked for it.
+
+## Core concepts
+
+| concept | what it is |
+|---|---|
+| **workspace** | The directory you work from, plus its budgets and concurrency. One machine can hold several. |
+| **project** | A goal inside a workspace, with one or more named **targets** (a git repo or a plain directory, each with an access mode). |
+| **profile** | A reusable agent bundle: model, system prompt, tool allowlist, time and cost limits. |
+| **task** | One bounded objective for one profile: a title, a written objective, optional context files, an optional gate. |
+| **chain** | Tasks wired into an acyclic graph — `depends_on`, `on_changes_requested`, `on_failure` — imported as one YAML file. |
+| **run** | One attempt at a task: a Pi session, a worktree, tokens, cost, and a result artifact. A retry is a new run. |
+| **gate** | A task that waits for a human before it continues. Approve, or reject with feedback and the chain routes on it. |
+
+A task's states are `draft → queued → running → validating → completed`, with `awaiting_gate`,
+`changes_requested`, `failed` and `cancelled` as the branches you will actually see.
+
+## Everyday commands
+
+| I want to… | command |
+|---|---|
+| see what is happening | `nova status`, `nova status --watch` |
+| run a task and walk away | `nova task run <id or key>` |
+| run a task and watch it | `nova task run <id or key> --watch` |
+| read a result | `nova task result <id or key>` |
+| follow a run's log | `nova task logs <id or key> --follow` |
+| import a chain | `nova project import-dag chain.yaml --project app` |
+| watch a chain | `nova chain status <chain-id> --watch` |
+| decide a gate | `nova task gate-approve <id> [--note …]`, `nova task gate-reject <id> "<feedback>"` |
+| check what verification ran | `nova chain verify <chain-id>` |
+| tidy the worktrees | `nova chain clean <chain-id> [--force]` |
+| browse finished runs in a browser | `nova web sync --all && nova web start` |
+
+`nova <noun> <verb> --help` prints that verb's usage, flags, one example and its exit codes.
+Exit codes are stable: `0` ok, `1` failed, `2` usage, `3` engine-state rejection, `4` not found,
+`5` daemon unreachable. Every refusal ends with the next move to try.
+
+## Watching work
 
 ```bash
-bin/nova project import-dag chain.yaml --project app   # prints the chain-run id
-bin/nova task run PLAN                                 # enqueue the root; WORK becomes ready after it
-bin/nova chain status <chain-run-id> --watch           # member transitions, one line each
-bin/nova task gate-approve WORK                         # the gate is a CLI/MCP act, never a web click
-bin/nova task result WORK
-bin/nova chain verify <chain-run-id>                    # configured vs executed verification
-bin/nova chain clean <chain-run-id>                     # settled only; refuses a dirty worktree without --force
+nova status                  # daemon, in-flight runs, today/month spend, last transitions
+nova status --watch          # same screen, reprinted only when it changes
+nova web sync --all          # copy settled run transcripts into a private Pi Web directory
+nova web start               # browse them at http://127.0.0.1:30142
 ```
 
-A `git_repo` target with `access_mode: read_write` runs in
-`.novaflow/worktrees/<run_id>/<alias>/`, created by `git worktree add -b novaflow/run-<run_id>`.
-A read-only git target or a plain directory runs in place. A worktree that cannot be created
-refuses the run — there is no fallback to the shared tree. `nova chain clean` is the post-terminal
-confirmation: it removes the worktrees and keeps the run rows and artifacts.
+The browser view is Pi Web's own renderer pointed at a private directory of **copied** transcripts,
+so it can never change a run. Copies are made only for settled runs, never for a run still writing,
+and the verbatim event log is never copied.
 
-A task **without a chain** has no `chain clean` verb. Its trees persist on settle by design; clean
-them by hand with `git -C <repo> worktree list` and `git -C <repo> worktree remove <path>`, then
-`git -C <repo> worktree prune`. The `novaflow/run-<run_id>` branch stays until you delete it.
-
-## What you can watch
-
-The live view is two tiers. There is no NovaFlow web UI and no plugin: the installed Pi Web
-(0.18.0, spiked 2026-11-23) exposes no plugin surface, so tier C is the terminal and tier D is
-Pi Web's own renderer reading a private mirror.
-
-```bash
-bin/nova status                  # one screen: daemon, scheduler in-flight, spend, last 3 transitions
-bin/nova status --watch          # reprints only when the screen changes; every transition line is HH:MM:SS UTC
-bin/nova status --json
-
-bin/nova web sync --all          # mirror every SETTLED run's session file into the private Pi Web dir
-bin/nova web sync --run FEAT-1   # one task (key) — or a bare run ULID
-bin/nova web start               # dedicated Pi Web on http://127.0.0.1:30142
-bin/nova web status              # pid liveness, port, mirrored-run count, URL
-bin/nova web stop
-```
-
-The mirror's rules: **copies, never links** (Pi Web could rename/delete/resume through a link);
-**settled runs only** (a live transcript is a torn read, and `--run` on a live run copies
-nothing); **`events.raw.jsonl` is never copied** by any path; and **no implicit prune** — the
-mirror only grows with `sync`. Pi Web is read-only for NovaFlow: gates, aborts and follow-ups
-stay on the CLI, MCP and the chat.
-
-In an operator Pi session the extension arms the **wake watcher** and injects one
-`[novaflow] …` follow-up per transition that needs a human — `awaiting_gate`, `failed`, and
-inferred chain completion. It seeds at head on session start, so pre-existing history never
-wakes. Configure it in `~/.novaflow/config.yaml`:
+In a Pi session, the extension wakes you on the transitions that need a human — a gate, a failure,
+a finished chain — so you do not poll:
 
 ```yaml
+# ~/.novaflow/config.yaml
 wake:
-  enabled: true      # default true
-  workspace: null    # a workspace slug to narrow, or null for every workspace
+  enabled: true
+  workspace: null   # or a workspace slug
 ```
 
-`NOVAFLOW_WAKE=off` disables it for the session; `NOVAFLOW_WAKE_MS` overrides the ~2 s poll
-interval.
+## The safety model, plainly
 
-## What ships in v0.3.0
+- **Nothing runs unconfined.** A run without target scopes is refused before a token is spent.
+- **Preflight is free.** Target roots, a clean base worktree, the Pi binary, budget ceilings and
+  disk space are checked before the agent starts.
+- **Write scopes are enforced during the run** by the Pi extension, which reads its allowed roots
+  from the run's own directory and fails closed.
+- **Verification runs after the agent stops**, with protected test files watched, so a task cannot
+  quietly disable the tests that judge it.
+- **Two logs per run**: `events.jsonl` (redacted, the read surface) and `events.raw.jsonl`
+  (verbatim, `0600`, never served).
+- **Merging is yours.** NovaFlow never merges. It leaves each run's worktree and patch on disk and
+  tells you what changed.
 
-- **Per-run worktree isolation.** `git_repo` + `read_write` targets get a tree per run under
-  `.novaflow/worktrees/<run_id>/<alias>/`; write scopes and verification commands run against
-  that tree. Fail-closed: no worktree, no run. Migration 0004 adds `task_runs.worktree_root`.
-- **Real concurrency.** `concurrency.workspace` defaults to **2** and `concurrency.global` to
-  **4**. `nova_daemon_status` reports the `inflight` count and each running run's
-  `worktree_root`.
-- **Background-first operation.** `nova task run` returns at enqueue; the wake watcher is the
-  notification path; the operator contract (enqueue, end the turn, act when woken) is written in
-  [`docs/operations.md`](docs/operations.md).
-- **The live view.** Tier C (`nova status --watch`) and tier D (`nova web sync|start|stop|status`)
-  as described above.
-- **CLI UX.** Verb-scoped `--help` on every verb, one exit-code table (0–5), and a ` — fix: `
-  next move on refusals, listed in [`docs/cli.md`](docs/cli.md).
-- **Chain import.** `target_scopes` is required per member (DEBT-011); an empty `edges:` list is
-  legal (DEBT-013); `nova chain verify` prints configured vs executed verification commands
-  (DEBT-006).
-- **Debt sweep.** `--watch` lines print `HH:MM:SS UTC` (DEBT-012); the extension's bash analyzer
-  warns once per session, naming the command it could not classify (DEBT-005).
-- **Install and packaging.** `install.sh`, the MIT `LICENSE`, and npm publishability: the
-  `npm pack --dry-run` file list is asserted by a test, and the guarded tarball smoke runs one
-  priced task end to end when `NOVAFLOW_SMOKE=1`. Publishing is a separate, operator-approved act.
-- **Deterministic FSM** over the canonical states (`draft`, `queued`, `running`, `validating`,
-  `awaiting_gate`, `changes_requested`, `completed`, `failed`, `cancelled`), every transition
-  audited in `state_transition_logs`.
-- **Scheduling**: 5-field cron and one-shot timers, missed-run policies (`skip` /
-  `run_immediately`), pause/resume.
-- **Zero-token pre-flight**: target roots, base-worktree cleanliness, the Pi binary, budget
-  ceilings and disk availability, checked before a token is spent.
-- **Independent verification**: the engine runs the configured commands and checks protected test
-  files and write scopes after the run — a task never completes on its own say-so.
-- **Two-file logging**: `events.raw.jsonl` (verbatim, mode `0600`, never served) and
-  `events.jsonl` (scrubbed — the only read surface).
-- **Storage maintenance**: online SQLite backups (`nova daemon backup`) and raw-stream retention
-  (`nova daemon prune`).
-- **Docs indexing**: `.md`/`.txt`/`.rst` files in a workspace's `docs/` are listable
-  (`nova docs list`) and injectable into a task's prompt (`--context docs/spec.md`).
+## Is it for you?
 
-## Surfaces
+Good fit: you already run coding agents, you want unattended work with an audit trail, you care
+what it costs, and you are happy merging the results yourself.
 
-| surface | what it is | entry point |
-|---|---|---|
-| **CLI** | the operator's control surface — one command = at most one daemon op; the offline verbs say so in the table | `bin/nova` (`nova <noun> <sub>`) |
-| **MCP** | the programmatic twin, for an orchestrator agent over stdio | `nova mcp` |
-| **Pi extension** | run mode (in-session scope enforcement + result submission) and operator mode (`/nova`) | `extensions/novaflow.ts` |
+Not a fit: you want a hosted service, a web dashboard that edits code, multi-user auth, or an agent
+that merges to `main` on its own. Those are deliberate non-goals, not roadmap items.
 
-All three are thin clients of one daemon over a loopback Unix socket
-(`~/.novaflow/novaflow.sock`). The daemon is the single writer of the SQLite store; the CLI and
-MCP server never open it. NovaFlow's control plane has no TCP, no HTTP and no telemetry.
+## Documentation
 
-## Deliberately **not** in v1
+| page | covers |
+|---|---|
+| [Quick start](docs/install.md) | the two install routes, what the installer checks, the config file |
+| [Operations](docs/operations.md) | the daily loop: enqueue, step away, act when woken |
+| [Chains](docs/chains.md) | the chain format, gates, retries, verification, worktree cleanup |
+| [Profiles](docs/profiles.md) | creating, updating and deleting profiles, and how names resolve |
+| [Live view](docs/live-view.md) | the terminal screen, the browser mirror, tailnet access |
+| [CLI reference](docs/cli.md) | every verb: purpose, blocking behaviour, `--json`, exit codes |
+| [Maintaining](docs/maintaining.md) | how a release is cut and published |
 
-A NovaFlow web UI or REST/SSE engine, webhooks, remote control planes, token streaming to a
-dashboard, multi-user auth, a plugin marketplace, and any second orchestration path. No GitHub CI:
-this box is the pipeline. The tier-D browser is Pi Web's own renderer over copied files, not a
-NovaFlow server.
+Every page is listed in the [docs index](docs/index.md), with the reading order.
 
-## Where the rest lives
+## Status
 
-The [`docs/` index](docs/index.md) is one page per concept:
+Pre-1.0, single-operator by design, MIT licensed. The store is SQLite; the control plane is local.
+Back up with `nova daemon backup` and read `nova daemon status` for the version and budget in force.
 
-- [`docs/operations.md`](docs/operations.md) — the operator contract: enqueue, end the turn, get
-  woken; never sleep-poll.
-- [`docs/chains.md`](docs/chains.md) — DAG import, gates, `chain verify`, `chain clean`, and the
-  worktree lifecycle (including the single-task manual cleanup).
-- [`docs/profiles.md`](docs/profiles.md) — create/update/delete and the scope resolution rule.
-- [`docs/live-view.md`](docs/live-view.md) — tiers C and D, and the mirror rules.
-- [`docs/cli.md`](docs/cli.md) — the verb audit table: purpose, blocking, `--json`, exit codes,
-  help and fix hints.
-- [`docs/install.md`](docs/install.md) — the acquisition routes, the checks, the config file once.
-
-`npm test` runs the suite and `npm run typecheck` the type check; both must be green. The pinned
-specification lives in the workspace repo at `odd/specs/novaflow-v1/`; the golden tests fail if
-this code drifts from it.
+```bash
+npm test          # the suite
+npm run typecheck # the type check
+```

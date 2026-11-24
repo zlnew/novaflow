@@ -1,95 +1,93 @@
 # Changelog
 
-What changed for the operator, release by release. The numbers are the ones the code and the
-run records enforce; the repository history is the PR list.
+What changed for you, release by release. Newest first.
+
+## [0.4.0] — Unreleased
+
+The date is set in the release commit; until then the registry's latest version is the one above.
+
+The first release written for someone who has just heard the name. Nothing about the engine
+changed; everything about how it is explained did.
+
+- **The README now starts with what the tool does** and who it is for, then a quick start that runs
+  from a fresh machine to a queued task.
+- **Every page in `docs/` leads with its answer**, carries one worked example you can paste, and has
+  a "Common problems" table: symptom, cause, and the command that fixes it.
+- **`docs/maintaining.md` replaces the release-notes template.** It documents the release flow, what
+  each step refuses, how to verify a publication, and how to roll forward from a bad one.
+- **`./release.sh publish` publishes to npm.** It prints the package, the version and the URL, runs
+  `npm publish --dry-run`, and uploads only when you pass `--confirm`. It refuses a dirty tree, a red
+  suite, a missing local or remote tag, a version already on the registry, or a missing `--confirm`.
+- **The GitHub release body is now your changelog section.** `./release.sh tag` extracts the
+  `## [X.Y.Z]` section of this file into a notes file and refuses if the section is missing.
+- **No internal shorthand in the public docs.** A test fails the build if a ticket number, a
+  decision id, an internal date or a spec path appears in the README, the changelog or `docs/`.
 
 ## [0.3.2] — 2026-11-24
 
-**Fix:** `nova web start` now passes the bind host explicitly and probes it. Found live: the
-command spawned `pi-web --port N --no-open` with no hostname, so an exported
-`PI_WEB_HOSTNAME=0.0.0.0` in the operator's shell (inherited by the child) served every mirrored
-transcript to the LAN with authentication off. It also hardcoded the readiness probe to
-`127.0.0.1`, so an instance bound elsewhere started and was then killed as "not answering".
-
-Now: host = `PI_WEB_HOSTNAME` or loopback, passed to pi-web, used by the probe and reported by
-`nova web status` (a wildcard bind is probed on loopback, and the printed URL says loopback).
-`docs/live-view.md` gains **Access from the tailnet**: keep the bind on loopback and publish it
-with `tailscale serve --bg --https=443 http://127.0.0.1:30142` — TLS, tailnet-only, no LAN
-exposure.
+- **`nova web start` always passes the bind host explicitly.** The default is loopback; set
+  `PI_WEB_HOSTNAME` to change it. A wildcard bind is reported as a warning, and the printed URL stays
+  reachable.
+- **The readiness probe uses the same host the instance was given**, so an instance bound somewhere
+  other than loopback is no longer started and then killed as "not answering".
+- **`nova web status` reports the host it is serving.** `docs/live-view.md` shows how to publish the
+  loopback instance over a tailnet instead of widening it.
 
 ## [0.3.1] — 2026-11-24
 
-**Fix:** `install.sh`'s default route (`git clone … && sh novaflow/install.sh`) did not work on
-npm >= 12. npm now blocks dependency install scripts by default and rejects the
-`--allow-scripts` environment override in *project-scoped* installs, so the native SQLite
-binding never landed and the daemon could not start. The package now declares npm 12's
-documented project field (`allowScripts` for `better-sqlite3` and `esbuild`), the from-source
-route stops passing the invalid override, and the global/tarball route keeps it. Found by the
-v0.3.0 stranger test on npm 12.2.3 and verified end to end there: install, extension deploy,
-config written once, three next commands, binary runs, binding loads, re-run byte-identical.
+- **Installing works with npm 12.** npm now blocks a dependency's install scripts by default and
+  rejects the old environment-variable override for project installs, so the native SQLite binding
+  never built. The package now declares `allowScripts` for that one native dependency, and the
+  from-source route stops passing the invalid override. The tarball route keeps it.
 
 ## [0.3.0] — 2026-11-24
 
-The release that makes NovaFlow handable to someone else: work runs in the background, in its own
-tree, and a settled run can be read in a browser.
-
-- **Work runs in the background.** `nova task run` returns at enqueue, and the extension wakes
-  the session with one `[novaflow] …` follow-up when a transition needs a human. The operator
-  contract — enqueue, end the turn, act when woken; never sleep-poll — is written in
-  `docs/operations.md`.
-- **Each run gets its own tree.** A `git_repo` target with `read_write` access runs in
-  `.novaflow/worktrees/<run_id>/<alias>/`, with write scopes and verification commands re-rooted
-  there. A run whose worktree cannot be created is refused; there is no fallback to the shared
-  tree. Read-only git targets and plain directories run in place. Migration 0004 adds
-  `task_runs.worktree_root`.
-- **Real concurrency.** Independent ready members run in parallel: `concurrency.workspace`
-  defaults to 2 and `concurrency.global` to 4. `nova_daemon_status` reports the `inflight` count
-  and each running run's `worktree_root`.
-- **`nova chain clean <chain-run-id>`** removes a settled chain's worktrees, refuses a
-  non-terminal chain, and refuses a dirty (or unassessable) worktree without `--force`. Run rows
-  and artifacts are history and are kept.
-- **The live view.** Tier C: `nova status` and `nova status --watch`, with `HH:MM:SS UTC` on every
-  transition line. Tier D: `nova web sync|start|stop|status` mirrors **settled** runs' session
-  files into a private agent dir and serves them from a dedicated Pi Web on port 30142. Copies,
-  never links; `events.raw.jsonl` is never copied; no implicit prune. No plugin ships: the
-  installed Pi Web exposes no plugin surface.
-- **CLI UX.** `--help` on every verb prints that verb's usage, flags and one example; an unknown
-  flag is a usage error (exit 2), not a whole-program dump. One exit-code table (0–5), and
-  refusals end with a ` — fix: ` next move, listed in `docs/cli.md`.
-- **Chain import.** `target_scopes` is required on every member (DEBT-011), an empty `edges:`
-  list imports a one-task chain (DEBT-013), and `nova chain verify` prints configured versus
-  executed verification commands (DEBT-006).
-- **Debt sweep.** The extension's bash analyzer warns once per session, naming a command it could
-  not classify (DEBT-005); `--watch` lines carry the UTC zone (DEBT-012).
-- **Install and package.** `install.sh` checks Node ≥ 22, `pi`, git ≥ 2.40 and (warn-only)
-  `sqlite3`, deploys the extension and writes `~/.novaflow/config.yaml` once. The MIT `LICENSE`
-  ships. `npm pack --dry-run`'s file list is asserted; the guarded tarball smoke runs one priced
-  task end to end. Publishing is a separate, operator-approved act.
-- **Docs.** The README is written for a stranger, `docs/` is one page per concept, and this
-  changelog is the release view.
+- **Work runs in the background.** `nova task run` returns at enqueue, and the Pi extension wakes your
+  session with one `[novaflow] …` follow-up when a run needs a human. Upgrade once with
+  `nova daemon start --migrate`.
+- **Each run gets its own worktree.** A writable git target runs in
+  `.novaflow/worktrees/<run_id>/<alias>/` with write scopes and verification commands rooted there. If
+  the worktree cannot be created the run is refused — there is no fallback to your shared checkout.
+- **Real concurrency.** Independent ready tasks run in parallel: 2 per workspace and 4 per machine by
+  default, both configurable.
+- **`nova chain clean <chain-run-id>`** removes a settled chain's worktrees, refuses a chain that is
+  still running, and refuses a worktree with uncommitted changes unless you pass `--force`. Run rows
+  and result artifacts are kept.
+- **A live view.** `nova status` and `nova status --watch` give you one screen; `nova web sync`,
+  `nova web start`, `nova web status` and `nova web stop` mirror settled runs' transcripts into a
+  private Pi Web directory on port 30142. Copies, never links; only settled runs; the verbatim event
+  log is never copied; nothing is pruned without you.
+- **`nova <noun> <verb> --help`** prints that verb's usage, flags, one example and its exit codes —
+  never the whole manual. An unknown flag is a usage error, not a program dump. Refusals end with
+  ` — fix: ` and your next move.
+- **Chains.** Import refuses a member with no target scope, an empty edge list imports a one-task
+  chain, and `nova chain verify` shows configured against executed verification commands (exit 3 when
+  one never ran).
+- **Install and package.** The installer checks Node 22+, `pi`, git 2.40+ and (as a warning only)
+  `sqlite3`, deploys the extension and writes the global config once. The MIT license ships. A tarball
+  smoke test runs one priced task end to end.
 
 ## [0.2.0] — 2026-11-23
 
-The cockpit on real work: the v0.2.0 dogfood trial ran 3 tasks for `$0.0643`, and cache reads were
-88.8% of the trial's prompt tokens (1,230,016 of 1,384,732).
+- **Cost is recorded, not guessed.** Runs store fresh input, cache-read, cache-write and output
+  tokens, and `nova status` shows today and this month in dollars and runs.
+- **The status line tells you when pricing is inert.** `prices_armed` and `inert_models` name any
+  model with no price entry, instead of silently recording zero.
+- **Live follow.** `nova task logs --follow` streams a run's redacted event log, and the `--watch`
+  verbs print one line per transition.
+- **The wake watcher.** A Pi session gets one follow-up per transition that needs a human, armed on
+  session start and seeded so old history never wakes it.
+- **Profile update and delete.** Change a stored profile and its canonical file together; delete a
+  profile that no task pins (a pinned one is refused with the count).
+- **`nova daemon start --migrate`** applies pending store migrations instead of refusing an older
+  store.
 
-- **Cache-aware accounting and the spend block.** Runs record cache-read and cache-write tokens
-  and a cost basis (`priced` / `legacy`); `nova status` and `nova_daemon_status` show today and
-  month spend with `prices_armed` and `inert_models`.
-- **The transitions stream.** `nova_events_since` polls the audited transition log by cursor —
-  the only pull surface, and daemon-required.
-- **Live follow.** `nova task logs --follow` and the `--watch` views.
-- **The wake watcher.** Operator sessions get one `[novaflow] …` follow-up per transition that
-  needs a human, armed on session start and seeded at head.
-- **Profile update/delete.** Change a stored profile and its canonical file together; delete an
-  unpinned profile (a pinned one is refused, naming the count).
-- **The `--migrate` upgrade door.** `nova daemon start --migrate` applies pending store
-  migrations instead of refusing an older store.
+In a measured three-task run on this project, cache reads were 88.8% of prompt tokens (1,230,016 of
+1,384,732) and the three runs cost $0.0643.
 
 ## 0.1.x
 
-- **0.1.4** — the scope guard: a task with no target scopes is refused at enqueue (DEBT-010).
-- **0.1.3** — profile resolution: the workspace-scoped profile wins over a global one of the same
-  name.
-- **0.1.2** — the `bin` field: `nova` is the installed entry point.
+- **0.1.4** — a task with no target scope is refused at enqueue, before any work is spent.
+- **0.1.3** — a workspace-scoped profile wins over a global profile of the same name.
+- **0.1.2** — `nova` is installed as the command, from the package's `bin` entry.
 - **0.1.1** — first public release.

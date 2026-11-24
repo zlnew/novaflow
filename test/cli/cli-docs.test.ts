@@ -88,18 +88,14 @@ test("docs/cli.md's exit-code table is the code module's table, row for row", ()
   assert.deepEqual([...documented].sort(), [...EXIT_CODE_VALUES]);
 });
 
-test("docs/cli.md documents the help contract and names the messages still lacking a fix hint", () => {
+test("docs/cli.md documents the help contract and the fix hint every refusal carries", () => {
   const doc = readFileSync(DOC, "utf8");
   assert.match(doc, /nova <noun> <verb> --help/, "the help section is gone");
   assert.match(doc, /never the whole manual/, "the help rule is not stated");
   assert.match(doc, /Every error names the fix/, "the fix-hint rule is gone");
-  assert.match(
-    doc,
-    /remaining refusals still lack the marker/,
-    "the P13 follow-up list (messages without a fix hint) is gone",
-  );
-  // the three worst refusals are named there
-  for (const subject of ["graph import", "unscoped-run", "inert-prices"]) {
+  assert.match(doc, / — fix: /, "the separator the refusals end with is not shown");
+  // the refusals an operator meets first are named, each with its next move
+  for (const subject of ["graph import", "no target scope", "price table"]) {
     assert.ok(doc.includes(subject), `docs/cli.md does not name the fixed refusal "${subject}"`);
   }
 });
