@@ -15,7 +15,8 @@
 #   * `npm link` symlinks this checkout into the global prefix, so the CLI
 #     runs against the exact tree `npm install` just prepared and
 #     `git pull && sh install.sh` upgrades it in place.
-# A registry install becomes the default in the release that publishes.
+# This script installs from the checkout you cloned; `npm install -g novaflow`
+# installs the published package instead (same code, no checkout).
 #
 # Usage:
 #   sh install.sh                                  # --from-source (default)
@@ -57,7 +58,8 @@ usage: sh install.sh [--from-source | --from-tarball <pkg.tgz>] [--start] [--for
 NovaFlow installer (novaflow-v030 R3.1).
 
   --from-source          install this checkout's dependencies and link it
-                         globally (DEFAULT: the registry has no release yet)
+                         globally, from this checkout (DEFAULT); the published
+                         package is `npm install -g novaflow`
   --from-tarball <pkg>   install a packed artifact (`npm pack`) globally
   --start                also start the daemon: nova daemon start --migrate
   --force-ext            overwrite a different ~/.pi/agent/extensions/novaflow.ts

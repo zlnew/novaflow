@@ -1,38 +1,53 @@
-# `nova` CLI reference — the verb audit (srs 4.1.1, v0.3.0 W4)
+# The `nova` CLI — every verb
 
-`nova` is a thin client of the daemon's JSONL socket: one command is one op
-call, and the CLI never opens the SQLite store. This page is the operator's
-complete map of the surface — every verb, what it is for, whether it returns
-or blocks, whether `--json` is supported, and which exit codes it can emit.
+`nova` is a thin client: one command is one call to the daemon, and the CLI never opens the store
+itself. This page is the full surface in one table — every verb, what it does, whether it waits,
+whether it speaks JSON, and which exit codes it can produce.
 
-The table is not prose that drifts: `src/cli/verbs.ts` is the single verb
-table, `src/cli/help.ts` renders help from it, the dispatcher refuses a verb
-that is not in it, and `test/cli/cli-docs.test.ts` reads this file and fails
-the build when a row is missing or disagrees with the table.
+You will not read this top to bottom. Use it to answer three questions: *is this command going to
+sit there?*, *what does exit 3 mean?*, and *what is this verb actually for?*
+
+## How to read the table
+
+| column | the question it answers |
+| --- | --- |
+| **verb** | the exact words to type, in the order the program lists them |
+| **purpose** | what one call does, in one line |
+| **blocking** | whether the command returns, returns at enqueue, or waits — see below |
+| **`--json`** | whether the verb can print one JSON document instead of a table; every read verb can |
+| **exit codes** | every code this verb can exit with, out of the table further down |
+
+## What "blocking" means for an operator
+
+| value | what you get |
+| --- | --- |
+| `returns` | the daemon answers, the command prints, the shell is yours again. Almost everything. |
+| `returns at enqueue` | `nova task run` queues the task and exits; the work continues in the daemon |
+| `blocks to completion` | `nova mcp` serves until its client disconnects, because it is a server |
+
+`--watch` and `--follow` are opt-in and are for a human at a terminal. They appear in the help text
+of the verbs that accept them, never in a script: a script that passes `--watch` is a script that
+hangs. When you want to wait for an outcome in a script, poll `nova task status --json` yourself, or
+use the MCP tools, which never block.
 
 ## Help
 
 | request | answer | exit |
 | --- | --- | --- |
-| `nova <noun> <verb> --help` (or `-h`) | that verb's usage, flags and one example | 0 |
+| `nova <noun> <verb> --help` (or `-h`) | that verb's usage, flags, one example and its exit codes | 0 |
 | `nova <noun> --help` | the noun's verbs, one line each | 0 |
-(a one-verb noun — `status`, `version`, `mcp` — prints that verb's usage)
 | `nova help <noun>` | the same noun list | 0 |
-| `nova help` (or bare `nova`) | the program overview (`nova help` prints it on stdout, bare `nova` on stderr) | 0 (`nova help`), 2 (bare `nova`) |
-| an unknown FLAG on a known verb | that verb's usage | 2 |
+| `nova help` (or bare `nova`) | the program overview (`nova help` prints it on stdout, bare `nova` on stderr) | 0 for `nova help`, 2 for bare `nova` |
+| an unknown flag on a known verb | that verb's usage | 2 |
 | an unknown noun or subcommand | the program overview | 2 |
 
-`--help` is intercepted by the dispatcher before any noun module parses
-flags: `nova chain verify --help` answers with `chain verify`'s own usage,
-flags and one example — never the whole manual. (This replaced the observed
-defect: an unknown `--help` flag, then the entire program dump.)
+`--help` is intercepted before any flag parsing, so `nova chain verify --help` answers with that
+verb's own usage, flags and one example — **never the whole manual**. A one-verb noun (`status`,
+`version`, `mcp`) prints its usage the same way.
 
 ## Exit codes
 
-Every code in this table is emitted somewhere in the CLI, and nothing else
-is. The map lives in `src/cli/exitcode.ts` (`EXIT_CODES`); the test
-`test/cli/exitcode.test.ts` writes this table into `docs/cli.md`'s shape and
-walks every verb's `exits` list so a new code without a row fails the build.
+Six codes, and nothing else. Scripts can rely on them.
 
 | exit | short | meaning |
 | --- | --- | --- |
@@ -43,12 +58,11 @@ walks every verb's `exits` list so a new code without a row fails the build.
 | 4 | not-found | not found (unknown id, key, slug or schedule) |
 | 5 | offline | daemon unreachable (no socket, or no answer) |
 
-## Verbs
+Exit `2` also prints the verb's usage block, which is itself the fix. Exit `3` means the request was
+well formed and the engine said no — a chain that is still running, a task in the wrong state, a
+verification command that never ran. Exit `5` means start the daemon.
 
-`blocking` is the operator's question: does the verb return as soon as the
-work is queued, or does it wait? `returns at enqueue` is `task run` (it
-queues and exits; `--watch` opts into waiting); `blocks to completion` is the
-MCP stdio server. Every other verb returns after its one op call.
+## Verbs
 
 | verb | purpose | blocking | --json | exit codes |
 | --- | --- | --- | --- | --- |
@@ -107,52 +121,44 @@ MCP stdio server. Every other verb returns after its one op call.
 | `nova mcp` | serve the MCP control surface on stdio (a server, not a one-shot command) | blocks to completion | no | 0 1 2 |
 | `nova docs list` | list the workspace docs index (the selectable --context options) | returns | yes | 0 2 4 5 |
 
-Every read verb supports `--json` (one JSON document on stdout): the audit
-found no gaps, and `test/cli/help.test.ts` walks the same verb table so a new
-read verb that forgets `--json` fails instead of shipping a table-only
-surface. `nova mcp` is the one verb without it: its stdout is the MCP
-protocol channel.
+Every read verb supports `--json`: one JSON document on stdout, no table, no colour. `nova mcp` is
+the single exception — its stdout is the protocol channel, so a JSON document there would corrupt
+the stream.
 
 ## Every error names the fix
 
-A refusal ends with the operator's next move, marked the same way everywhere
-(`src/fixhint.ts`, separator ` — fix: `):
+A refusal ends with your next move, marked the same way everywhere: ` — fix: `. The message before
+the marker says what was wrong; the clause after it names the command to run. A script that
+captures stderr sees the same next move a human sees on the screen.
 
+```text
+nova: schema_invalid: the chain graph must declare a non-empty string "project_slug" — fix: correct the graph file and re-run `nova project import-dag <file>`
 ```
-nova: schema_invalid: the chain graph must declare a non-empty string "project_slug" (§4.3 required key) — fix: correct the graph file (…) and re-run `nova project import-dag <file>`
-```
 
-The three worst refusals carry a hint as of v0.3.0 P12:
+The refusals you are most likely to meet, and what each one tells you to do:
 
-| refusal | where | next move it names |
-| --- | --- | --- |
-| graph import `schema_invalid` (every validator message, plus the import op's own shape errors) | `src/chain/graph.ts`, `src/daemon/server.ts` | correct the graph file, re-run `nova project import-dag <file>` |
-| the DEBT-010 unscoped-run refusal (`task … carries no target_scopes`) | `src/tasks.ts` | add a scope (`nova task create … --scope <repo_alias>`), re-run `nova task run <id|key>` |
-| the inert-prices note (`prices.json missing/unparseable — cost budget enforcement inert`) | `src/runs/prices.ts` | write `<prices path>` with the model's per-1M-token rates, re-run the task |
+| refusal | next move it names |
+| --- | --- |
+| graph import `schema_invalid` | correct the graph file, then re-run `nova project import-dag <file>` |
+| no target scope on a task (`task … carries no target_scopes`) | add one with `nova task create … --scope <repo_alias>`, then re-run `nova task run <id|key>` |
+| the price table is missing or unparsable (`cost budget enforcement inert`) | write `~/.novaflow/prices.json` with the model's per-million-token rates, then `nova task retry <id|key>` |
+| a live daemon already answers at the socket | check it with `nova daemon status`, or stop it with `nova daemon stop` |
+| a live Pi Web already answers at the URL | browse that URL, or stop it with `nova web stop` |
+| `port <n> is already in use` | stop the process holding it, or set `NOVAFLOW_PIWEB_PORT` to a free port |
+| `the daemon did not answer <socket> within 15 s` | read the log tail printed below the message, fix the cause, re-run the start command |
+| `workspace "<slug>" is archived — task execution is disabled` | create a new workspace with `nova workspace create <name> --path <dir>` and re-create the task there |
+| `no project "<ident>"` | `nova project list`, then pass the exact slug |
+| `no profile named "<name>"` | `nova profile list`, then fix the name or create the profile in that scope |
+| `no such task: <id>` / `no task with key "<key>"` | `nova task list` |
+| `profile "<name>" is pinned by N task(s)` | pin new tasks to a different profile; a pinned profile is never deleted |
+| a name that is not lower-case kebab-case | use lower-case letters, digits and hyphens, e.g. `my-workspace` |
+| `root_path is not an existing writable directory` | `mkdir -p <path>`, make it writable, re-run the verb |
+| `--lines must be an integer 1..1000` | pass a value in range, e.g. `--lines 100` |
+| `NOVAFLOW_STATUS_WATCH_MS must be a number >= 50` | set a whole number of milliseconds >= 50, or unset it for the two-second default |
+| `nova web sync --run` on a live run | follow it with `nova task status <id> --watch`, then sync again once it settles |
 
-Usage errors are their own fix: exit 2 prints the verb's usage block, which
-IS the next move. The message on the line above it also names the fix
-(` — fix: `), so a script that captures stderr sees the same next move a
-human sees on the screen.
+The `--target alias=path[:type]` suffix defaults to `directory`, which runs in place. Use
+`:git_repo` for a target that gets per-run worktrees (its base must be a clean git repo).
 
-P13 applied the carried list: every refusal on that list now ends with the
-separator, one clause naming the move. On the P13 list, remaining refusals still lack the marker: none. The list and its next moves:
-
-- `a live daemon already answers at <socket> — refusing to start a second one` (`daemon start`) — fix: check it with `nova daemon status`, or stop it with `nova daemon stop`.
-- `a live pi-web already answers at <url> (pid N) — refusing to start a second one` (`web start`) — fix: browse the URL, or stop it with `nova web stop`.
-- `port <port> is already in use — held by …; refusing to start pi-web on a busy port` (`web start`) — fix: stop the process holding the port, or set `NOVAFLOW_PIWEB_PORT` to a free port.
-- `the daemon did not answer <socket> within 15 s` / `pi-web did not answer <url> within 15 s` / `pi-web exited … before answering` (the start commands) — fix: read the log tail below, fix the cause it names, then re-run the start command.
-- `workspace "<slug>" is <status> — task execution is disabled (FR-WS-03); …` (`nova_task_run`) — fix: create a new workspace with `nova workspace create <name> --path <dir>` and re-create the task there.
-- `no project "<ident>" in the active workspace` / `no project "<slug>" in workspace "<slug>"` / `no project "<slug>" in any workspace` (task create, project status/phase, the project lookup) — fix: list projects with `nova project list` and pass the exact slug.
-- `no profile named "<name>" in …` (`profile validate`, enqueue, chain import's project lookup, profile update/delete) — fix: list the profiles in scope with `nova profile list`.
-- `no such task: <id>` / `no task with key "<key>" in workspace "<slug>"` (task/schedule/run reads via the wire `not_found`) — fix: list tasks with `nova task list`.
-- `profile "<name>" (…) is pinned by N task(s) — a pinned profile is never deleted …` (the FK-safe `profile delete` refusal) — fix: pin new tasks to a different profile (`nova task create … --profile <other>`), since v1 has no task reassign or delete.
-- `workspace name must be lower-case kebab-case (…), got "<name>"` / `project name must be lower-case kebab-case (…), got "<name>"` (`workspace create`, `project create`) — fix: use lower-case letters, digits and hyphens, e.g. `my-workspace`.
-- `root_path is not an existing writable directory: <path>` (`workspace create`) — fix: create the directory (`mkdir -p <path>`), make it writable, then re-run the verb.
-- `--lines must be an integer 1..1000` / `--retention-days must be a non-negative integer (days)` (usage errors naming the rule) — fix: pass a value in range, e.g. `--lines 100` / `--retention-days 30`.
-- `NOVAFLOW_STATUS_WATCH_MS must be a number >= 50 (milliseconds)` (`status --watch`) — fix: set a whole number of milliseconds >= 50, or unset it for the 2000 ms default.
-- the `web sync --run` live-run refusal — fix: follow it live with `nova status --watch`, then re-run `nova web sync --run <id|key>` once it settles.
-
-The three refusals fixed in P12 keep their hints and their table above: graph
-import `schema_invalid`, the DEBT-010 unscoped-run refusal, and the
-inert-prices note.
+Usage errors are their own fix: exit 2 prints the verb's usage block, and the line above it carries
+the same ` — fix: ` marker.
