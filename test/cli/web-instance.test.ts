@@ -40,7 +40,7 @@ function runNova(args: string[], env: Record<string, string>, timeoutMs = 60_000
   const res = spawnSync(NOVA, args, {
     encoding: "utf8",
     timeout: timeoutMs,
-    env: { ...process.env, ...env },
+    env: { ...process.env, PI_WEB_HOSTNAME: "", ...env },
   });
   return { code: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
 }
@@ -66,6 +66,30 @@ async function freePort(): Promise<number> {
   const port = typeof address === "object" && address !== null ? address.port : 0;
   await new Promise<void>((resolve) => server.close(() => resolve()));
   return port;
+}
+
+/** A tiny fake pi-web: records its argv, then serves /api/sessions on the asked host. */
+function writeFakePiweb(dir: string): { bin: string; argvLog: string } {
+  const argvLog = join(dir, "piweb-argv.log");
+  const bin = join(dir, "fake-pi-web.mjs");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+import { createServer } from "node:http";
+import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+const args = process.argv.slice(2);
+const opt = (name, dflt) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : dflt; };
+const host = opt("--hostname", "127.0.0.1");
+const port = Number(opt("--port", "0"));
+createServer((req, res) => {
+  res.setHeader("content-type", "application/json");
+  res.end(JSON.stringify({ sessions: [], runningSessionIds: [] }));
+}).listen(port, host, () => {});
+`,
+  );
+  spawnSync("chmod", ["755", bin]);
+  return { bin, argvLog };
 }
 
 function get(port: number, path: string): Promise<number> {
@@ -336,4 +360,35 @@ test("nova web start/stop/status appear in the help text (the 4.1.1 web verbs)",
   assert.match(res.stdout, /nova web stop/);
   assert.match(res.stdout, /nova web status/);
   assert.match(res.stdout, /nova status \[--watch\]/);
+});
+
+test("nova web start passes an explicit --hostname and probes that host (DEBT-016)", async () => {
+  const h = mkdtempSync(join(tmpdir(), "novaflow-webhost-"));
+  const port = await freePort();
+  const { bin, argvLog } = writeFakePiweb(h);
+  const env = {
+    NOVAFLOW_HOME: h,
+    NOVAFLOW_PIWEB_BIN: bin,
+    NOVAFLOW_PIWEB_PORT: String(port),
+  };
+  try {
+    const started = runNova(["web", "start"], env);
+    assert.equal(started.code, 0, `[start] failed: ${started.stderr}`);
+    const argv = JSON.parse(readFileSync(argvLog, "utf8").trim().split("\n").pop() ?? "[]") as string[];
+    // pi-web binds 0.0.0.0 when nobody tells it otherwise, and with auth off
+    // that exposed every mirrored transcript to the LAN — so the host is
+    // ALWAYS passed explicitly, loopback by default.
+    const i = argv.indexOf("--hostname");
+    assert.ok(i >= 0, `argv must carry --hostname (got ${JSON.stringify(argv)})`);
+    assert.equal(argv[i + 1], "127.0.0.1", "the default bind host is loopback");
+
+    const status = runNova(["web", "status", "--json"], env);
+    assert.equal(status.code, 0, `[status] failed: ${status.stderr}`);
+    const parsed = JSON.parse(status.stdout) as { url: string; answering: boolean };
+    assert.equal(parsed.url, `http://127.0.0.1:${port}`, "status reports the bound host, not a guess");
+    assert.equal(parsed.answering, true, "the readiness probe targets the bound host");
+  } finally {
+    runNova(["web", "stop"], env);
+    rmSync(h, { recursive: true, force: true });
+  }
 });
