@@ -64,3 +64,28 @@ The destination is Pi Web's own layout, derived from the session's recorded cwd:
 
 Pi Web stays **read-only** for NovaFlow. Gate approvals, aborts, retries and follow-ups stay on
 the CLI, MCP and the chat; the browser is a transcript view over copied files.
+
+## Access from the tailnet
+
+The instance belongs on loopback. To read runs from a phone or another machine, let
+Tailscale publish it — never widen the bind:
+
+```bash
+nova web start                                   # binds 127.0.0.1:30142
+tailscale serve --bg --https=443 http://127.0.0.1:30142
+tailscale serve status                           # shows https://<node>.<tailnet>.ts.net
+```
+
+That gives you `https://<node>.<tailnet>.ts.net/` with Tailscale's own TLS, reachable only from
+devices on your tailnet (nothing is exposed to the LAN or the internet).
+
+**Why not `--hostname 0.0.0.0`:** with Pi Web's authentication off by default, a wildcard bind
+serves every mirrored transcript to anything on the same network — a real exposure found on
+2026-11-24 (DEBT-016). `nova web start` therefore always passes the bind host explicitly
+(loopback unless you set `PI_WEB_HOSTNAME`), probes that host for readiness, and reports it in
+`nova web status`. If you have `PI_WEB_HOSTNAME=0.0.0.0` exported in your shell for a
+hand-run Pi Web, unset it before `nova web start` — your environment is inherited by the child.
+
+`tailscale serve` needs HTTPS enabled for the tailnet (admin console → DNS → HTTPS
+Certificates). `--bg` persists across restarts; `tailscale serve reset` removes it.
+

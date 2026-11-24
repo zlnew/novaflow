@@ -122,8 +122,23 @@ function piwebPort(): number {
   return port;
 }
 
-function piwebUrl(port: number): string {
-  return `http://127.0.0.1:${port}`;
+/** The bind host: PI_WEB_HOSTNAME when set, else loopback (DEBT-016 — the bind is
+ *  never widened by default; tailnet access belongs to `tailscale serve`). */
+function piwebHost(): string {
+  const raw = process.env["PI_WEB_HOSTNAME"];
+  const host = raw === undefined ? "" : raw.trim();
+  return host === "" ? "127.0.0.1" : host;
+}
+
+function piwebUrl(host: string, port: number): string {
+  return `http://${probeHost(host)}:${port}`;
+}
+
+/** A wildcard bind is reachable on loopback, and `0.0.0.0` is not an address a
+ *  client can dial on every platform — probes and the printed URL use loopback
+ *  for it while the child still receives the host it was given. */
+function probeHost(host: string): string {
+  return host === "0.0.0.0" || host === "::" || host === "" ? "127.0.0.1" : host;
 }
 
 /** `pi-web` on PATH, or the documented injection override (tests). */
@@ -415,7 +430,7 @@ async function sync(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise
 /* ------------------------------- nova web start ------------------------------- */
 
 /** Any answer (or a silent bound socket) means the port is taken. */
-function portBusy(port: number, timeoutMs = 1200): Promise<boolean> {
+function portBusy(host: string, port: number, timeoutMs = 1200): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
     const done = (v: boolean): void => {
@@ -424,7 +439,7 @@ function portBusy(port: number, timeoutMs = 1200): Promise<boolean> {
       sock.destroy();
       resolve(v);
     };
-    const sock = connect({ host: "127.0.0.1", port });
+    const sock = connect({ host, port });
     sock.setTimeout(timeoutMs, () => done(true)); // bound but silent: treat as busy
     sock.once("connect", () => done(true));
     sock.once("error", () => done(false));
@@ -432,10 +447,10 @@ function portBusy(port: number, timeoutMs = 1200): Promise<boolean> {
 }
 
 /** One GET, resolving the status code (0 when nothing answered within the bound). */
-function httpGet(port: number, path: string, timeoutMs = 1500): Promise<number> {
+function httpGet(host: string, port: number, path: string, timeoutMs = 1500): Promise<number> {
   return new Promise((resolve) => {
     const req = request(
-      { host: "127.0.0.1", port, path, method: "GET", timeout: timeoutMs },
+      { host, port, path, method: "GET", timeout: timeoutMs },
       (res) => {
         res.resume();
         resolve(res.statusCode ?? 0);
@@ -451,22 +466,23 @@ function httpGet(port: number, path: string, timeoutMs = 1500): Promise<number> 
 }
 
 /** Pi Web answers `/api/sessions` with 2xx once its server is up. */
-async function apiAnswers(port: number): Promise<boolean> {
-  const status = await httpGet(port, "/api/sessions");
+async function apiAnswers(host: string, port: number): Promise<boolean> {
+  const status = await httpGet(probeHost(host), port, "/api/sessions");
   return status >= 200 && status < 300;
 }
 
 async function startInstance(opts: CommandOpts): Promise<number> {
   const port = piwebPort();
   const root = piwebRoot();
-  const url = piwebUrl(port);
+  const host = piwebHost();
+  const url = piwebUrl(host, port);
   const pidPath = piwebPidPath();
   const logPath = piwebLogPath();
 
   // an instance we already launched: refuse a second one (the daemon rule)
   const existing = readPid(pidPath);
   if (existing !== null) {
-    if (pidAlive(existing) && (await apiAnswers(port))) {
+    if (pidAlive(existing) && (await apiAnswers(host, port))) {
       console.error(
         withFixHint(
           `nova: a live pi-web already answers at ${url} (pid ${existing}) — refusing to start a second one`,
@@ -479,7 +495,7 @@ async function startInstance(opts: CommandOpts): Promise<number> {
   }
 
   // a busy port is somebody else's server: name it, never kill it
-  if (await portBusy(port)) {
+  if (await portBusy(probeHost(host), port)) {
     console.error(
       withFixHint(
         `nova: port ${port} is already in use — held by ${portHolder(port)}; refusing to start pi-web on a busy port`,
@@ -498,7 +514,11 @@ async function startInstance(opts: CommandOpts): Promise<number> {
   // the private agent dir: Pi Web reads <root>/sessions, nothing else is ours
   mkdirSync(piwebSessionsRoot(), { recursive: true });
   const logFd = openSync(logPath, "a");
-  const child = spawn(bin, ["--port", String(port), "--no-open"], {
+  // DEBT-016: the bind host is explicit. pi-web binds 0.0.0.0 when it is not
+  // told otherwise, and with authentication off that exposed every mirrored
+  // transcript to the LAN. Loopback is the default; tailnet access is
+  // `tailscale serve`, never a widened bind.
+  const child = spawn(bin, ["--port", String(port), "--hostname", host, "--no-open"], {
     detached: true,
     cwd: root,
     stdio: ["ignore", logFd, logFd],
@@ -509,7 +529,7 @@ async function startInstance(opts: CommandOpts): Promise<number> {
 
   const deadline = Date.now() + START_BOUND_MS;
   for (;;) {
-    if (await apiAnswers(port)) break;
+    if (await apiAnswers(host, port)) break;
     if (child.exitCode !== null) {
       await reapGroup(child.pid);
       console.error(
@@ -536,6 +556,16 @@ async function startInstance(opts: CommandOpts): Promise<number> {
   }
 
   writeFileSync(pidPath, `${child.pid}\n`);
+  if (probeHost(host) !== host) {
+    console.error(
+      withFixHint(
+        `nova: warning: pi-web is bound to ${host} (a wildcard) with authentication ${
+          process.env["PI_WEB_PASSWORD"] === undefined ? "DISABLED" : "enabled"
+        } — every mirrored transcript is reachable from this network`,
+        "unset PI_WEB_HOSTNAME for a loopback bind and publish it with: tailscale serve --bg --https=443 http://127.0.0.1:30142",
+      ),
+    );
+  }
   if (opts.json) {
     console.log(
       JSON.stringify({
@@ -602,9 +632,10 @@ async function instanceStatus(opts: CommandOpts): Promise<number> {
   const pidPath = piwebPidPath();
   const pid = readPid(pidPath);
   const running = pid !== null && pidAlive(pid);
-  const answering = await apiAnswers(port);
+  const host = piwebHost();
+  const answering = await apiAnswers(host, port);
   const mirrored = countMirroredRuns();
-  const url = piwebUrl(port);
+  const url = piwebUrl(host, port);
   const payload = {
     running,
     pid,
