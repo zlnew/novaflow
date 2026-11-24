@@ -2,9 +2,7 @@
 
 What changed for you, release by release. Newest first.
 
-## [0.4.0] — Unreleased
-
-The date is set in the release commit; until then the registry's latest version is the one above.
+## [0.4.0] — 2026-11-24
 
 The first release written for someone who has just heard the name. Nothing about the engine
 changed; everything about how it is explained did.
