@@ -136,10 +136,11 @@ describe('core/fsm start', () => {
     const box = pool.make();
     const project = seedProject(box, 'novaflow-v3');
     const task = seedTask(box, project.slug, 'jwt-authentication');
-    startTask(box.db, { id: task.key, by: 'agent-a', lease_sec: 30, now: NOW });
+    startTask(box.db, { id: task.key, by: 'agent-a', session_ref: 'thread://a', lease_sec: 30, now: NOW });
 
     const takeover = startTask(box.db, { id: task.key, by: 'agent-b', lease_sec: 60, now: later(31) });
     assert.equal(takeover.task.claimed_by, 'agent-b');
+    assert.equal(takeover.task.session_ref, null, 'session_ref clears when claimant changes without --ref');
     assert.equal(takeover.task.lease_expires_at, later(91).toISOString());
     assert.deepEqual(takeover.task.started_at, NOW.toISOString(), 'started_at is preserved');
     const payload = events(box.db, task.id).at(-1)?.payload as { take_over?: { claimed_by: string; expired: boolean } };

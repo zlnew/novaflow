@@ -139,6 +139,9 @@ export function appendEventWithSeq(db: DatabaseSync, input: AppendEventInput): E
 }
 
 const RELATIVE_SINCE = /^([1-9][0-9]*)([smhdw])$/;
+const ISO_DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/;
+const ISO_DATE_TIME =
+  /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(?:[Zz]|[+-]\d{2}:?\d{2})?$/;
 const UNIT_MS: Record<string, number> = {
   s: 1000,
   m: 60_000,
@@ -146,6 +149,12 @@ const UNIT_MS: Record<string, number> = {
   d: 86_400_000,
   w: 604_800_000,
 };
+
+function isValidCalendarDate(year: number, month: number, day: number): boolean {
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const check = new Date(Date.UTC(year, month - 1, day));
+  return check.getUTCFullYear() === year && check.getUTCMonth() === month - 1 && check.getUTCDate() === day;
+}
 
 /**
  * Normalizes `--since` into an ISO-8601 UTC timestamp
@@ -163,7 +172,27 @@ export function parseSince(value: string, now: Date): string {
     return new Date(now.getTime() - amount * unit).toISOString();
   }
 
-  const padded = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? `${raw}T00:00:00.000Z` : raw;
+  const dateOnly = ISO_DATE_ONLY.exec(raw);
+  const dateTime = dateOnly === null ? ISO_DATE_TIME.exec(raw) : null;
+  if (dateOnly === null && dateTime === null) {
+    throw validationError(
+      `Invalid --since value ${JSON.stringify(value)}.`,
+      'Pass an ISO-8601 timestamp (2026-11-28T03:30:00Z) or a duration like 30m, 2h, 7d.',
+    );
+  }
+
+  const parts = (dateOnly ?? dateTime)!;
+  const year = Number(parts[1]);
+  const month = Number(parts[2]);
+  const day = Number(parts[3]);
+  if (!isValidCalendarDate(year, month, day)) {
+    throw validationError(
+      `Invalid --since value ${JSON.stringify(value)}.`,
+      'Pass an ISO-8601 timestamp (2026-11-28T03:30:00Z) or a duration like 30m, 2h, 7d.',
+    );
+  }
+
+  const padded = dateOnly !== null ? `${raw}T00:00:00.000Z` : raw;
   const hasZone = /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(padded);
   const parsed = new Date(hasZone ? padded : `${padded}Z`);
   if (Number.isNaN(parsed.getTime())) {

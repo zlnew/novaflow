@@ -804,8 +804,13 @@ function claimFields(task: TaskRow, input: ClaimFieldInput): ClaimFields {
     : input.by !== null || input.takeover !== null
       ? null
       : task.lease_expires_at;
+  const claimantChanged = claimedBy !== task.claimed_by;
   const sessionRef =
-    input.session_ref === undefined ? task.session_ref : nonEmpty(input.session_ref);
+    input.session_ref !== undefined
+      ? nonEmpty(input.session_ref)
+      : claimantChanged
+        ? null
+        : task.session_ref;
 
   return { claimed_by: claimedBy, session_ref: sessionRef, lease_expires_at: leaseExpiresAt };
 }

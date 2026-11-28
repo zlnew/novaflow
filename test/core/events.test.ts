@@ -142,7 +142,7 @@ describe('core/events since parsing', () => {
   });
 
   it('rejects malformed and zero-length durations with exit 2', () => {
-    for (const value of ['', '0s', 'm', '30', '1.5h', '2026-13-45T00:00:00Z', 'now']) {
+    for (const value of ['', '0s', 'm', '5', '30', '2026', 'Nov 28 2026', '2026-11-28 03:30', '2026-02-30', '1.5h', '2026-13-45T00:00:00Z', 'now']) {
       assert.throws(() => parseSince(value, NOW), expectNovaError('VALIDATION_ERROR', 2), value);
     }
   });
