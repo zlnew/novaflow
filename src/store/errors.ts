@@ -5,12 +5,22 @@
  * stable domain code and the CLI exit code it maps to (`novaflow-v100/cli` §2.3).
  */
 
-/** Domain error codes emitted by the store layer. */
+/**
+ * Domain error codes emitted by the store and core layers.
+ *
+ * The full set is pinned by `novaflow-v100/cli` §2.3 and `novaflow-v100/mcp` §3:
+ * `VALIDATION_ERROR`, `NOT_FOUND`, `WORKSPACE_NOT_FOUND`, `STATE_CONFLICT`,
+ * `ALREADY_CLAIMED`, `UNMET_DEPENDENCIES`, `CYCLE_DETECTED`, `INTERNAL_ERROR`,
+ * `SCHEMA_TOO_NEW`.
+ */
 export type NovaErrorCode =
   | 'VALIDATION_ERROR'
   | 'NOT_FOUND'
   | 'WORKSPACE_NOT_FOUND'
   | 'STATE_CONFLICT'
+  | 'ALREADY_CLAIMED'
+  | 'UNMET_DEPENDENCIES'
+  | 'CYCLE_DETECTED'
   | 'INTERNAL_ERROR'
   | 'SCHEMA_TOO_NEW';
 
@@ -23,6 +33,9 @@ export const EXIT_CODES: Record<NovaErrorCode, ExitCode> = {
   NOT_FOUND: 4,
   WORKSPACE_NOT_FOUND: 4,
   STATE_CONFLICT: 3,
+  ALREADY_CLAIMED: 3,
+  UNMET_DEPENDENCIES: 3,
+  CYCLE_DETECTED: 3,
   INTERNAL_ERROR: 1,
   SCHEMA_TOO_NEW: 1,
 };
