@@ -2,6 +2,10 @@
 
 What changed for you, release by release. Newest first.
 
+## [1.0.1] — unreleased
+
+Write what changed for the user, then run ./release.sh tag.
+
 ## [1.0.0] — 2026-11-28
 
 Clean-slate redesign of NovaFlow as a local-first, daemonless CLI and MCP orchestration ledger.

@@ -4,7 +4,7 @@ description: Drive NovaFlow workspaces, projects, and tasks. Query next ready wo
 license: MIT
 compatibility: "Requires novaflow >= 1.0.0 CLI on PATH"
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
   author: "zlnew"
 ---
 
