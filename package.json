@@ -1,20 +1,21 @@
 {
   "name": "novaflow",
-  "version": "0.4.0",
-  "description": "Deterministic orchestration for chains of Pi coding-agent tasks: per-run git worktrees, gates, verification, and a live operator view.",
+  "version": "1.0.0",
+  "description": "Daemonless, local-first task ledger for coding agents: SQLite-backed workspaces, projects, and tasks with DAG dependencies, leases, handoff context, a CLI, and an MCP server.",
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=24.0.0"
   },
   "bin": {
-    "nova": "./bin/nova"
+    "novaflow": "./bin/novaflow"
   },
   "files": [
+    "dist/",
     "bin/",
-    "src/",
-    "extensions/",
-    "docs/",
+    "skills/",
+    "README.md",
+    "LICENSE",
     "CHANGELOG.md"
   ],
   "repository": {
@@ -22,37 +23,35 @@
     "url": "git+https://github.com/zlnew/novaflow.git"
   },
   "keywords": [
-    "pi",
-    "coding-agent",
+    "novaflow",
+    "agentskills",
     "agent-orchestration",
     "orchestration",
-    "workflow",
-    "fsm",
-    "sqlite",
+    "orchestrator",
     "cli",
     "mcp",
+    "sqlite",
+    "tasks",
+    "task-queue",
     "dag",
-    "worktree",
-    "task-queue"
+    "workflow",
+    "fsm",
+    "local-first",
+    "daemonless"
   ],
   "scripts": {
-    "test": "tsx --test \"test/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "prepublishOnly": "npm run typecheck && npm test"
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx --test \"test/**/*.test.ts\"",
+    "prepublishOnly": "npm run typecheck && npm run build && npm test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
-    "better-sqlite3": "^12.2.0",
-    "tsx": "^4.20.0"
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.6.0",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
     "typescript": "^5.9.0"
-  },
-  "allowScripts": {
-    "esbuild@0.28.2": true,
-    "better-sqlite3@12.11.1": true
   }
 }

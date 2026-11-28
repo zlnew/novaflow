@@ -1,59 +1,39 @@
-import { EXIT_OK } from "../exitcode.ts";
-import { parseArgs, UsageError } from "../args.ts";
-import { socketPath as defaultSocketPath, defaultDbPath } from "../client.ts";
-import type { CommandOpts } from "../opts.ts";
-
 /**
- * `nova mcp` (mcp.md §2: "a subcommand of the same Node.js binary as the
- * CLI; no separate service of its own").
+ * `novaflow mcp` — stateless stdio MCP server (`novaflow-v100/mcp`).
  *
- * This command STARTS A SERVER and serves MCP over stdio until its client
- * disconnects. Consequences, spelled out because they are easy to get
- * wrong (mcp.md §2 + §4):
+ * The command's whole job is dispatch: build the server, attach stdio, and serve
+ * until `stdin` closes. `--workspace` gives every tool call its fallback target;
+ * a call's own `workspace` argument still wins (`novaflow-v100/mcp` §1).
  *
- *   - stdout is the PROTOCOL CHANNEL. Nothing decorative may be printed
- *     there; every diagnostic goes to stderr via the server's own logging.
- *   - the srs 4.1.1 CLI exit map does NOT apply to this command. That map
- *     maps taxonomy codes for one-shot commands; `daemon_unreachable` is
- *     here a TOOL-level error code (mcp.md §4) and does not end the
- *     server — the client may still call read-only tools, which serve from
- *     SQLite while the daemon is down. Exit 5 therefore has no meaning
- *     here, and returning it would misreport a healthy session.
- *   - the honest exit is 0 when the client disconnects: a session that
- *     ended because the client hung up is a normal end of service, per the
- *     stdio lifecycle in §2 ("stateless per connection").
- *   - a start-up failure BEFORE the transport is listening (unreadable
- *     stdio, a connect error) is an operation failure and returns 1.
- *
- * Only the common flags are parsed here: `--json`/`--watch` are accepted by
- * the dispatcher's pre-scan but have no meaning for a stdio server, so
- * they are ignored rather than refused (the CLI's own convention: options
- * are per-noun, and this noun has none).
- *
- * The MCP server module is imported DYNAMICALLY, exactly like
- * `daemon start --foreground` reaches the lifecycle: the read-only
- * fallback (src/mcp/read.ts → src/store/readonly.ts) needs the SQLite
- * driver, and dragging a database driver into the startup path of every
- * other `nova` command would break the thin-client rule that keeps the CLI
- * a pure socket client (pinned by test/cli/discipline.test.ts).
+ * The result is marked `silent` because the transport owns `stdout`: writing a
+ * success envelope here would corrupt the JSON-RPC framing.
  */
-export async function mcpCommand(argv: string[], opts: CommandOpts): Promise<number> {
-  // A stray positional would silently be ignored — refuse instead of
-  // pretending `nova mcp something` means `nova mcp`. An unknown FLAG is the
-  // parser's usage error (exit 2 + this verb's usage block, W4 R4.1).
-  const p = parseArgs(argv, {});
-  if (p.positionals.length > 0) {
-    throw new UsageError(`nova mcp takes no arguments (got "${p.positionals.join(" ")}")`);
-  }
-  void opts;
-  try {
-    const { runStdioServer } = await import("../../mcp/server.ts");
-    await runStdioServer({ socketPath: defaultSocketPath(), dbPath: defaultDbPath() });
-    return EXIT_OK;
-  } catch (err) {
-    // Only reachable when the transport never came up — after a successful
-    // connect the promise resolves on client disconnect instead.
-    console.error(`nova: mcp failed to start: ${(err as Error).message}`);
-    return 1;
-  }
-}
+import { TOOL_NAMES, runStdioServer } from '../../mcp/index.js';
+import type { CommandModule, VerbSpec } from '../types.js';
+
+const mcpVerb: VerbSpec = {
+  verb: null,
+  command: 'mcp',
+  summary: 'Serve the NovaFlow workspace, project, task, event, and export tools over stdio',
+  usage: 'novaflow mcp [--workspace <name|path>]',
+  positionals: [],
+  flags: [],
+  examples: ['novaflow mcp', 'novaflow mcp --workspace personal', 'novaflow mcp -w ~/www/personal'],
+  run: async (ctx) => {
+    await runStdioServer({
+      workspace: ctx.options.workspace ?? null,
+      env: ctx.env,
+      cwd: ctx.cwd,
+    });
+    return {
+      data: { transport: 'stdio', tool_count: TOOL_NAMES.length, closed: true },
+      silent: true,
+    };
+  },
+};
+
+export const mcpModule: CommandModule = {
+  name: 'mcp',
+  summary: 'Stateless stdio MCP server for the same core operations.',
+  verbs: [mcpVerb],
+};

@@ -1,132 +1,240 @@
-import { daemonRequest } from "../client.ts";
-import { parseArgs, UsageError, type ParsedArgs, type ArgSpec } from "../args.ts";
-import { renderTable } from "../format.ts";
-import { writeActiveWorkspace } from "../active.ts";
-import { workspaceContext } from "../context.ts";
-import type { CommandOpts } from "../opts.ts";
-
 /**
- * `nova workspace …` (srs 4.1.1): create/list/switch/archive/unregister.
- * Thin translators over the daemon ops — every write goes through the
- * socket (single-writer rule, architecture 8.1). `--json` prints the
- * op's data envelope, single-line.
- *
- * switch is CLI-local state by ruling (documented in src/cli/active.ts):
- * the marker is validated against the daemon's registry and written to
- * <NOVAFLOW_HOME>/active-workspace; the daemon has no switch op.
+ * `novaflow workspace` — create, list, show, update, register, unregister
+ * (`novaflow-v100/cli` §3.1).
  */
+import {
+  createWorkspace,
+  listWorkspaces,
+  registerWorkspace,
+  showWorkspace,
+  unregisterWorkspace,
+  updateWorkspace,
+} from '../../core/workspace.js';
+import { rejectCombined, requireFlag } from '../args.js';
+import { bucket, countsLine, detail, orDash, table, yesNo } from '../format.js';
+import { identifiers } from '../output.js';
+import { afterWorkspaceCreate, afterWorkspaceUpdate } from '../next-actions.js';
+import type { CommandModule, VerbSpec } from '../types.js';
 
-/** Every command accepts the common flags --workspace/--json/--watch. */
-const SPEC: ArgSpec = {
-  valueFlags: ["path", "default-branch", "workspace"],
+const createVerb: VerbSpec = {
+  verb: 'create',
+  command: 'workspace.create',
+  summary: 'Create a workspace, scaffold .novaflow/ and register it globally',
+  usage: 'novaflow workspace create [--name <slug>] [--path <dir>] [--gitignore] [--default]',
+  positionals: [],
+  flags: [
+    { name: 'name', kind: 'string', placeholder: '<slug>', description: 'Workspace name (default: slugified --path basename)' },
+    { name: 'path', kind: 'string', placeholder: '<dir>', description: 'Directory that will hold .novaflow/ (default: cwd)' },
+    { name: 'gitignore', kind: 'boolean', description: 'Append .novaflow/ to the nearest git root .gitignore' },
+    { name: 'default', kind: 'boolean', description: 'Mark the new workspace as the registry default' },
+  ],
+  examples: [
+    'novaflow workspace create --name personal --path ~/www/personal',
+    'novaflow workspace create --name scratch --path ./scratch --gitignore --default',
+  ],
+  run: (ctx) => {
+    const result = createWorkspace({
+      name: ctx.args.get('name') ?? null,
+      path: ctx.args.get('path') ?? null,
+      gitignore: ctx.args.has('gitignore'),
+      set_default: ctx.args.has('default'),
+      env: ctx.env,
+      cwd: ctx.cwd,
+      now: ctx.now,
+      dry_run: ctx.options.dryRun,
+    });
+    const name = result.workspace.name;
+    const human = result.dry_run
+      ? `Dry run: would create workspace ${name} at ${result.workspace.path}\nNo files written.\n`
+      : `Created workspace ${name} at ${result.workspace.root}\nRegistry: ${result.registry_path}\n`;
+    return { data: result, human, quiet: identifiers([name]), next_actions: afterWorkspaceCreate(name) };
+  },
 };
 
-export async function workspaceCommand(argv: string[], opts: CommandOpts): Promise<number> {
-  const p = parseArgs(argv, SPEC);
-  const sub = p.positionals[0];
-  switch (sub) {
-    case "create":
-      return create(p, opts.json);
-    case "list":
-      return list(p, opts.json);
-    case "switch":
-      return switchTo(p, opts.json);
-    case "archive":
-      return archive(p, opts.json);
-    case "unregister":
-      return unregister(p, opts.json);
-    default:
-      throw new UsageError(`nova workspace [create|list|switch|archive|unregister]${unknown(sub)}`);
-  }
-}
+const listVerb: VerbSpec = {
+  verb: 'list',
+  command: 'workspace.list',
+  summary: 'List registered workspaces with the active and default markers',
+  usage: 'novaflow workspace list',
+  positionals: [],
+  flags: [],
+  examples: ['novaflow workspace list', 'novaflow workspace list --quiet'],
+  run: (ctx) => {
+    const result = listWorkspaces({ env: ctx.env, cwd: ctx.cwd });
+    const rows = result.workspaces.map((entry) => [
+      entry.name,
+      entry.root,
+      yesNo(entry.exists),
+      yesNo(entry.is_default),
+      yesNo(entry.is_active),
+      orDash(entry.defaults?.project ?? null),
+    ]);
+    const human = table(['NAME', 'PATH', 'EXISTS', 'DEFAULT', 'ACTIVE', 'DEFAULT PROJECT'], rows);
+    return {
+      data: result,
+      human: result.workspaces.length === 0 ? `${human}(no workspaces registered)\n` : human,
+      quiet: identifiers(result.workspaces.map((entry) => entry.name)),
+      next_actions: [
+        { command: 'novaflow workspace create --name <name>', description: 'Create and register a workspace' },
+      ],
+    };
+  },
+};
 
-function unknown(sub: string | undefined): string {
-  return sub === undefined ? "" : ` — unknown subcommand "${sub}"`;
-}
+const showVerb: VerbSpec = {
+  verb: 'show',
+  command: 'workspace.show',
+  summary: 'Show resolved workspace metadata, path, project count and task counts',
+  usage: 'novaflow workspace show [name]',
+  positionals: ['[name]'],
+  minPositionals: 0,
+  flags: [],
+  examples: ['novaflow workspace show', 'novaflow workspace show personal --json'],
+  run: (ctx) => {
+    const name = ctx.args.positionals[0];
+    const result = showWorkspace({
+      workspace: name ?? ctx.options.workspace ?? null,
+      env: ctx.env,
+      cwd: ctx.cwd,
+      now: ctx.now,
+    });
+    const human = `${detail([
+      ['name', result.name],
+      ['root', result.root],
+      ['path', result.path],
+      ['workspace_id', result.workspace_id],
+      ['created_at', result.created_at],
+      ['source', result.source],
+      ['default_project', orDash(result.defaults.project)],
+      ['projects', `${result.projects.active} active, ${result.projects.paused} paused, ${result.projects.archived} archived`],
+      ['tasks', countsLine(bucket(result.tasks))],
+    ])}`;
+    return {
+      data: result,
+      human,
+      quiet: identifiers([result.name]),
+      next_actions: [
+        { command: `novaflow project list --workspace ${result.name}`, description: 'List this workspace\'s projects' },
+        { command: `novaflow status --workspace ${result.name}`, description: 'Review the board summary' },
+      ],
+    };
+  },
+};
 
-async function create(p: ParsedArgs, json: boolean): Promise<number> {
-  const name = p.positionals[1];
-  const path = p.values.get("path");
-  if (name === undefined || path === undefined) {
-    throw new UsageError("nova workspace create <name> --path <dir> [--default-branch b]");
-  }
-  const args: Record<string, unknown> = { name, root_path: path };
-  const branch = p.values.get("default-branch");
-  if (branch !== undefined) args["default_branch"] = branch;
-  const data = (await daemonRequest("nova_workspace_create", args)) as {
-    id: string;
-    workspace: { slug: string; root_path: string; status: string; created_at: string };
-  };
-  if (json) console.log(JSON.stringify(data));
-  else {
-    console.log(`created workspace ${data.workspace.slug} (id ${data.id})`);
-    console.log(`  root: ${data.workspace.root_path}`);
-  }
-  return 0;
-}
+const updateVerb: VerbSpec = {
+  verb: 'update',
+  command: 'workspace.update',
+  summary: 'Update the workspace name, default project, or registry default',
+  usage:
+    'novaflow workspace update [--name <new>] [--default-project <slug>] [--clear-default-project] [--set-default]',
+  positionals: [],
+  flags: [
+    { name: 'name', kind: 'string', placeholder: '<new>', description: 'New workspace name (config.yaml and registry together)' },
+    {
+      name: 'default-project',
+      kind: 'string',
+      placeholder: '<slug>',
+      description: 'Default project for task commands in this workspace',
+    },
+    { name: 'clear-default-project', kind: 'boolean', description: 'Clear the workspace default project' },
+    { name: 'set-default', kind: 'boolean', description: 'Mark this workspace as the registry default' },
+  ],
+  examples: [
+    'novaflow workspace update --name personal-2',
+    'novaflow workspace update --default-project novaflow-v3',
+    'novaflow workspace update --clear-default-project',
+  ],
+  run: (ctx) => {
+    rejectCombined(ctx.args, 'default-project', 'clear-default-project');
+    const name = ctx.args.get('name');
+    const defaultProject = ctx.args.get('default-project');
+    const clear = ctx.args.has('clear-default-project');
 
-async function list(p: ParsedArgs, json: boolean): Promise<number> {
-  void p;
-  const data = (await daemonRequest("nova_workspace_list")) as {
-    workspaces: Array<Record<string, unknown>>;
-  };
-  if (json) {
-    console.log(JSON.stringify(data));
-    return 0;
-  }
-  console.log(
-    renderTable(data.workspaces, [
-      { key: "slug", header: "SLUG" },
-      { key: "status", header: "STATUS" },
-      { key: "root_path", header: "ROOT" },
-      { key: "id", header: "ID" },
-    ]),
-  );
-  return 0;
-}
+    const result = updateWorkspace({
+      workspace: ctx.options.workspace ?? null,
+      ...(name === undefined ? {} : { name }),
+      ...(defaultProject === undefined && !clear ? {} : { default_project: clear ? null : (defaultProject as string) }),
+      set_default: ctx.args.has('set-default'),
+      env: ctx.env,
+      cwd: ctx.cwd,
+      now: ctx.now,
+      dry_run: ctx.options.dryRun,
+    });
 
-async function switchTo(p: ParsedArgs, json: boolean): Promise<number> {
-  const slug = p.positionals[1];
-  if (slug === undefined) {
-    throw new UsageError("nova workspace switch <slug>");
-  }
-  const ctx = await workspaceContext(slug); // not_found when the slug is unknown
-  writeActiveWorkspace(ctx.slug);
-  if (json) console.log(JSON.stringify({ active: ctx.slug, id: ctx.id }));
-  else console.log(`active workspace: ${ctx.slug} (${ctx.id})`);
-  return 0;
-}
+    const changed = result.changed.length === 0 ? 'no changes' : `changed ${result.changed.join(', ')}`;
+    const human = result.dry_run
+      ? `Dry run: would update workspace ${result.workspace.name} (${changed}).\nNo files written.\n`
+      : `Updated workspace ${result.workspace.name} (${changed}).\n`;
+    return {
+      data: result,
+      human,
+      quiet: identifiers([result.workspace.name]),
+      next_actions: afterWorkspaceUpdate(result.workspace.name),
+    };
+  },
+};
 
-function identArg(slugOrId: string): Record<string, string> {
-  return /^[0-9A-HJKMNP-TV-Z]{26}$/.test(slugOrId) ? { workspace_id: slugOrId } : { slug: slugOrId };
-}
+const registerVerb: VerbSpec = {
+  verb: 'register',
+  command: 'workspace.register',
+  summary: 'Register an existing .novaflow/ directory in the global registry',
+  usage: 'novaflow workspace register --path <dir> [--name <slug>]',
+  positionals: [],
+  flags: [
+    { name: 'name', kind: 'string', placeholder: '<slug>', description: 'Registered name (default: name in config.yaml)' },
+    { name: 'path', kind: 'string', placeholder: '<dir>', description: 'Directory that already holds .novaflow/' },
+  ],
+  examples: ['novaflow workspace register --path ~/www/personal'],
+  run: (ctx) => {
+    const path = requireFlag(ctx.args, 'path', 'workspace.register');
+    const result = registerWorkspace({
+      name: ctx.args.get('name') ?? null,
+      path,
+      env: ctx.env,
+      cwd: ctx.cwd,
+      now: ctx.now,
+      dry_run: ctx.options.dryRun,
+    });
+    const human = result.dry_run
+      ? `Dry run: would register workspace ${result.name} at ${result.root}\nNo registry changes written.\n`
+      : `Registered workspace ${result.name} at ${result.root}\nRegistry: ${result.registry_path}\n`;
+    return {
+      data: result,
+      human,
+      quiet: identifiers([result.name]),
+      next_actions: result.dry_run
+        ? []
+        : [{ command: `novaflow workspace show ${result.name}`, description: 'Inspect the registered workspace' }],
+    };
+  },
+};
 
-async function archive(p: ParsedArgs, json: boolean): Promise<number> {
-  const slug = p.positionals[1];
-  if (slug === undefined) {
-    throw new UsageError("nova workspace archive <slug>");
-  }
-  const data = (await daemonRequest("nova_workspace_archive", identArg(slug))) as {
-    slug: string;
-    status: string;
-  };
-  if (json) console.log(JSON.stringify(data));
-  else console.log(`workspace ${data.slug}: ${data.status} (task execution disabled; logs stay read-only)`);
-  return 0;
-}
+const unregisterVerb: VerbSpec = {
+  verb: 'unregister',
+  command: 'workspace.unregister',
+  summary: 'Remove a workspace from the global registry (the directory is kept)',
+  usage: 'novaflow workspace unregister <name>',
+  positionals: ['<name>'],
+  flags: [],
+  examples: ['novaflow workspace unregister scratch'],
+  run: (ctx) => {
+    const name = ctx.args.positionals[0] as string;
+    const result = unregisterWorkspace({ name, env: ctx.env, dry_run: ctx.options.dryRun });
+    return {
+      data: result,
+      human: result.dry_run
+        ? `Dry run: would unregister workspace ${result.name}.\nNo registry changes written.\n`
+        : `Unregistered workspace ${result.name}. Its .novaflow/ directory was not touched.\n`,
+      quiet: identifiers([result.name]),
+      next_actions: result.dry_run
+        ? []
+        : [{ command: 'novaflow workspace list', description: 'Confirm the registry contents' }],
+    };
+  },
+};
 
-async function unregister(p: ParsedArgs, json: boolean): Promise<number> {
-  const slug = p.positionals[1];
-  if (slug === undefined) {
-    throw new UsageError("nova workspace unregister <slug>");
-  }
-  const data = (await daemonRequest("nova_workspace_unregister", identArg(slug))) as {
-    unregistered: string;
-  };
-  if (json) console.log(JSON.stringify(data));
-  else {
-    console.log(`unregistered workspace ${data.unregistered}`);
-    console.log("  the registry entry was removed; files on disk were NOT touched");
-  }
-  return 0;
-}
+export const workspaceModule: CommandModule = {
+  name: 'workspace',
+  summary: 'Create, inspect, and register NovaFlow workspaces.',
+  verbs: [createVerb, listVerb, showVerb, updateVerb, registerVerb, unregisterVerb],
+};

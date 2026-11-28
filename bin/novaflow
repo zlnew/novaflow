@@ -1,0 +1,10 @@
+#!/usr/bin/env node
+'use strict';
+
+// NovaFlow launcher. Loads the compiled ESM entry point next to this bin.
+import('../dist/cli/index.js').catch((error) => {
+  const message = error && error.message ? error.message : String(error);
+  process.stderr.write(`novaflow: failed to start: ${message}\n`);
+  process.stderr.write('novaflow: run "npm run build" (or reinstall) so dist/cli/index.js exists.\n');
+  process.exit(1);
+});

@@ -1,266 +1,266 @@
-import { daemonRequest, OpFailureError } from "../client.ts";
-import { parseArgs, UsageError, type ArgSpec } from "../args.ts";
-import { renderKv, renderTable } from "../format.ts";
-import { workspaceContext } from "../context.ts";
-import { operatorActor } from "../context.ts";
-import { readFileSync } from "node:fs";
-import type { CommandOpts } from "../opts.ts";
-import { withFixHint } from "../../fixhint.ts";
-
 /**
- * `nova project …` (srs 4.1.1): create/list/status/phase.
- * FR-PRJ-01 (targets), FR-PRJ-02 (free-text phase labels, audited),
- * FR-PRJ-03 (per-target base branch / access mode).
- *
- * Target flag syntax (documented): `--target alias=path[:type]` where
- * type is the DDL token `git_repo` or `directory`; omitted type is
- * `directory` (v1's plain-path default). Repeating --target appends
- * targets in order.
+ * `novaflow project` — create, list, show, update, archive
+ * (`novaflow-v100/cli` §3.2).
  */
+import {
+  archiveProject,
+  createProject,
+  listProjects,
+  showProject,
+  updateProject,
+} from '../../core/project.js';
+import { validationError } from '../../core/errors.js';
+import type { ProjectStatus } from '../../core/model.js';
+import { rejectCombined, requireFlag } from '../args.js';
+import { withWorkspace } from '../context.js';
+import { bucket, countsLine, detail, orDash, snippet, table } from '../format.js';
+import { identifiers } from '../output.js';
+import { afterProjectCreate, afterProjectUpdate } from '../next-actions.js';
+import type { CommandModule, VerbSpec } from '../types.js';
 
-const SPEC: ArgSpec = {
-  valueFlags: ["objective", "workspace", "project"],
-  repeatableFlags: ["target"],
+const PROJECT_STATUSES = ['active', 'paused', 'archived', 'all'] as const;
+
+const createVerb: VerbSpec = {
+  verb: 'create',
+  command: 'project.create',
+  summary: 'Create a project with a derived slug and a unique key prefix',
+  usage:
+    'novaflow project create --title <title> [--slug <slug>] [--prefix <PFX>] [--objective <text>] [--path <dir>] [--verify <cmd>] [--tag <t>]...',
+  positionals: [],
+  flags: [
+    { name: 'title', kind: 'string', placeholder: '<title>', description: 'Human project title (required)' },
+    { name: 'slug', kind: 'string', placeholder: '<slug>', description: 'Explicit kebab-case slug (default: derived from --title)' },
+    { name: 'prefix', kind: 'string', placeholder: '<PFX>', description: 'Explicit key prefix (default: derived, collision-suffixed)' },
+    { name: 'objective', kind: 'string', placeholder: '<text>', description: 'One-line project objective' },
+    { name: 'path', kind: 'string', placeholder: '<dir>', description: 'Repo or folder hint recorded on the project' },
+    { name: 'verify', kind: 'string', placeholder: '<cmd>', description: 'Verification command metadata' },
+    { name: 'tag', kind: 'string', placeholder: '<t>', repeatable: true, description: 'Project tag (repeatable)' },
+  ],
+  examples: [
+    'novaflow project create --title novaflow-v3 --objective "Rebuild the orchestrator"',
+    'novaflow project create --title api --prefix API --tag backend',
+  ],
+  run: (ctx) => {
+    requireFlag(ctx.args, 'title', 'project.create');
+    const result = withWorkspace(ctx, (db) =>
+      createProject(db, {
+        title: ctx.args.get('title') as string,
+        slug: ctx.args.get('slug') ?? null,
+        prefix: ctx.args.get('prefix') ?? null,
+        objective: ctx.args.get('objective') ?? null,
+        repo_path: ctx.args.get('path') ?? null,
+        verify_cmd: ctx.args.get('verify') ?? null,
+        tags: ctx.args.getAll('tag'),
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    const project = result.project;
+    const human = result.dry_run
+      ? `Dry run: would create project ${project.slug} (${project.prefix}).\nNo rows written.\n`
+      : `Created project ${project.slug} (${project.prefix}) — ${project.title}\n`;
+    return {
+      data: result,
+      human,
+      quiet: identifiers([project.slug]),
+      next_actions: result.dry_run ? [] : afterProjectCreate(project),
+    };
+  },
 };
 
-const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
-
-export async function projectCommand(argv: string[], opts: CommandOpts): Promise<number> {
-  const p = parseArgs(argv, SPEC);
-  const sub = p.positionals[0];
-  switch (sub) {
-    case "create":
-      return create(p, opts);
-    case "list":
-      return list(p, opts);
-    case "status":
-      return status(p, opts);
-    case "phase":
-      return phase(p, opts);
-    case "import-dag":
-      return importDag(p, opts);
-    default:
-      throw new UsageError(`nova project [create|list|status|phase|import-dag]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`);
-  }
-}
-
-type TargetInput = {
-  alias: string;
-  root_path: string;
-  target_type: "git_repo" | "directory";
+const listVerb: VerbSpec = {
+  verb: 'list',
+  command: 'project.list',
+  summary: 'List projects with prefix, task counts and objective snippet',
+  usage: 'novaflow project list [--status active|paused|archived|all]',
+  positionals: [],
+  flags: [
+    {
+      name: 'status',
+      kind: 'string',
+      placeholder: '<active|paused|archived|all>',
+      description: 'Project status filter (default: active)',
+    },
+  ],
+  examples: ['novaflow project list', 'novaflow project list --status all --quiet'],
+  run: (ctx) => {
+    const requested = ctx.args.get('status') ?? 'active';
+    if (!(PROJECT_STATUSES as readonly string[]).includes(requested)) {
+      throw validationError(
+        `Invalid project status ${JSON.stringify(requested)}.`,
+        `Use one of: ${PROJECT_STATUSES.join(', ')}.`,
+      );
+    }
+    const projects = withWorkspace(ctx, (db) => listProjects(db, { status: requested as ProjectStatus | 'all', now: ctx.now }));
+    const rows = projects.map((project) => [
+      project.prefix,
+      project.slug,
+      project.status,
+      String(project.counts.todo),
+      String(project.counts.ready),
+      String(project.counts.in_progress),
+      String(project.counts.blocked),
+      String(project.counts.done),
+      String(project.counts.total),
+      snippet(project.objective),
+    ]);
+    return {
+      data: { projects },
+      human:
+        projects.length === 0
+          ? `${table(['PREFIX', 'SLUG', 'STATUS', 'TODO', 'READY', 'WIP', 'BLOCKED', 'DONE', 'TOTAL', 'OBJECTIVE'], rows)}(no projects with status ${requested})\n`
+          : table(['PREFIX', 'SLUG', 'STATUS', 'TODO', 'READY', 'WIP', 'BLOCKED', 'DONE', 'TOTAL', 'OBJECTIVE'], rows),
+      quiet: identifiers(projects.map((project) => project.slug)),
+      next_actions: [
+        { command: 'novaflow project create --title <title>', description: 'Create another project' },
+        { command: 'novaflow status', description: 'Review the workspace board' },
+      ],
+    };
+  },
 };
 
-function parseTargetFlag(value: string, index: number): TargetInput {
-  const eq = value.indexOf("=");
-  if (eq < 1) {
-    throw new UsageError(`--target #${index + 1} must be alias=path[:git_repo|directory], got "${value}"`);
-  }
-  const alias = value.slice(0, eq);
-  let rest = value.slice(eq + 1);
-  let type: "git_repo" | "directory" = "directory"; // documented default
-  const colon = rest.lastIndexOf(":");
-  if (colon > 0) {
-    const suffix = rest.slice(colon + 1);
-    if (suffix === "git_repo" || suffix === "directory") {
-      type = suffix;
-      rest = rest.slice(0, colon);
-    }
-  }
-  if (rest === "") {
-    throw new UsageError(`--target #${index + 1} has an empty path`);
-  }
-  return { alias, root_path: rest, target_type: type };
-}
-
-async function create(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const name = p.positionals[1];
-  const objective = p.values.get("objective");
-  if (name === undefined || objective === undefined) {
-    throw new UsageError("nova project create <name> --objective <text> [--target alias=path[:type]]...");
-  }
-  const ctx = await workspaceContext(opts.workspace ?? p.values.get("workspace"));
-  const targets = (p.lists.get("target") ?? []).map(parseTargetFlag);
-  const data = (await daemonRequest("nova_project_create", {
-    workspace_id: ctx.id,
-    name,
-    objective,
-    ...(targets.length > 0 ? { targets } : {}),
-  })) as {
-    project: { id: string; slug: string; phase: string };
-    targets: Array<{ alias: string }>;
-  };
-  if (opts.json) console.log(JSON.stringify(data));
-  else {
-    console.log(`created project ${data.project.slug} (id ${data.project.id}, phase ${data.project.phase})`);
-    for (const t of data.targets) console.log(`  target: ${t.alias}`);
-  }
-  return 0;
-}
-
-async function list(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const explicit = p.values.get("workspace") ?? opts.workspace;
-  // scoped to the active workspace when one exists; otherwise every
-  // workspace's projects (documented — the op's no-arg behavior)
-  let workspaceId: string | undefined;
-  if (explicit !== undefined) {
-    workspaceId = (await workspaceContext(explicit)).id;
-  } else {
-    try {
-      workspaceId = (await workspaceContext()).id;
-    } catch (err) {
-      if (err instanceof OpFailureError || err instanceof UsageError) workspaceId = undefined;
-      else throw err;
-    }
-  }
-  const data = (await daemonRequest("nova_project_list",
-    workspaceId !== undefined ? { workspace_id: workspaceId } : {})) as {
-    projects: Array<Record<string, unknown>>;
-  };
-  if (opts.json) {
-    console.log(JSON.stringify(data));
-    return 0;
-  }
-  console.log(
-    renderTable(data.projects, [
-      { key: "slug", header: "SLUG" },
-      { key: "phase", header: "PHASE" },
-      { key: "status", header: "STATUS" },
-      { key: "target_count", header: "TARGETS" },
-      { key: "id", header: "ID" },
-    ]),
-  );
-  return 0;
-}
-
-/** Resolve <id|slug> to a project id within the active workspace. */
-async function resolveProject(
-  ident: string,
-  workspaceOverride: string | undefined,
-): Promise<string> {
-  const ctx = await workspaceContext(workspaceOverride);
-  // bare ULIDs verified within the active workspace (cross-scope ids refuse)
-  const data = (await daemonRequest("nova_project_list", { workspace_id: ctx.id })) as {
-    projects: Array<{ id: string; slug: string }>;
-  };
-  const row = data.projects.find((x) => x.slug === ident || x.id === ident);
-  if (row === undefined) {
-    throw new OpFailureError(
-      "not_found",
-      withFixHint(`no project "${ident}" in workspace ${ctx.slug}`, "list projects with `nova project list` and pass the exact slug"),
+const showVerb: VerbSpec = {
+  verb: 'show',
+  command: 'project.show',
+  summary: 'Show project details, task status breakdown and ready/blocked counts',
+  usage: 'novaflow project show <project>',
+  positionals: ['<project>'],
+  flags: [],
+  examples: ['novaflow project show novaflow-v3', 'novaflow project show NV3 --json'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const project = withWorkspace(ctx, (db, resolved) =>
+      showProject(db, {
+        project: id,
+        env: ctx.env,
+        config: resolved.config,
+        now: ctx.now,
+      }),
     );
-  }
-  return row.id;
-}
+    const human = detail([
+      ['slug', project.slug],
+      ['prefix', project.prefix],
+      ['title', project.title],
+      ['status', project.status],
+      ['objective', orDash(project.objective)],
+      ['repo_path', orDash(project.repo_path)],
+      ['verify_cmd', orDash(project.verify_cmd)],
+      ['tags', project.tags.length === 0 ? '-' : project.tags.join(', ')],
+      ['created_at', project.created_at],
+      ['updated_at', project.updated_at],
+      ['tasks', countsLine(bucket(project.counts))],
+    ]);
+    return {
+      data: { project },
+      human,
+      quiet: identifiers([project.slug]),
+      next_actions: [
+        { command: `novaflow task list --project ${project.slug}`, description: 'List this project\'s tasks' },
+        { command: `novaflow task create --title "<title>" --project ${project.slug}`, description: 'Add a task' },
+      ],
+    };
+  },
+};
 
-async function status(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const ident = p.positionals[1];
-  if (ident === undefined) {
-    throw new UsageError("nova project status <id|slug>");
-  }
-  const projectId = await resolveProject(ident, opts.workspace ?? p.values.get("workspace"));
-  const data = (await daemonRequest("nova_project_status", { project_id: projectId })) as {
-    project: Record<string, unknown>;
-    task_counts: Record<string, number>;
-    targets: Array<Record<string, unknown>>;
-  };
-  if (opts.json) {
-    console.log(JSON.stringify(data));
-    return 0;
-  }
-  const project = data.project;
-  console.log(
-    renderKv([
-      ["id", String(project["id"])],
-      ["slug", String(project["slug"])],
-      ["objective", String(project["objective"])],
-      ["phase", String(project["phase"])],
-      ["status", String(project["status"])],
-      ["created_at", String(project["created_at"])],
-    ]),
-  );
-  const counts = Object.entries(data.task_counts)
-    .map(([state, n]) => `${state}=${n}`)
-    .join(" ");
-  console.log(`tasks: ${counts === "" ? "(none)" : counts}`);
-  if (data.targets.length > 0) {
-    console.log(
-      renderTable(data.targets, [
-        { key: "alias", header: "TARGET" },
-        { key: "target_type", header: "TYPE" },
-        { key: "default_access", header: "ACCESS" },
-        { key: "base_branch", header: "BASE" },
-      ]),
+const updateVerb: VerbSpec = {
+  verb: 'update',
+  command: 'project.update',
+  summary: 'Update project metadata, tags, or status (the prefix is immutable once tasks exist)',
+  usage:
+    'novaflow project update <project> [--title <t>] [--objective <o>] [--clear-objective] [--path <dir>] [--clear-repo-path] [--verify <cmd>] [--clear-verify] [--tag <t>]... [--clear-tags] [--status active|paused|archived]',
+  positionals: ['<project>'],
+  flags: [
+    { name: 'title', kind: 'string', placeholder: '<t>', description: 'New title' },
+    { name: 'objective', kind: 'string', placeholder: '<o>', description: 'New objective' },
+    { name: 'clear-objective', kind: 'boolean', description: 'Clear the objective' },
+    { name: 'path', kind: 'string', placeholder: '<dir>', description: 'New repo/folder hint' },
+    { name: 'clear-repo-path', kind: 'boolean', description: 'Clear the repo/folder hint' },
+    { name: 'verify', kind: 'string', placeholder: '<cmd>', description: 'New verification command metadata' },
+    { name: 'clear-verify', kind: 'boolean', description: 'Clear the verification command metadata' },
+    { name: 'tag', kind: 'string', placeholder: '<t>', repeatable: true, description: 'Replace the full tag list (repeatable)' },
+    { name: 'clear-tags', kind: 'boolean', description: 'Clear every tag' },
+    { name: 'status', kind: 'string', placeholder: '<active|paused|archived>', description: 'New project status' },
+  ],
+  examples: [
+    'novaflow project update novaflow-v3 --objective "Ship the CLI"',
+    'novaflow project update novaflow-v3 --status paused',
+    'novaflow project update novaflow-v3 --tag core --tag cli',
+  ],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    rejectCombined(ctx.args, 'objective', 'clear-objective');
+    rejectCombined(ctx.args, 'path', 'clear-repo-path');
+    rejectCombined(ctx.args, 'verify', 'clear-verify');
+    rejectCombined(ctx.args, 'tag', 'clear-tags');
+
+    const objective = ctx.args.has('clear-objective') ? '' : ctx.args.get('objective');
+    const repoPath = ctx.args.has('clear-repo-path') ? '' : ctx.args.get('path');
+    const verifyCmd = ctx.args.has('clear-verify') ? '' : ctx.args.get('verify');
+    const tags = ctx.args.getAll('tag');
+
+    const result = withWorkspace(ctx, (db, resolved) =>
+      updateProject(db, {
+        project: id,
+        env: ctx.env,
+        config: resolved.config,
+        ...(ctx.args.get('title') === undefined ? {} : { title: ctx.args.get('title') as string }),
+        ...(objective === undefined ? {} : { objective }),
+        ...(repoPath === undefined ? {} : { repo_path: repoPath }),
+        ...(verifyCmd === undefined ? {} : { verify_cmd: verifyCmd }),
+        ...(tags.length === 0 && !ctx.args.has('clear-tags') ? {} : { tags: ctx.args.has('clear-tags') ? [] : tags }),
+        ...(ctx.args.get('status') === undefined ? {} : { status: ctx.args.get('status') as ProjectStatus }),
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
     );
-  }
-  return 0;
-}
 
-async function phase(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const ident = p.positionals[1];
-  const label = p.positionals.slice(2).join(" ");
-  if (ident === undefined || label === "") {
-    throw new UsageError("nova project phase <id|slug> <label...>");
-  }
-  const projectId = await resolveProject(ident, opts.workspace ?? p.values.get("workspace"));
-  const data = (await daemonRequest("nova_project_phase_set", {
-    project_id: projectId,
-    phase: label,
-    actor: operatorActor(),
-  })) as { phase: string; changed: boolean };
-  if (opts.json) console.log(JSON.stringify(data));
-  else {
-    console.log(
-      data.changed
-        ? `project phase: ${data.phase} (change audited)`
-        : `project phase already: ${data.phase} (no change, nothing audited)`,
+    const changed = result.changed.length === 0 ? 'no changes' : `changed ${result.changed.join(', ')}`;
+    return {
+      data: result,
+      human: result.dry_run
+        ? `Dry run: would update project ${result.project.slug} (${changed}).\nNo rows written.\n`
+        : `Updated project ${result.project.slug} (${changed}).\n`,
+      quiet: identifiers([result.project.slug]),
+      next_actions: result.dry_run ? [] : afterProjectUpdate(result.project),
+    };
+  },
+};
+
+const archiveVerb: VerbSpec = {
+  verb: 'archive',
+  command: 'project.archive',
+  summary: 'Archive a project (shorthand for update --status archived)',
+  usage: 'novaflow project archive <project>',
+  positionals: ['<project>'],
+  flags: [],
+  examples: ['novaflow project archive novaflow-v3'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const result = withWorkspace(ctx, (db, resolved) =>
+      archiveProject(db, {
+        project: id,
+        env: ctx.env,
+        config: resolved.config,
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
     );
-  }
-  return 0;
-}
+    const changed = result.changed.length === 0 ? 'already archived' : 'archived';
+    return {
+      data: result,
+      human: result.dry_run
+        ? `Dry run: would archive project ${result.project.slug}.\nNo rows written.\n`
+        : `Project ${result.project.slug}: ${changed}.\n`,
+      quiet: identifiers([result.project.slug]),
+      next_actions: result.dry_run
+        ? []
+        : [{ command: `novaflow project show ${result.project.slug}`, description: 'Confirm the archived state' }],
+    };
+  },
+};
 
-/**
- * `nova project import-dag <file> [--project <slug>]` (srs 4.1.1;
- * FR-PRJ-04): the CLI is a THIN CLIENT — it reads the file's RAW TEXT
- * and passes it (+ a format hint derived from the extension: .json →
- * json, .yaml/.yml → yaml, anything else → auto) to the daemon, the
- * single parse+validate+import source. `--project` is a consistency
- * pin only: the §4.3 schema CARRIES project_slug, and a mismatch
- * refuses (exit 3) — the flag never retargets the import.
- */
-async function importDag(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const file = p.positionals[1];
-  if (file === undefined) {
-    throw new UsageError("nova project import-dag <file> [--project <slug>]");
-  }
-  let graphText: string;
-  try {
-    graphText = readFileSync(file, "utf8");
-  } catch (err) {
-    throw new OpFailureError("not_found", `cannot read ${file}: ${(err as Error).message}`);
-  }
-  const ext = file.slice(file.lastIndexOf(".") + 1).toLowerCase();
-  const format = ext === "json" ? "json" : ext === "yaml" || ext === "yml" ? "yaml" : undefined;
-  const ctx = await workspaceContext(p.values.get("workspace") ?? opts.workspace);
-  const data = (await daemonRequest("nova_project_import_dag", {
-    workspace_id: ctx.id,
-    graph_text: graphText,
-    ...(format !== undefined ? { format } : {}),
-    ...(p.values.get("project") !== undefined ? { project_slug: p.values.get("project") } : {}),
-  })) as {
-    chain_run_id: string;
-    chain_run: { state: string };
-    tasks: Record<string, { id: string; key: string; state: string }>;
-  };
-  if (opts.json) {
-    console.log(JSON.stringify(data));
-    return 0;
-  }
-  const members = Object.values(data.tasks);
-  console.log(
-    `imported chain ${data.chain_run_id} (${data.chain_run.state}) — ${members.length} member${members.length === 1 ? "" : "s"} in draft; enqueue roots with 'nova task run'`,
-  );
-  for (const m of members) {
-    console.log(`  ${m.key} (tsk_${m.id}) — ${m.state}`);
-  }
-  return 0;
-}
+export const projectModule: CommandModule = {
+  name: 'project',
+  summary: 'Create and maintain projects inside a workspace.',
+  verbs: [createVerb, listVerb, showVerb, updateVerb, archiveVerb],
+};

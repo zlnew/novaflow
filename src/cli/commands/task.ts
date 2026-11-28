@@ -1,562 +1,774 @@
-import { daemonRequest, OpFailureError } from "../client.ts";
-import { parseArgs, UsageError, type ArgSpec } from "../args.ts";
-import { renderKv, renderTable } from "../format.ts";
-import { operatorActor, resolveTaskIdent, workspaceContext } from "../context.ts";
-import { EXIT_OK, EXIT_OPERATION_FAILED } from "../exitcode.ts";
-import { drainTransitions, FOLLOW_INTERVAL_MS, isTerminalState, pollIntervalMs, sleep } from "../watch.ts";
-import type { CommandOpts } from "../opts.ts";
-import { withFixHint } from "../../fixhint.ts";
-
 /**
- * `nova task …` (srs 4.1.1): create/list/run/status/result/logs/abort/
- * retry/steer/gate-approve/gate-reject — thin translators over the
- * daemon's task ops.
+ * `novaflow task` — the full lifecycle surface (`novaflow-v100/cli` §3.3).
  *
- * Identifier rule (srs 4.1.1, implemented in src/cli/context.ts): the
- * ULID id (bare or tsk_ display form) resolves directly; the human key
- * resolves within the active workspace context. `--project <slug|id>`
- * is REQUIRED on create (spec-silent, documented: there is no active-
- * project marker in v1).
- *
- * `--watch` (run/status) was v1 SNAPSHOT POLLING: no stream op existed on
- * the wire, so the client polled nova_task_status at a documented interval
- * (default 1000 ms, NOVAFLOW_WATCH_MS override) until a terminal state. The
- * three live surfaces are now SPLIT (novaflow-v02/watch.md, v0.2.0 P3):
- *   - `status --watch` AMENDS the v1 semantics — one line per transition
- *     from `nova_transitions_since` (task-filtered, cursor held here) until
- *     the task is terminal, then the unchanged v1 status block. It no longer
- *     polls whole snapshots for output (it reads the status op only to learn
- *     terminality and to render that final block).
- *   - `logs --follow` is NEW — the fixed-1 s `nova_run_logs_since` poll of the
- *     run's REDACTED events.jsonl, following the CURRENT run only (a retry is
- *     a NEW run: the follow says so and exits rather than switching).
- *   - `run --watch` keeps the v1 snapshot poll verbatim: watch.md's table
- *     names `task status --watch`, not `run --watch` (reported, not guessed).
- *
- * Exit codes for a watch: completed → 0; failed/cancelled → 1 (operation
- * failure — the srs's "task failed" row; budget/preflight failures land here
- * through the run record).
+ * Every verb resolves the workspace, then delegates to `src/core/task.ts`; the CLI
+ * owns flag spelling, `--clear-*` semantics, human rendering, and envelopes.
  */
+import { TASK_PRIORITIES, type ArtifactKind, type TaskPriority, type TaskStatus } from '../../core/model.js';
+import {
+  addTaskDep,
+  addTaskNote,
+  attachTaskArtifact,
+  blockTask,
+  cancelTask,
+  claimTask,
+  completeTask,
+  createTask,
+  getTaskContext,
+  getTaskStatus,
+  listTasks,
+  nextTasks,
+  releaseTask,
+  removeTaskDep,
+  reopenTask,
+  startTask,
+  unblockTask,
+  updateTask,
+  type TaskMutationResult,
+} from '../../core/task.js';
+import { rejectCombined, requireFlag, splitList } from '../args.js';
+import { withWorkspace } from '../context.js';
+import { detail, orDash, snippet, table } from '../format.js';
+import { identifiers } from '../output.js';
+import {
+  afterTaskAttach,
+  afterTaskBlocked,
+  afterTaskCancelled,
+  afterTaskClaim,
+  afterTaskComplete,
+  afterTaskCreate,
+  afterTaskDep,
+  afterTaskNote,
+  afterTaskRelease,
+  afterTaskReopened,
+  afterTaskStart,
+  afterTaskUnblocked,
+  afterTaskUpdate,
+} from '../next-actions.js';
+import type { CommandModule, CommandResult, NextAction, VerbSpec } from '../types.js';
 
-const SPEC: ArgSpec = {
-  booleanFlags: ["gate", "follow"],
-  valueFlags: ["title", "objective", "profile", "project", "workspace", "run", "by", "note", "lines", "state"],
-  repeatableFlags: ["context", "scope"],
+const TASK_COLUMNS = ['KEY', 'STATUS', 'PRIORITY', 'READY', 'ASSIGNEE', 'CLAIMED', 'TITLE'] as const;
+
+function taskRows(tasks: readonly { key: string; status: string; priority: string; is_ready: boolean; assignee: string | null; claimed_by: string | null; title: string }[]): string[][] {
+  return tasks.map((task) => [
+    task.key,
+    task.status,
+    task.priority,
+    task.is_ready ? 'yes' : 'waiting',
+    orDash(task.assignee),
+    orDash(task.claimed_by),
+    snippet(task.title),
+  ]);
+}
+
+function mutationResult(result: TaskMutationResult, nextActions: NextAction[]): CommandResult {
+  const task = result.task;
+  const transition =
+    result.from_state === result.to_state ? task.status : `${result.from_state} -> ${result.to_state}`;
+  const suffix = result.dry_run ? ' (dry run, nothing written)' : '';
+  return {
+    data: result,
+    human: `Task ${task.key}: ${transition}${suffix}\n`,
+    quiet: identifiers([task.key]),
+    next_actions: result.dry_run ? [] : nextActions,
+  };
+}
+
+const createVerb: VerbSpec = {
+  verb: 'create',
+  command: 'task.create',
+  summary: 'Create a task in todo, allocating the next PREFIX-N key',
+  usage:
+    'novaflow task create --title <title> [--project <p>] [--slug <s>] [--objective <text>] [--assignee <a>] [--priority low|medium|high|urgent] [--depends-on <k1,k2>] [--tag <t>]... [--idempotency-key <k>]',
+  positionals: [],
+  flags: [
+    { name: 'title', kind: 'string', placeholder: '<title>', description: 'Task title (required)' },
+    { name: 'slug', kind: 'string', placeholder: '<s>', description: 'Explicit kebab-case slug (default: derived from --title)' },
+    { name: 'objective', kind: 'string', placeholder: '<text>', description: 'Task objective' },
+    { name: 'assignee', kind: 'string', placeholder: '<a>', description: 'Intended actor' },
+    { name: 'priority', kind: 'string', placeholder: '<low|medium|high|urgent>', description: 'Priority (default: medium)' },
+    { name: 'depends-on', kind: 'string', placeholder: '<k1,k2>', repeatable: true, description: 'Dependency keys or slugs (comma-separated, repeatable)' },
+    { name: 'tag', kind: 'string', placeholder: '<t>', repeatable: true, description: 'Task tag (repeatable)' },
+    { name: 'idempotency-key', kind: 'string', placeholder: '<k>', description: 'Return the existing task with this key instead of creating' },
+  ],
+  examples: [
+    'novaflow task create --title jwt-authentication --assignee backend-agent --priority high',
+    'novaflow task create --title refresh-token-rotation --depends-on NV3-1',
+  ],
+  run: (ctx) => {
+    requireFlag(ctx.args, 'title', 'task.create');
+    const result = withWorkspace(ctx, (db, resolved) =>
+      createTask(db, {
+        title: ctx.args.get('title') as string,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        slug: ctx.args.get('slug') ?? null,
+        objective: ctx.args.get('objective') ?? null,
+        assignee: ctx.args.get('assignee') ?? null,
+        priority: (ctx.args.get('priority') as TaskPriority | undefined) ?? null,
+        depends_on: splitList(ctx.args.getAll('depends-on')),
+        tags: ctx.args.getAll('tag'),
+        idempotency_key: ctx.args.get('idempotency-key') ?? null,
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    const task = result.task;
+    const human = result.idempotent_hit
+      ? `Task ${task.key} already exists for this idempotency key.\n`
+      : result.dry_run
+        ? `Dry run: would create task ${task.key} (${task.status}, ${task.priority}).\nNo rows written.\n`
+        : `Created task ${task.key} — ${task.title} [${task.status}, ${task.priority}]\n`;
+    return {
+      data: result,
+      human,
+      quiet: identifiers([task.key]),
+      next_actions: result.idempotent_hit || result.dry_run ? [] : afterTaskCreate(task),
+    };
+  },
 };
 
-const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
-const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
-
-export async function taskCommand(argv: string[], opts: CommandOpts): Promise<number> {
-  const p = parseArgs(argv, SPEC);
-  const sub = p.positionals[0];
-  switch (sub) {
-    case "create":
-      return create(p, opts);
-    case "list":
-      return list(p, opts);
-    case "run":
-      return run(p, opts);
-    case "status":
-      return status(p, opts);
-    case "result":
-      return result(p, opts);
-    case "logs":
-      return logs(p, opts);
-    case "abort":
-      return abort(p, opts);
-    case "retry":
-      return retry(p, opts);
-    case "steer":
-      return steer(p, opts);
-    case "gate-approve":
-      return gateApprove(p, opts);
-    case "gate-reject":
-      return gateReject(p, opts);
-    default:
-      throw new UsageError(`nova task [create|list|run|status|result|logs|abort|retry|steer|gate-approve|gate-reject]${sub === undefined ? "" : ` — unknown subcommand "${sub}"`}`);
-  }
-}
-
-function workspaceOverride(p: ReturnType<typeof parseArgs>, opts: CommandOpts): string | undefined {
-  return p.values.get("workspace") ?? opts.workspace;
-}
-
-async function identOrThrow(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<string> {
-  const ident = p.positionals[1];
-  if (ident === undefined) {
-    throw new UsageError(`nova task ${p.positionals[0]} <id|key>`);
-  }
-  const task = await resolveTaskIdent(ident, workspaceOverride(p, opts));
-  return task.id;
-}
-
-async function create(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const key = p.positionals[1];
-  const title = p.values.get("title");
-  const objective = p.values.get("objective");
-  const profileName = p.values.get("profile");
-  const projectIdent = p.values.get("project");
-  if (key === undefined || title === undefined || objective === undefined || profileName === undefined || projectIdent === undefined) {
-    throw new UsageError(
-      "nova task create <key> --title <t> --objective <o> --profile <name> --project <slug|id> [--gate] [--context <path>]... [--scope <repo_alias>[:read_only|read_write]]...",
+const listVerb: VerbSpec = {
+  verb: 'list',
+  command: 'task.list',
+  summary: 'List tasks across the workspace or filtered to one project',
+  usage:
+    'novaflow task list [--project <p>] [--status <s>]... [--ready] [--assignee <a>] [--claimed-by <a>] [--tag <t>] [--limit <n>]',
+  positionals: [],
+  flags: [
+    { name: 'status', kind: 'string', placeholder: '<s>', repeatable: true, description: 'Status filter (repeatable or comma-separated)' },
+    { name: 'ready', kind: 'boolean', description: 'Only todo tasks whose dependencies are all done and unclaimed' },
+    { name: 'assignee', kind: 'string', placeholder: '<a>', description: 'Filter by intended actor' },
+    { name: 'claimed-by', kind: 'string', placeholder: '<a>', description: 'Filter by current claim holder' },
+    { name: 'tag', kind: 'string', placeholder: '<t>', description: 'Filter by tag' },
+    { name: 'limit', kind: 'int', min: 1, placeholder: '<n>', description: 'Maximum rows returned' },
+  ],
+  examples: ['novaflow task list --ready', 'novaflow task list --status todo,blocked --limit 20'],
+  run: (ctx) => {
+    const tasks = withWorkspace(ctx, (db) =>
+      listTasks(db, {
+        project: ctx.options.project ?? null,
+        status: splitList(ctx.args.getAll('status')) as TaskStatus[],
+        ready: ctx.args.has('ready'),
+        assignee: ctx.args.get('assignee') ?? null,
+        claimed_by: ctx.args.get('claimed-by') ?? null,
+        tag: ctx.args.get('tag') ?? null,
+        limit: ctx.args.int('limit') ?? null,
+        now: ctx.now,
+      }),
     );
-  }
-  /**
-   * DEBT-010: `--scope <repo_alias>[:access_mode]` (repeatable) — the
-   * guarded draft→queued row refuses a task with zero target_scopes, so
-   * the CLI's create must be able to scope the task it creates. Syntax
-   * mirrors `project create --target alias=path[:type]`; access_mode
-   * defaults to read_write.
-   */
-  const scopeArgs = p.lists.get("scope") ?? [];
-  const targetScopes = scopeArgs.map((v) => {
-    const [alias, mode] = v.split(":", 2);
-    if (alias === undefined || alias.trim() === "") {
-      throw new UsageError(`--scope #${scopeArgs.indexOf(v) + 1} must be <repo_alias>[:read_only|read_write], got "${v}"`);
-    }
-    if (mode !== undefined && mode !== "read_only" && mode !== "read_write") {
-      throw new UsageError(
-        `--scope #${scopeArgs.indexOf(v) + 1} access mode must be read_only or read_write, got "${mode}"`,
-      );
-    }
-    return { repo_alias: alias, access_mode: mode ?? "read_write" };
-  });
-  const ctx = await workspaceContext(workspaceOverride(p, opts));
-  const projectId = await resolveProjectIdent(projectIdent, ctx.id);
-  /**
-   * FR-WS-04 AC2: `--context` values in the docs-index spelling (`docs/…`,
-   * exactly what `nova docs list` prints in its path column) are DOC
-   * REFERENCES, resolved by the daemon against the workspace docs index and
-   * written to the same `tasks.context_files_json` the run loop injects
-   * from. EVERYTHING ELSE — including plain `.md`/`.txt`/`.rst` paths
-   * outside docs/ — stays the plain workspace-relative context file it has
-   * always been (FR-TSK-04): routing by extension broke previously-valid
-   * inputs (judge B finding 2), and the srs names the selection surface as
-   * the docs-list printed path, which is always `docs/…`. The daemon does
-   * the resolution because only it knows the workspace root.
-   */
-  const contextArgs = p.lists.get("context") ?? [];
-  const isDocReference = (v: string): boolean => v.replace(/^\.\//, "").startsWith("docs/");
-  const docReferences = contextArgs.filter(isDocReference);
-  const plainContextFiles = contextArgs.filter((v) => !isDocReference(v));
-  const data = (await daemonRequest("nova_task_create", {
-    project_id: projectId,
-    key,
-    title,
-    objective,
-    profile_name: profileName,
-    ...(p.flags.has("gate") ? { requires_human_gate: true } : {}),
-    ...(plainContextFiles.length > 0 ? { context_files: plainContextFiles } : {}),
-    ...(docReferences.length > 0 ? { doc_references: docReferences } : {}),
-    ...(targetScopes.length > 0 ? { target_scopes: targetScopes } : {}),
-  })) as { task: { id: string; key: string; state: string } };
-  if (opts.json) console.log(JSON.stringify(data));
-  else console.log(`created task ${data.task.key} (tsk_${data.task.id}) — ${data.task.state}`);
-  return 0;
-}
-
-async function resolveProjectIdent(ident: string, workspaceId: string): Promise<string> {
-  // bare ULIDs are verified within the active workspace too — a syntactically
-  // valid id from ANOTHER workspace must not act silently (review finding 6)
-  const data = (await daemonRequest("nova_project_list", { workspace_id: workspaceId })) as {
-    projects: Array<{ id: string; slug: string }>;
-  };
-  const row = data.projects.find((x) => x.slug === ident || x.id === ident);
-  if (row === undefined) {
-    throw new OpFailureError(
-      "not_found",
-      withFixHint(
-        `no project "${ident}" in the active workspace`,
-        "list projects with `nova project list` and pass the exact slug",
-      ),
-    );
-  }
-  return row.id;
-}
-
-async function list(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  // --project scopes; without it the op lists every task (documented)
-  const args: Record<string, unknown> = {};
-  const projectIdent = p.values.get("project");
-  if (projectIdent !== undefined) {
-    const ctx = await workspaceContext(workspaceOverride(p, opts));
-    args["project_id"] = await resolveProjectIdent(projectIdent, ctx.id);
-  }
-  const state = p.values.get("state");
-  if (state !== undefined) args["state"] = state;
-  const data = (await daemonRequest("nova_task_list", args)) as {
-    tasks: Array<Record<string, unknown>>;
-  };
-  if (opts.json) {
-    console.log(JSON.stringify(data));
-    return 0;
-  }
-  console.log(
-    renderTable(data.tasks, [
-      { key: "key", header: "KEY" },
-      { key: "state", header: "STATE" },
-      { key: "title", header: "TITLE" },
-      { key: "id", header: "ID" },
-    ]),
-  );
-  return 0;
-}
-
-async function run(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const taskId = await identOrThrow(p, opts);
-  const data = (await daemonRequest("nova_task_run", {
-    task_id: taskId,
-    actor: operatorActor(),
-  })) as { task: { state: string } };
-  if (!opts.watch) {
-    if (opts.json) console.log(JSON.stringify(data));
-    else console.log(`task tsk_${taskId}: ${data.task.state}`);
-    return EXIT_OK;
-  }
-  return watchTask(taskId, opts.json);
-}
-
-async function status(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const taskId = await identOrThrow(p, opts);
-  if (opts.watch) return watchTaskTransitions(taskId, opts.json);
-  const data = (await daemonRequest("nova_task_status", { task_id: taskId })) as TaskStatusData;
-  if (opts.json) {
-    console.log(JSON.stringify(data));
-    return EXIT_OK;
-  }
-  console.log(statusBlock(data));
-  return EXIT_OK;
-}
-
-/** The `nova_task_status` envelope the status surfaces read. */
-type TaskStatusData = {
-  task: Record<string, unknown>;
-  current_run: Record<string, unknown> | null;
-  elapsed_ms: number | null;
-  workspace?: { status: string; slug: string };
+    return {
+      data: { tasks },
+      human:
+        tasks.length === 0
+          ? `${table(TASK_COLUMNS, [])}(no tasks matched)\n`
+          : table(TASK_COLUMNS, taskRows(tasks)),
+      quiet: identifiers(tasks.map((task) => task.key)),
+      next_actions: [
+        { command: 'novaflow task next', description: 'Dispatch the next ready task' },
+        { command: 'novaflow status', description: 'Review the board summary' },
+      ],
+    };
+  },
 };
 
-/**
- * The v1 status block — ONE renderer for `status` and for every watch's
- * closing output, so `--watch` can never print a different "final status"
- * than the plain verb (watch.md: "the v1 final status block unchanged").
- */
-function statusBlock(data: TaskStatusData): string {
-  const lines: Array<[string, string]> = [
-    ["id", `tsk_${String(data.task["id"])}`],
-    ["key", String(data.task["key"])],
-    ["title", String(data.task["title"])],
-    ["state", String(data.task["state"])],
-    ["retry_count", String(data.task["retry_count"])],
-  ];
-  if (data.current_run !== null) {
-    lines.push(["run", String(data.current_run["id"])]);
-    lines.push(["run_status", String(data.current_run["status"])]);
-    lines.push(["verification", String(data.current_run["engine_verification_passed"]) === "1" ? "passed" : "not passed"]);
-  }
-  if (data.elapsed_ms !== null) lines.push(["elapsed_ms", String(data.elapsed_ms)]);
-  return renderKv(lines);
-}
-
-/**
- * `nova task status --watch` (watch.md, frozen 2026-11-23 — AMENDS v1): print
- * ONE line per transition, task-filtered, until the task is terminal, then the
- * unchanged v1 status block.
- *
- * The cursor is process-local and starts at 0 = "head" (events.md rule 2): a
- * watch is a liveness view of the live edge, and the audit history beyond that
- * page stays reachable through the plain `status`/store reads. State is read
- * from the status op only to decide terminality (and for the FR-WS-03
- * workspace guard) — the OUTPUT is transitions, never snapshots.
- */
-async function watchTaskTransitions(taskId: string, json: boolean): Promise<number> {
-  const intervalMs = pollIntervalMs();
-  let cursor = 0;
-  for (;;) {
-    const data = (await daemonRequest("nova_task_status", { task_id: taskId })) as TaskStatusData;
-    // FR-WS-03 (v1 rule, carried over): a task in a non-active workspace never
-    // reaches a terminal state — poll forever would be a silent hang.
-    if (data.workspace !== undefined && data.workspace.status !== "active") {
-      if (json) console.log(JSON.stringify({ task_id: taskId, error: "workspace_not_active", workspace: data.workspace }));
-      else console.error(`workspace ${data.workspace.slug} is ${data.workspace.status} — this task will never dispatch (exit 1)`);
-      return EXIT_OPERATION_FAILED;
-    }
-    cursor = await drainTransitions(cursor, { task_id: taskId }, json);
-    if (isTerminalState(String(data.task["state"]))) break;
-    await sleep(intervalMs);
-  }
-  return finishWatch(taskId, json);
-}
-
-/** The watch's closing output: the v1 status block plus v1's exit line. */
-async function finishWatch(taskId: string, json: boolean): Promise<number> {
-  const data = (await daemonRequest("nova_task_status", { task_id: taskId })) as TaskStatusData;
-  const state = String(data.task["state"]);
-  if (json) {
-    console.log(JSON.stringify(data));
-    return state === "completed" ? EXIT_OK : EXIT_OPERATION_FAILED;
-  }
-  console.log(statusBlock(data));
-  if (state === "completed") {
-    console.log("SUCCESS task completed");
-    return EXIT_OK;
-  }
-  console.log(`task ended in ${state} (exit 1)`);
-  // surface the run's recorded failure detail (preflight/budget messages live
-  // here — the v1 review-round behaviour, unchanged)
-  const summary = data.current_run === null ? null : data.current_run["error_summary"];
-  if (typeof summary === "string" && summary !== "") console.log(`  detail: ${summary}`);
-  return EXIT_OPERATION_FAILED;
-}
-
-/** The --watch loop: poll nova_task_status until a terminal state. */
-async function watchTask(taskId: string, json: boolean): Promise<number> {
-  const intervalMs = Number(process.env["NOVAFLOW_WATCH_MS"] ?? 1000);
-  let lastState: string | undefined;
-  for (;;) {
-    const data = (await daemonRequest("nova_task_status", { task_id: taskId })) as {
-      task: { state: string };
-      workspace?: { status: string; slug: string };
-      current_run?: { error_summary: string | null } | null;
+const nextVerb: VerbSpec = {
+  verb: 'next',
+  command: 'task.next',
+  summary: 'Return ready tasks ordered by priority, then creation time',
+  usage: 'novaflow task next [--project <p>] [--assignee <a>] [--limit <n>]',
+  positionals: [],
+  flags: [
+    { name: 'assignee', kind: 'string', placeholder: '<a>', description: 'Only tasks assigned to this actor' },
+    { name: 'limit', kind: 'int', min: 1, placeholder: '<n>', description: 'Maximum tasks returned (default 10)' },
+  ],
+  examples: ['novaflow task next', 'novaflow task next --limit 3 --json'],
+  run: (ctx) => {
+    const tasks = withWorkspace(ctx, (db, resolved) =>
+      nextTasks(db, {
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        assignee: ctx.args.get('assignee') ?? null,
+        limit: ctx.args.int('limit') ?? null,
+        now: ctx.now,
+      }),
+    );
+    return {
+      data: { tasks },
+      human:
+        tasks.length === 0
+          ? 'No ready tasks. Unblock or complete in-flight work first.\n'
+          : table(TASK_COLUMNS, taskRows(tasks)),
+      quiet: identifiers(tasks.map((task) => task.key)),
+      next_actions:
+        tasks.length === 0
+          ? [{ command: 'novaflow status', description: 'Review what is in flight or blocked' }]
+          : [
+              {
+                command: `novaflow task start ${tasks[0]?.key} --by <actor>`,
+                description: 'Claim and start the highest-priority ready task',
+              },
+              {
+                command: `novaflow task context ${tasks[0]?.key}`,
+                description: 'Load the handoff bundle for it',
+              },
+            ],
     };
-    // FR-WS-03: a task in a non-active workspace never reaches a terminal
-    // state — poll forever would be a silent hang (review round finding).
-    if (data.workspace !== undefined && data.workspace.status !== "active") {
-      if (json) console.log(JSON.stringify({ task_id: taskId, error: "workspace_not_active", workspace: data.workspace }));
-      else console.error(`workspace ${data.workspace.slug} is ${data.workspace.status} — this task will never dispatch (exit 1)`);
-      return EXIT_OPERATION_FAILED;
-    }
-    const state = data.task.state;
-    if (state !== lastState) {
-      lastState = state;
-      if (json) {
-        console.log(JSON.stringify({ task_id: taskId, state, at: new Date().toISOString() }));
-      } else {
-        const clock = new Date().toISOString().slice(11, 19);
-        console.log(`[${clock}] tsk_${taskId} ${state}`);
-      }
-    }
-    if (TERMINAL_STATES.has(state)) {
-      const failureSummary =
-        data.current_run !== null && data.current_run !== undefined
-          ? data.current_run.error_summary
-          : null;
-      if (!json) {
-        console.log(
-          state === "completed"
-            ? "SUCCESS task completed"
-            : `task ended in ${state} (exit 1)`,
-        );
-        // surface the run's recorded failure detail (preflight/budget
-        // messages live here — review round finding 7)
-        if (state !== "completed" && failureSummary !== null && failureSummary !== "") {
-          console.log(`  detail: ${failureSummary}`);
-        }
-      }
-      return state === "completed" ? EXIT_OK : EXIT_OPERATION_FAILED;
-    }
-    await new Promise((r) => setTimeout(r, intervalMs));
-  }
-}
+  },
+};
 
-async function result(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const taskId = await identOrThrow(p, opts);
-  const data = (await daemonRequest("nova_result_get", { task_id: taskId })) as {
-    run_id: string;
-    artifact: Record<string, unknown>;
-  };
-  if (opts.json) {
-    console.log(JSON.stringify(data));
-    return 0;
-  }
-  console.log(`run ${data.run_id} — result.json:`);
-  console.log(JSON.stringify(data.artifact, null, 2));
-  return 0;
-}
-
-async function logs(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const taskId = await identOrThrow(p, opts);
-  let tailLines: number | undefined;
-  const linesFlag = p.values.get("lines");
-  if (linesFlag !== undefined) {
-    const n = Number(linesFlag);
-    if (!Number.isInteger(n) || n < 1 || n > 1000) {
-      throw new UsageError(
-        withFixHint(
-          "--lines must be an integer 1..1000",
-          "pass an integer between 1 and 1000, e.g. `--lines 100`",
-        ),
-      );
-    }
-    tailLines = n;
-  }
-  // --follow: the v0.2 live tail (watch.md), not a bigger `--lines`
-  if (p.flags.has("follow")) return followLogs(taskId, opts.json, tailLines);
-  const args: Record<string, unknown> = { task_id: taskId };
-  if (tailLines !== undefined) args["tail_lines"] = tailLines;
-  const data = (await daemonRequest("nova_run_logs", args)) as {
-    run_id: string;
-    lines: string[];
-  };
-  if (opts.json) {
-    console.log(JSON.stringify(data));
-    return 0;
-  }
-  for (const line of data.lines) console.log(line);
-  return 0;
-}
-
-/**
- * `nova task logs <id> --follow` (watch.md, NEW in v0.2.0): poll
- * `nova_run_logs_since` on the pinned FIXED 1 s interval and print each new
- * line of the run's REDACTED events.jsonl.
- *
- * WHY THE RUN IS PINNED: a retry attempt is a NEW run with its own directory
- * and its own line offsets. Re-resolving "the task's latest run" every poll
- * would interleave two logs under one offset and silently switch what the
- * operator is watching. So the first poll fixes `run_id`; when THAT run's log
- * closes the follow says so and exits.
- *
- * `--lines <n>` is the way to start at the tail (watch.md: "a caller that
- * wants the tail asks tail_lines"); without it the follow starts at the head
- * of the file, which is what an operator watching a run from its start wants.
- *
- * Exit: 0 when the followed run's log closes (a read verb — the TASK's
- * outcome is `status`/`result`'s business), Ctrl-C at any time.
- */
-async function followLogs(
-  taskId: string,
-  json: boolean,
-  tailLines: number | undefined,
-): Promise<number> {
-  let runId: string | undefined;
-  let offset = 0;
-  let firstPoll = true;
-  for (;;) {
-    const args: Record<string, unknown> = { task_id: taskId };
-    if (runId !== undefined) args["run_id"] = runId;
-    if (firstPoll && tailLines !== undefined) args["tail_lines"] = tailLines;
-    else if (!firstPoll) args["offset"] = offset;
-    const page = (await daemonRequest("nova_run_logs_since", args)) as {
-      run_id: string;
-      lines: string[];
-      offset: number;
-      has_more: boolean;
-      done: boolean;
+const statusVerb: VerbSpec = {
+  verb: 'status',
+  command: 'task.status',
+  summary: 'Show full task state, readiness, claim, blocker and recent timeline',
+  usage: 'novaflow task status <ID>',
+  positionals: ['<ID>'],
+  flags: [],
+  examples: ['novaflow task status NV3-1', 'novaflow task status NV3-1 --json'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const result = withWorkspace(ctx, (db, resolved) =>
+      getTaskStatus(db, { id, project: ctx.options.project ?? null, env: ctx.env, config: resolved.config, now: ctx.now }),
+    );
+    const task = result.task;
+    const unmet = task.unmet_deps.map((dep) => `${dep.key} (${dep.status})`).join(', ');
+    const human = detail([
+      ['key', task.key],
+      ['title', task.title],
+      ['project', task.project_slug],
+      ['status', task.status],
+      ['priority', task.priority],
+      ['ready', task.is_ready ? 'yes' : 'no'],
+      ['unmet_deps', unmet === '' ? '-' : unmet],
+      ['assignee', orDash(task.assignee)],
+      ['claimed_by', orDash(task.claimed_by)],
+      ['session_ref', orDash(task.session_ref)],
+      ['lease_expires_at', orDash(task.lease_expires_at)],
+      ['block_reason', orDash(task.block_reason)],
+      ['blocked_by_ref', orDash(task.blocked_by_ref)],
+      ['objective', orDash(task.objective)],
+      ['summary', orDash(task.summary)],
+      ['tags', task.tags.length === 0 ? '-' : task.tags.join(', ')],
+      ['counts', `notes ${result.counts.notes}, artifacts ${result.counts.artifacts}, deps ${result.counts.dependencies}, dependents ${result.counts.dependents}`],
+      ['created_at', task.created_at],
+      ['updated_at', task.updated_at],
+    ]) + (result.recent_events.length === 0 ? '' : `recent events: ${result.recent_events.map((event) => event.event_type).join(', ')}\n`);
+    return {
+      data: result,
+      human,
+      quiet: identifiers([task.key]),
+      next_actions:
+        task.status === 'blocked'
+          ? afterTaskBlocked(task)
+          : task.status === 'in_progress'
+            ? afterTaskStart(task)
+            : afterTaskCreate(task),
     };
-    runId = page.run_id;
-    firstPoll = false;
-    if (json) {
-      // the raw rows, one page per line — and nothing at all on a silent poll
-      if (page.lines.length > 0 || page.done) console.log(JSON.stringify(page));
-    } else {
-      for (const line of page.lines) console.log(line);
-    }
-    // the op's offset is the window START, so offset + len is the next window
-    offset = page.offset + page.lines.length;
-    if (page.has_more) continue; // a backlog drains immediately, never 1 s/line
-    if (page.done) {
-      await announceFollowEnd(taskId, runId, json);
-      return EXIT_OK;
-    }
-    await sleep(FOLLOW_INTERVAL_MS);
-  }
-}
+  },
+};
 
-/**
- * Say why the follow stopped. On stderr: stdout is the log pipe and must stay
- * greppable/redirectable. Best-effort by design — the follow's job is done, so
- * a status probe that fails never turns this into an error.
- */
-async function announceFollowEnd(taskId: string, runId: string, json: boolean): Promise<void> {
-  if (json) return; // the final JSON page already carried done: true
-  let notice = `run ${runId} is closed — no further lines will arrive (follow ends here)`;
-  try {
-    const st = (await daemonRequest("nova_task_status", { task_id: taskId })) as {
-      current_run: { id: string } | null;
+const contextVerb: VerbSpec = {
+  verb: 'context',
+  command: 'task.context',
+  summary: 'Assemble the agent handoff bundle: upstream summaries, notes, artifacts, downstream list',
+  usage: 'novaflow task context <ID>',
+  positionals: ['<ID>'],
+  flags: [],
+  examples: ['novaflow task context NV3-2', 'novaflow task context NV3-2 --json'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const result = withWorkspace(ctx, (db, resolved) =>
+      getTaskContext(db, { id, project: ctx.options.project ?? null, env: ctx.env, config: resolved.config, now: ctx.now }),
+    );
+    const lines: string[] = [];
+    lines.push(detail([
+      ['task', `${result.task.key} — ${result.task.title}`],
+      ['status', result.task.status],
+      ['objective', orDash(result.task.objective)],
+      ['project', `${result.project.slug} (${result.project.prefix})`],
+      ['project objective', orDash(result.project.objective)],
+      ['repo_path', orDash(result.project.repo_path)],
+      ['verify_cmd', orDash(result.project.verify_cmd)],
+    ]));
+    lines.push(`upstream: ${result.upstream.length === 0 ? '-' : result.upstream.map((entry) => `${entry.key} (${entry.status})`).join(', ')}\n`);
+    lines.push(`downstream: ${result.downstream.length === 0 ? '-' : result.downstream.map((entry) => `${entry.key} (${entry.status})`).join(', ')}\n`);
+    lines.push(`notes: ${result.notes.length}, artifacts: ${result.artifacts.length}\n`);
+    return {
+      data: result,
+      human: lines.join(''),
+      quiet: identifiers([result.task.key]),
+      next_actions: afterTaskStart({ key: result.task.key, project_slug: result.project.slug }),
     };
-    const live = st.current_run;
-    if (live !== null && live.id !== runId) {
-      notice = `run ${runId} is closed — resolution: a retry is a NEW run (now ${live.id}); run \`nova task logs ${taskId} --follow\` again to follow it`;
-    }
-  } catch {
-    // the notice is best-effort: the follow's job is done already
-  }
-  console.error(notice);
-}
+  },
+};
 
-async function abort(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const taskId = await identOrThrow(p, opts);
-  const data = (await daemonRequest("nova_task_abort", {
-    task_id: taskId,
-    actor: operatorActor(),
-  })) as { final_state: string };
-  if (opts.json) console.log(JSON.stringify(data));
-  else console.log(`task tsk_${taskId}: ${data.final_state}`);
-  return 0;
-}
+const updateVerb: VerbSpec = {
+  verb: 'update',
+  command: 'task.update',
+  summary: 'Update mutable task fields without changing lifecycle state',
+  usage: 'novaflow task update <ID> [--title <t>] [--objective <o>] [--clear-objective] [--priority <p>] [--assignee <a>] [--clear-assignee] [--tag <t>]... [--clear-tags]',
+  positionals: ['<ID>'],
+  flags: [
+    { name: 'title', kind: 'string', placeholder: '<t>', description: 'New title' },
+    { name: 'objective', kind: 'string', placeholder: '<o>', description: 'New objective' },
+    { name: 'clear-objective', kind: 'boolean', description: 'Clear the objective' },
+    { name: 'priority', kind: 'string', placeholder: `<${TASK_PRIORITIES.join('|')}>`, description: 'New priority' },
+    { name: 'assignee', kind: 'string', placeholder: '<a>', description: 'New intended actor' },
+    { name: 'clear-assignee', kind: 'boolean', description: 'Clear the assignee' },
+    { name: 'tag', kind: 'string', placeholder: '<t>', repeatable: true, description: 'Replace the full tag list (repeatable)' },
+    { name: 'clear-tags', kind: 'boolean', description: 'Clear every tag' },
+  ],
+  examples: [
+    'novaflow task update NV3-1 --priority urgent',
+    'novaflow task update NV3-1 --clear-assignee',
+    'novaflow task update NV3-1 --tag auth --tag security',
+  ],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    rejectCombined(ctx.args, 'objective', 'clear-objective');
+    rejectCombined(ctx.args, 'assignee', 'clear-assignee');
+    rejectCombined(ctx.args, 'tag', 'clear-tags');
 
-async function retry(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const taskId = await identOrThrow(p, opts);
-  const data = (await daemonRequest("nova_task_retry", {
-    task_id: taskId,
-    actor: operatorActor(),
-  })) as { decision: { kind: string } };
-  if (opts.json) console.log(JSON.stringify(data));
-  else console.log(`task tsk_${taskId}: ${data.decision.kind}`);
-  return 0;
-}
+    const objective = ctx.args.has('clear-objective') ? '' : ctx.args.get('objective');
+    const assignee = ctx.args.has('clear-assignee') ? null : ctx.args.get('assignee');
+    const tags = ctx.args.getAll('tag');
+    const title = ctx.args.get('title');
+    const priority = ctx.args.get('priority');
 
-async function steer(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const taskId = await identOrThrow(p, opts);
-  const message = p.positionals.slice(2).join(" ");
-  if (message === "") {
-    throw new UsageError("nova task steer <id|key> <message...>");
-  }
-  const data = (await daemonRequest("nova_task_steer", { task_id: taskId, message })) as {
-    steered: boolean;
-  };
-  if (opts.json) console.log(JSON.stringify(data));
-  else console.log(`steered task tsk_${taskId}`);
-  return 0;
-}
+    const result = withWorkspace(ctx, (db, resolved) =>
+      updateTask(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        ...(title === undefined ? {} : { title }),
+        ...(objective === undefined ? {} : { objective }),
+        ...(priority === undefined ? {} : { priority: priority as TaskPriority }),
+        ...(assignee === undefined ? {} : { assignee }),
+        ...(tags.length === 0 && !ctx.args.has('clear-tags') ? {} : { tags: ctx.args.has('clear-tags') ? [] : tags }),
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return mutationResult(result, afterTaskUpdate(result.task));
+  },
+};
 
-async function gateApprove(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const taskId = await identOrThrow(p, opts);
-  // run_id: --run, else the live run (the gate approval contract)
-  let runId = p.values.get("run");
-  if (runId === undefined) {
-    const st = (await daemonRequest("nova_task_status", { task_id: taskId })) as {
-      current_run: { id: string } | null;
+const startVerb: VerbSpec = {
+  verb: 'start',
+  command: 'task.start',
+  summary: 'Transition todo -> in_progress atomically, with claim and lease',
+  usage: 'novaflow task start <ID> [--by <actor>] [--ref <session_uri>] [--lease <sec>] [--note <text>] [--force]',
+  positionals: ['<ID>'],
+  flags: [
+    { name: 'by', kind: 'string', placeholder: '<actor>', description: 'Actor claiming the task' },
+    { name: 'ref', kind: 'string', placeholder: '<session_uri>', description: 'Session reference (thread, run, shell id)' },
+    { name: 'lease', kind: 'int', min: 1, placeholder: '<sec>', description: 'Lease length in seconds (omit for a permanent claim)' },
+    { name: 'note', kind: 'string', placeholder: '<text>', description: 'Progress note recorded with the start' },
+    { name: 'force', kind: 'boolean', description: 'Override unmet dependencies, a live claim, or a restart' },
+  ],
+  examples: [
+    'novaflow task start NV3-1 --by t3-agent --ref "thread://abc123" --lease 900',
+    'novaflow task start NV3-1 --force',
+  ],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const refValue = ctx.args.get('ref');
+    const result = withWorkspace(ctx, (db, resolved) =>
+      startTask(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        by: ctx.args.get('by') ?? null,
+        ...(refValue === undefined ? {} : { session_ref: refValue }),
+        lease_sec: ctx.args.int('lease') ?? null,
+        note: ctx.args.get('note') ?? null,
+        force: ctx.args.has('force'),
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return mutationResult(result, afterTaskStart(result.task));
+  },
+};
+
+const completeVerb: VerbSpec = {
+  verb: 'complete',
+  command: 'task.complete',
+  summary: 'Transition todo/in_progress/blocked -> done with an optional summary and artifacts',
+  usage: 'novaflow task complete <ID> [--summary <text>] [--by <actor>] [--artifact <uri>]... [--force]',
+  positionals: ['<ID>'],
+  flags: [
+    { name: 'summary', kind: 'string', placeholder: '<text>', description: 'Completion summary' },
+    { name: 'by', kind: 'string', placeholder: '<actor>', description: 'Actor completing the task' },
+    { name: 'artifact', kind: 'string', placeholder: '<uri>', repeatable: true, description: 'Artifact URI (repeatable)' },
+    { name: 'force', kind: 'boolean', description: 'Override a live claim or a terminal state' },
+  ],
+  examples: [
+    'novaflow task complete NV3-1 --summary "Implemented JWT RS256 issue/verify" --artifact src/auth/jwt.ts',
+  ],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const result = withWorkspace(ctx, (db, resolved) =>
+      completeTask(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        summary: ctx.args.get('summary') ?? null,
+        by: ctx.args.get('by') ?? null,
+        artifacts: ctx.args.getAll('artifact'),
+        force: ctx.args.has('force'),
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return mutationResult(result, afterTaskComplete(result.task));
+  },
+};
+
+const blockVerb: VerbSpec = {
+  verb: 'block',
+  command: 'task.block',
+  summary: 'Transition todo/in_progress/blocked -> blocked with a reason or a dependency',
+  usage: 'novaflow task block <ID> [--reason <text>] [--waiting-on <ref>] [--on <OTHER_ID>] [--by <actor>]',
+  positionals: ['<ID>'],
+  flags: [
+    { name: 'reason', kind: 'string', placeholder: '<text>', description: 'Why the task is blocked' },
+    { name: 'waiting-on', kind: 'string', placeholder: '<ref>', description: 'External reference being awaited' },
+    { name: 'on', kind: 'string', placeholder: '<OTHER_ID>', description: 'Add a dependency on another task (cycle-checked)' },
+    { name: 'by', kind: 'string', placeholder: '<actor>', description: 'Actor recording the blocker' },
+  ],
+  examples: [
+    'novaflow task block NV3-1 --reason "Need RS256 key rotation decision"',
+    'novaflow task block NV3-2 --on NV3-1',
+  ],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const result = withWorkspace(ctx, (db, resolved) =>
+      blockTask(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        reason: ctx.args.get('reason') ?? null,
+        waiting_on: ctx.args.get('waiting-on') ?? null,
+        on: ctx.args.get('on') ?? null,
+        by: ctx.args.get('by') ?? null,
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return mutationResult(result, afterTaskBlocked(result.task));
+  },
+};
+
+const unblockVerb: VerbSpec = {
+  verb: 'unblock',
+  command: 'task.unblock',
+  summary: 'Clear the blocker and return to todo (or in_progress with --start)',
+  usage: 'novaflow task unblock <ID> [--note <text>] [--start] [--by <actor>] [--ref <uri>] [--lease <sec>] [--force]',
+  positionals: ['<ID>'],
+  flags: [
+    { name: 'note', kind: 'string', placeholder: '<text>', description: 'Note recorded with the unblock' },
+    { name: 'start', kind: 'boolean', description: 'Resume straight into in_progress' },
+    { name: 'by', kind: 'string', placeholder: '<actor>', description: 'Actor resuming the task' },
+    { name: 'ref', kind: 'string', placeholder: '<uri>', description: 'Session reference when starting' },
+    { name: 'lease', kind: 'int', min: 1, placeholder: '<sec>', description: 'Lease length in seconds when starting' },
+    { name: 'force', kind: 'boolean', description: 'Override dependency and claim guards' },
+  ],
+  examples: ['novaflow task unblock NV3-1', 'novaflow task unblock NV3-1 --start --by alice'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const refValue = ctx.args.get('ref');
+    const result = withWorkspace(ctx, (db, resolved) =>
+      unblockTask(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        note: ctx.args.get('note') ?? null,
+        start: ctx.args.has('start'),
+        by: ctx.args.get('by') ?? null,
+        ...(refValue === undefined ? {} : { session_ref: refValue }),
+        lease_sec: ctx.args.int('lease') ?? null,
+        force: ctx.args.has('force'),
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return mutationResult(result, afterTaskUnblocked(result.task));
+  },
+};
+
+const cancelVerb: VerbSpec = {
+  verb: 'cancel',
+  command: 'task.cancel',
+  summary: 'Transition todo/in_progress/blocked -> cancelled',
+  usage: 'novaflow task cancel <ID> [--reason <text>] [--by <actor>]',
+  positionals: ['<ID>'],
+  flags: [
+    { name: 'reason', kind: 'string', placeholder: '<text>', description: 'Why the task is being cancelled' },
+    { name: 'by', kind: 'string', placeholder: '<actor>', description: 'Actor cancelling the task' },
+  ],
+  examples: ['novaflow task cancel NV3-4 --reason "Superseded by NV3-7"'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const result = withWorkspace(ctx, (db, resolved) =>
+      cancelTask(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        reason: ctx.args.get('reason') ?? null,
+        by: ctx.args.get('by') ?? null,
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return mutationResult(result, afterTaskCancelled(result.task));
+  },
+};
+
+const reopenVerb: VerbSpec = {
+  verb: 'reopen',
+  command: 'task.reopen',
+  summary: 'Reset a done or cancelled task back to todo',
+  usage: 'novaflow task reopen <ID> [--reason <text>] [--by <actor>]',
+  positionals: ['<ID>'],
+  flags: [
+    { name: 'reason', kind: 'string', placeholder: '<text>', description: 'Why the task is being reopened' },
+    { name: 'by', kind: 'string', placeholder: '<actor>', description: 'Actor reopening the task' },
+  ],
+  examples: ['novaflow task reopen NV3-1 --reason "Regression found"'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const result = withWorkspace(ctx, (db, resolved) =>
+      reopenTask(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        reason: ctx.args.get('reason') ?? null,
+        by: ctx.args.get('by') ?? null,
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return mutationResult(result, afterTaskReopened(result.task));
+  },
+};
+
+const claimVerb: VerbSpec = {
+  verb: 'claim',
+  command: 'task.claim',
+  summary: 'Acquire or renew a lease without changing state',
+  usage: 'novaflow task claim <ID> --by <actor> [--ref <uri>] [--lease <sec>] [--force]',
+  positionals: ['<ID>'],
+  flags: [
+    { name: 'by', kind: 'string', placeholder: '<actor>', description: 'Actor acquiring the claim (required)' },
+    { name: 'ref', kind: 'string', placeholder: '<uri>', description: 'Session reference' },
+    { name: 'lease', kind: 'int', min: 1, placeholder: '<sec>', description: 'Lease length in seconds (omit for a permanent claim)' },
+    { name: 'force', kind: 'boolean', description: 'Take over a live claim held by another actor' },
+  ],
+  examples: ['novaflow task claim NV3-1 --by t3-agent --lease 600'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const by = requireFlag(ctx.args, 'by', 'task.claim');
+    const refValue = ctx.args.get('ref');
+    const result = withWorkspace(ctx, (db, resolved) =>
+      claimTask(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        by,
+        ...(refValue === undefined ? {} : { session_ref: refValue }),
+        lease_sec: ctx.args.int('lease') ?? null,
+        force: ctx.args.has('force'),
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return mutationResult(result, afterTaskClaim(result.task));
+  },
+};
+
+const releaseVerb: VerbSpec = {
+  verb: 'release',
+  command: 'task.release',
+  summary: 'Clear the active claim and lease, optionally returning to todo',
+  usage: 'novaflow task release <ID> [--by <actor>] [--to-todo]',
+  positionals: ['<ID>'],
+  flags: [
+    { name: 'by', kind: 'string', placeholder: '<actor>', description: 'Actor releasing the claim' },
+    { name: 'to-todo', kind: 'boolean', description: 'Also transition in_progress back to todo' },
+  ],
+  examples: ['novaflow task release NV3-1', 'novaflow task release NV3-1 --to-todo'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const result = withWorkspace(ctx, (db, resolved) =>
+      releaseTask(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        by: ctx.args.get('by') ?? null,
+        to_todo: ctx.args.has('to-todo'),
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return mutationResult(result, afterTaskRelease(result.task));
+  },
+};
+
+const dependVerb: VerbSpec = {
+  verb: 'depend',
+  command: 'task.depend',
+  summary: 'Add `ID depends_on OTHER_ID` after a cycle check (idempotent)',
+  usage: 'novaflow task depend <ID> --on <OTHER_ID>',
+  positionals: ['<ID>'],
+  flags: [{ name: 'on', kind: 'string', placeholder: '<OTHER_ID>', description: 'Task this one must wait for (required)' }],
+  examples: ['novaflow task depend NV3-2 --on NV3-1'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const on = requireFlag(ctx.args, 'on', 'task.depend');
+    const result = withWorkspace(ctx, (db, resolved) =>
+      addTaskDep(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        on,
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return mutationResult(result, afterTaskDep(result.task));
+  },
+};
+
+const undependVerb: VerbSpec = {
+  verb: 'undepend',
+  command: 'task.undepend',
+  summary: 'Remove a dependency edge',
+  usage: 'novaflow task undepend <ID> --on <OTHER_ID>',
+  positionals: ['<ID>'],
+  flags: [{ name: 'on', kind: 'string', placeholder: '<OTHER_ID>', description: 'Dependency edge to remove (required)' }],
+  examples: ['novaflow task undepend NV3-2 --on NV3-1'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const on = requireFlag(ctx.args, 'on', 'task.undepend');
+    const result = withWorkspace(ctx, (db, resolved) =>
+      removeTaskDep(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        on,
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return mutationResult(result, afterTaskDep(result.task));
+  },
+};
+
+const noteVerb: VerbSpec = {
+  verb: 'note',
+  command: 'task.note',
+  summary: 'Append a timestamped progress or decision note without changing status',
+  usage: 'novaflow task note <ID> <message> [--by <actor>]',
+  positionals: ['<ID>', '<message>'],
+  flags: [{ name: 'by', kind: 'string', placeholder: '<actor>', description: 'Note author' }],
+  examples: ['novaflow task note NV3-1 "Keys live in env, rotation documented" --by alice'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const message = ctx.args.positionals[1] as string;
+    const result = withWorkspace(ctx, (db, resolved) =>
+      addTaskNote(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        message,
+        by: ctx.args.get('by') ?? null,
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return {
+      data: { note: result.task, event_seqs: result.event_seqs, dry_run: result.dry_run },
+      human: result.dry_run ? 'Dry run: would append the note.\nNo rows written.\n' : `Noted on ${result.task_key}.\n`,
+      quiet: identifiers([result.task_key]),
+      next_actions: result.dry_run ? [] : afterTaskNote({ key: result.task_key }),
     };
-    if (st.current_run === null) {
-      throw new OpFailureError("not_found", `task tsk_${taskId} has no run to approve`);
-    }
-    runId = st.current_run.id;
-  }
-  const data = (await daemonRequest("nova_gate_approve", {
-    task_id: taskId,
-    run_id: runId,
-    approved_by: p.values.get("by") ?? operatorActor(),
-    note: p.values.get("note") ?? "",
-  })) as { final_state: string };
-  if (opts.json) console.log(JSON.stringify(data));
-  else console.log(`task tsk_${taskId}: ${data.final_state} (gate approved)`);
-  return 0;
-}
+  },
+};
 
-async function gateReject(p: ReturnType<typeof parseArgs>, opts: CommandOpts): Promise<number> {
-  const taskId = await identOrThrow(p, opts);
-  const feedback = p.positionals.slice(2).join(" ");
-  if (feedback === "") {
-    throw new UsageError("nova task gate-reject <id|key> <feedback...>");
-  }
-  const data = (await daemonRequest("nova_gate_reject", {
-    task_id: taskId,
-    feedback,
-  })) as { final_state: string; retry_count: number };
-  if (opts.json) console.log(JSON.stringify(data));
-  else console.log(`task tsk_${taskId}: ${data.final_state} (retry ${data.retry_count})`);
-  return 0;
-}
+const attachVerb: VerbSpec = {
+  verb: 'attach',
+  command: 'task.attach',
+  summary: 'Attach a file path, PR URL, or log pointer for handoff',
+  usage: 'novaflow task attach <ID> <uri> [--label <text>] [--kind file|pr|log|url]',
+  positionals: ['<ID>', '<uri>'],
+  flags: [
+    { name: 'label', kind: 'string', placeholder: '<text>', description: 'Human label for the artifact' },
+    { name: 'kind', kind: 'string', placeholder: '<file|pr|log|url>', description: 'Artifact kind (default: file)' },
+  ],
+  examples: ['novaflow task attach NV3-1 src/auth/jwt.ts --label "JWT module"', 'novaflow task attach NV3-1 https://example.test/pr/1 --kind pr'],
+  run: (ctx) => {
+    const id = ctx.args.positionals[0] as string;
+    const uri = ctx.args.positionals[1] as string;
+    const result = withWorkspace(ctx, (db, resolved) =>
+      attachTaskArtifact(db, {
+        id,
+        project: ctx.options.project ?? null,
+        env: ctx.env,
+        config: resolved.config,
+        uri,
+        label: ctx.args.get('label') ?? null,
+        kind: (ctx.args.get('kind') as ArtifactKind | undefined) ?? null,
+        now: ctx.now,
+        dry_run: ctx.options.dryRun,
+      }),
+    );
+    return {
+      data: result,
+      human: result.dry_run
+        ? 'Dry run: would attach the artifact.\nNo rows written.\n'
+        : `Attached ${result.artifact.uri} (${result.artifact.kind}) to ${result.task_key}.\n`,
+      quiet: identifiers([result.task_key]),
+      next_actions: result.dry_run ? [] : afterTaskAttach({ key: result.task_key }),
+    };
+  },
+};
+
+export const taskModule: CommandModule = {
+  name: 'task',
+  summary: 'Create, dispatch, and drive tasks through the 5-state lifecycle.',
+  verbs: [
+    createVerb,
+    listVerb,
+    nextVerb,
+    statusVerb,
+    contextVerb,
+    updateVerb,
+    startVerb,
+    completeVerb,
+    blockVerb,
+    unblockVerb,
+    cancelVerb,
+    reopenVerb,
+    claimVerb,
+    releaseVerb,
+    dependVerb,
+    undependVerb,
+    noteVerb,
+    attachVerb,
+  ],
+};

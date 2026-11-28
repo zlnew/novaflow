@@ -2,6 +2,16 @@
 
 What changed for you, release by release. Newest first.
 
+## [1.0.0] — 2026-11-28
+
+Clean-slate redesign of NovaFlow as a local-first, daemonless CLI and MCP orchestration ledger.
+
+- **Daemonless `.novaflow/` + built-in SQLite WAL:** State lives in `<workspace>/.novaflow/` (`config.yaml`, `.gitignore`, `state.db`) using Node.js 24's built-in `node:sqlite` (zero native C++ addons) with automatic `cwd` walk-up discovery and an XDG global workspace index.
+- **Single `novaflow` CLI (`novaflow <noun> <verb>`):** Manages workspaces, projects with deterministic `PREFIX-N` task keys, a 5-state task FSM (`todo`, `in_progress`, `blocked`, `done`, `cancelled`), atomic leases, DAG dependencies, handoff `task context`, `status`, `events`, and `export`, with `--json` `next_actions`, `--dry-run`, `--quiet`, and exit codes `0`–`4`.
+- **Stateless stdio MCP server (`novaflow mcp`):** Exposes 30 `novaflow_*` tools 1:1 over the core domain layer with structured `isError` payloads and MCP-native `next_actions`.
+- **Bundled Agent Skill (`novaflow skill install|status|uninstall`):** Ships `skills/novaflow/SKILL.md` offline inside the npm package and links it into detected agent harnesses (`claude`, `codex`, `hermes`, `pi`, `opencode`, `cursor`).
+- **Unified `./release.sh` pipeline:** Adds `./release.sh check` (typecheck, build, test, pack allowlist, and isolated tarball install smoke) alongside `bump`, `pr`, `tag`, and 2FA-aware `publish`.
+
 ## [0.4.0] — 2026-11-24
 
 The first release written for someone who has just heard the name. Nothing about the engine

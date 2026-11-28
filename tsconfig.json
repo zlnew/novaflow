@@ -4,15 +4,17 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "lib": ["ES2023"],
+    "types": ["node"],
     "strict": true,
-    "verbatimModuleSyntax": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
     "skipLibCheck": true,
-    "allowImportingTsExtensions": true,
-    "noEmit": true,
-    "outDir": "dist",
-    "types": ["node"]
+    "declaration": true,
+    "sourceMap": true,
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist"
   },
-  "include": ["src/**/*.ts", "extensions/**/*.ts", "test/extensions/**/*.ts"]
+  "include": ["src/**/*.ts"]
 }

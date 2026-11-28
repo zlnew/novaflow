@@ -1,23 +1,20 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-
 /**
- * The package version, reported in the MCP `initialize` handshake as the
- * server's implementation version. Read from package.json at startup (the
- * same offline approach src/cli/main.ts uses — no JSON import assertion,
- * no build step). A missing/unreadable package.json degrades to "0.0.0"
- * rather than failing the handshake.
+ * Server version for the MCP `initialize` handshake.
+ *
+ * Read from `package.json` next to the compiled entry point, exactly like the
+ * CLI's `--version`, so the server and the binary can never disagree.
  */
-export function version(): string {
+import { readFileSync } from 'node:fs';
+
+function readVersion(): string {
   try {
-    return String(
-      (
-        JSON.parse(
-          readFileSync(join(import.meta.dirname, "..", "..", "package.json"), "utf8"),
-        ) as { version: string }
-      ).version,
-    );
+    const raw = readFileSync(new URL('../../package.json', import.meta.url), 'utf8');
+    const pkg = JSON.parse(raw) as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
   } catch {
-    return "0.0.0";
+    return '0.0.0';
   }
 }
+
+export const SERVER_NAME = 'novaflow';
+export const SERVER_VERSION = readVersion();
