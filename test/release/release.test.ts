@@ -150,17 +150,37 @@ describe('release.sh argument guards', () => {
     }
   });
 
+  it('exits 2 when --dry-run and --confirm are combined', () => {
+    const result = release(['publish', '--dry-run', '--confirm']);
+    assert.equal(result.code, 2, `expected exit 2, got ${result.code}: ${result.stdout}${result.stderr}`);
+    assert.match(result.stderr, /cannot combine --dry-run and --confirm/);
+  });
+
   it('exits 2 when --confirm needs an OTP and stdin is not a TTY', () => {
-    const result = release(['publish', '--confirm'], { NODE_AUTH_TOKEN: '' });
+    const emptyNpmrc = join(scratchDir('novaflow-npmrc-'), 'npmrc');
+    writeFileSync(emptyNpmrc, '');
+    const result = release(['publish', '--confirm'], { NODE_AUTH_TOKEN: '', npm_config_userconfig: emptyNpmrc });
     assert.equal(result.code, 2, `expected exit 2, got ${result.code}: ${result.stdout}${result.stderr}`);
     assert.match(result.stderr, /--otp/);
     assert.match(result.stderr, /NODE_AUTH_TOKEN/);
   });
 
-  it('does not demand an OTP when an automation token is configured', () => {
-    const result = release(['publish', '--confirm'], { NODE_AUTH_TOKEN: 'npm_fake_token_for_guards' });
-    assert.notEqual(result.code, 2, 'an automation token must satisfy the OTP guard');
-    assert.doesNotMatch(result.stderr, /publish needs an OTP/);
+  it('does not demand an OTP when an automation token or _authToken is configured', () => {
+    const emptyNpmrc = join(scratchDir('novaflow-npmrc-'), 'npmrc');
+    writeFileSync(emptyNpmrc, '');
+    const withEnv = lib('require_publish_otp_ready 1 "" </dev/null', {
+      NODE_AUTH_TOKEN: 'npm_fake_token_for_guards',
+      npm_config_userconfig: emptyNpmrc,
+    });
+    assert.equal(withEnv.code, 0, withEnv.stderr);
+
+    const tokenNpmrc = join(scratchDir('novaflow-npmrc-tok-'), 'npmrc');
+    writeFileSync(tokenNpmrc, '//registry.npmjs.org/:_authToken=npm_fake_rc_token\n');
+    const withNpmrc = lib('require_publish_otp_ready 1 "" </dev/null', {
+      NODE_AUTH_TOKEN: '',
+      npm_config_userconfig: tokenNpmrc,
+    });
+    assert.equal(withNpmrc.code, 0, withNpmrc.stderr);
   });
 
   it('accepts publish --help without running a preflight', () => {
@@ -224,7 +244,7 @@ describe('release.sh helpers', () => {
     assert.equal(rcOnly.code, 1, 'a suffix-only heading must not satisfy a different version');
   });
 
-  it('refuses an empty changelog section', () => {
+  it('refuses an empty, unreleased, or placeholder changelog section', () => {
     const dir = scratchDir('novaflow-changelog-empty-');
     const file = join(dir, 'CHANGELOG.md');
     writeFileSync(
@@ -234,6 +254,40 @@ describe('release.sh helpers', () => {
     const result = lib(`changelog_notes 1.0.0 ${JSON.stringify(file)}`);
     assert.equal(result.code, 1, 'an empty section must fail');
     assert.match(result.stderr, /empty/);
+
+    writeFileSync(
+      file,
+      [
+        '# Changelog',
+        '',
+        '## [1.0.0] — unreleased',
+        '',
+        'Write what changed for the user, then run ./release.sh tag.',
+        '',
+      ].join('\n'),
+    );
+    const unreleased = lib(`changelog_notes 1.0.0 ${JSON.stringify(file)}`);
+    assert.equal(unreleased.code, 1);
+    assert.match(unreleased.stderr, /unreleased/);
+
+    writeFileSync(
+      file,
+      [
+        '# Changelog',
+        '',
+        '## [1.0.0] — 2026-11-28',
+        '',
+        'Write what changed for the user, then run ./release.sh tag.',
+        '',
+      ].join('\n'),
+    );
+    const placeholder = lib(`changelog_notes 1.0.0 ${JSON.stringify(file)}`);
+    assert.equal(placeholder.code, 1);
+    assert.match(placeholder.stderr, /placeholder/);
+
+    const real = lib(`changelog_notes 1.0.0 ${JSON.stringify(join(REPO_ROOT, 'CHANGELOG.md'))}`);
+    assert.equal(real.code, 0, real.stderr);
+    assert.match(real.stdout, /SQLite WAL/);
   });
 
   it('accepts the real pack allowlist and rejects a leaked tree', () => {
@@ -258,7 +312,7 @@ describe('release.sh helpers', () => {
     assert.equal(plain.stdout.trim(), './release.sh publish --confirm --tag latest');
 
     const withOtp = lib('next_publish_command next 123456');
-    assert.equal(withOtp.stdout.trim(), './release.sh publish --confirm --tag next --otp 123456');
+    assert.equal(withOtp.stdout.trim(), './release.sh publish --confirm --tag next --otp <code>');
   });
 });
 
@@ -278,7 +332,7 @@ describe('package manifest and legacy cleanup', () => {
       assert.ok(pkg.keywords.includes(keyword), `package.json keywords must include ${keyword}`);
     }
     assert.match(pkg.description, /SQLite/i);
-    assert.equal(pkg.bin.novaflow, './bin/novaflow');
+    assert.deepEqual(pkg.bin, { novaflow: './bin/novaflow' });
     assert.ok(pkg.files.includes('dist/'));
   });
 
@@ -318,7 +372,7 @@ describe('published tarball', () => {
     const prefix = join(work, 'prefix');
     const installed = spawnSync(
       'npm',
-      ['install', '-g', '--prefix', prefix, '--no-audit', '--no-fund', '--prefer-offline', join(work, tarball)],
+      ['install', '-g', '--prefix', prefix, '--no-audit', '--no-fund', '--offline', join(work, tarball)],
       { cwd: work, encoding: 'utf8', timeout: 300_000 },
     );
     assert.equal(installed.status, 0, `npm install -g failed: ${installed.stderr}`);

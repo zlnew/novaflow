@@ -281,17 +281,24 @@ ensure_changelog_section() {
 
 # Prints the `## [v]` section body, or exits 1 naming why the section is unusable.
 changelog_notes() {
-  local v="$1" file="${2:-CHANGELOG.md}" vre start end body
+  local v="$1" file="${2:-CHANGELOG.md}" vre start heading end body
   [ -f "$file" ] || die "missing ${file}"
   vre="${v//./\\.}"
   start="$(grep -m1 -nE "^## \\[${vre}\\]" "$file" | cut -d: -f1 || true)"
   [ -n "$start" ] ||
     die "${file} has no \"## [${v}]\" section — add one that opens \"## [${v}] — <date>\" and says what changed for the user"
+  heading="$(sed -n "${start}p" "$file")"
+  if printf '%s\n' "$heading" | grep -qiE '([[:space:]]|[—-])unreleased([[:space:]]|$)'; then
+    die "the \"## [${v}]\" heading in ${file} still says unreleased — replace it with the release date before tagging"
+  fi
   end="$(awk -v s="$start" 'NR > s && /^## / { print NR; exit }' "$file")"
   [ -n "$end" ] || end=$(( $(wc -l <"$file") + 2 ))
   body="$(sed -n "$((start + 1)),$((end - 1))p" "$file" | sed -e '/./,$!d')"
   [ -n "${body//[[:space:]]/}" ] ||
     die "the \"## [${v}]\" section of ${file} is empty — write what changed for the user, then re-run"
+  if printf '%s\n' "$body" | grep -qF 'Write what changed for the user, then run ./release.sh tag.'; then
+    die "the \"## [${v}]\" section of ${file} still contains the scaffold placeholder — write real release notes first"
+  fi
   printf '%s\n' "$body"
 }
 
@@ -401,10 +408,28 @@ require_tag_at_head() {
 require_unpublished() {
   local v="$1" out
   if out="$(npm view "novaflow@${v}" version 2>&1)"; then
+    if [ -z "${out//[[:space:]]/}" ]; then
+      return 0
+    fi
     die "novaflow@${v} is already on the registry (npm view: ${out}) — bump the version instead of republishing"
   fi
-  printf '%s\n' "$out" | grep -qE 'E404|404' ||
+  printf '%s\n' "$out" | grep -qE '(^|[[:space:]:])E?404([[:space:]]|$)' ||
     die "could not confirm novaflow@${v} is unpublished — npm view said: ${out}"
+}
+
+has_automation_npm_token() {
+  if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+    return 0
+  fi
+  local npmrc="${npm_config_userconfig:-${NPM_CONFIG_USERCONFIG:-${HOME:-}/.npmrc}}"
+  [ -f "$npmrc" ] && grep -Eq '^[[:space:]]*[^#;].*:_authToken=[[:space:]]*[^[:space:]]+' "$npmrc"
+}
+
+require_publish_otp_ready() {
+  local confirm="$1" otp="$2"
+  if [ "$confirm" -eq 1 ] && [ -z "$otp" ] && ! has_automation_npm_token && [ ! -t 0 ]; then
+    halt "publish --confirm needs an OTP here: stdin is not a TTY. Pass --otp <code> or set NODE_AUTH_TOKEN (a granular 2FA-bypass token), then re-run"
+  fi
 }
 
 require_npm_auth() {
@@ -420,16 +445,16 @@ next_publish_command() {
   local dist_tag="$1" otp="$2" command
   command="./release.sh publish --confirm --tag ${dist_tag}"
   if [ -n "$otp" ]; then
-    command="${command} --otp ${otp}"
+    command="${command} --otp <code>"
   fi
   printf '%s\n' "$command"
 }
 
 cmd_publish() {
-  local confirm=0 otp="" dist_tag="latest" v tag
+  local dry_run=0 confirm=0 otp="" dist_tag="latest" v tag
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --dry-run) shift ;;
+      --dry-run) dry_run=1; shift ;;
       --confirm) confirm=1; shift ;;
       --otp)
         [ "$#" -ge 2 ] || halt "--otp needs <code>"
@@ -457,15 +482,17 @@ cmd_publish() {
     esac
   done
   [ -n "$dist_tag" ] || halt "--tag needs a non-empty <dist-tag>"
+  if [ "$dry_run" -eq 1 ] && [ "$confirm" -eq 1 ]; then
+    halt "cannot combine --dry-run and --confirm — pass --dry-run to preview or --confirm to upload"
+  fi
 
   # 2FA: an explicit OTP and an automation token both answer the prompt. Without
   # either, a TTY hands control to npm; a pipe fails fast instead of hanging.
-  if [ "$confirm" -eq 1 ] && [ -z "$otp" ] && [ -z "${NODE_AUTH_TOKEN:-}" ] && [ ! -t 0 ]; then
-    halt "publish --confirm needs an OTP here: stdin is not a TTY. Pass --otp <code> or set NODE_AUTH_TOKEN (a granular 2FA-bypass token), then re-run"
-  fi
+  require_publish_otp_ready "$confirm" "$otp"
 
   require_branch main
   require_clean
+  require_npm_auth
   cmd_check
 
   v="$(version)"
@@ -473,7 +500,6 @@ cmd_publish() {
   git fetch -q origin --tags
   require_tag_at_head "$tag"
   require_unpublished "$v"
-  require_npm_auth
 
   local publish_args=(--tag "$dist_tag")
   if [ -n "$otp" ]; then
