@@ -418,11 +418,9 @@ require_unpublished() {
 }
 
 has_automation_npm_token() {
-  if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
-    return 0
-  fi
-  local npmrc="${npm_config_userconfig:-${NPM_CONFIG_USERCONFIG:-${HOME:-}/.npmrc}}"
-  [ -f "$npmrc" ] && grep -Eq '^[[:space:]]*[^#;].*:_authToken=[[:space:]]*[^[:space:]]+' "$npmrc"
+  # Normal `npm login` also writes //registry.npmjs.org/:_authToken to ~/.npmrc,
+  # so only treat NODE_AUTH_TOKEN (or an explicit bypass opt-in) as 2FA-bypass.
+  [ -n "${NODE_AUTH_TOKEN:-}" ] || [ "${NOVAFLOW_NPM_BYPASS_2FA:-0}" = "1" ]
 }
 
 require_publish_otp_ready() {

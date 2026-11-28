@@ -157,30 +157,27 @@ describe('release.sh argument guards', () => {
   });
 
   it('exits 2 when --confirm needs an OTP and stdin is not a TTY', () => {
-    const emptyNpmrc = join(scratchDir('novaflow-npmrc-'), 'npmrc');
-    writeFileSync(emptyNpmrc, '');
-    const result = release(['publish', '--confirm'], { NODE_AUTH_TOKEN: '', npm_config_userconfig: emptyNpmrc });
+    const result = lib('require_publish_otp_ready 1 "" </dev/null', {
+      NODE_AUTH_TOKEN: '',
+      NOVAFLOW_NPM_BYPASS_2FA: '0',
+    });
     assert.equal(result.code, 2, `expected exit 2, got ${result.code}: ${result.stdout}${result.stderr}`);
     assert.match(result.stderr, /--otp/);
     assert.match(result.stderr, /NODE_AUTH_TOKEN/);
   });
 
-  it('does not demand an OTP when an automation token or _authToken is configured', () => {
-    const emptyNpmrc = join(scratchDir('novaflow-npmrc-'), 'npmrc');
-    writeFileSync(emptyNpmrc, '');
+  it('does not demand an OTP when NODE_AUTH_TOKEN or explicit bypass opt-in is configured', () => {
     const withEnv = lib('require_publish_otp_ready 1 "" </dev/null', {
       NODE_AUTH_TOKEN: 'npm_fake_token_for_guards',
-      npm_config_userconfig: emptyNpmrc,
+      NOVAFLOW_NPM_BYPASS_2FA: '0',
     });
     assert.equal(withEnv.code, 0, withEnv.stderr);
 
-    const tokenNpmrc = join(scratchDir('novaflow-npmrc-tok-'), 'npmrc');
-    writeFileSync(tokenNpmrc, '//registry.npmjs.org/:_authToken=npm_fake_rc_token\n');
-    const withNpmrc = lib('require_publish_otp_ready 1 "" </dev/null', {
+    const withOptIn = lib('require_publish_otp_ready 1 "" </dev/null', {
       NODE_AUTH_TOKEN: '',
-      npm_config_userconfig: tokenNpmrc,
+      NOVAFLOW_NPM_BYPASS_2FA: '1',
     });
-    assert.equal(withNpmrc.code, 0, withNpmrc.stderr);
+    assert.equal(withOptIn.code, 0, withOptIn.stderr);
   });
 
   it('accepts publish --help without running a preflight', () => {
