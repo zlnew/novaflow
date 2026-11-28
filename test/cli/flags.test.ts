@@ -171,8 +171,8 @@ describe('cli global flags and grammar', () => {
     const box = makeBox();
     const withoutDir = box.jsonError(['skill', 'status', '--local', '--copy']);
     assert.match(withoutDir.message, /Unknown flag|--copy|not wired/i);
-    const statusBare = box.jsonError(['skill', 'status', '--local']);
-    assert.equal(statusBare.code, 'VALIDATION_ERROR');
-    assert.match(statusBare.hint ?? '', /P4b/);
+    const statusBare = box.json(['skill', 'status', '--local']);
+    assert.equal(statusBare.command, 'skill.status');
+    assert.equal(statusBare.data.local, true);
   });
 });
