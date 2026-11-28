@@ -216,6 +216,7 @@ describe('skill status', () => {
   it('upgrades a canonical store carrying an older version marker', () => {
     const box = makeBox();
     box.seed('claude');
+    seedUnmanaged(box.paths.canonical);
     seedMarker(box.paths.canonical, '0.9.0');
 
     const envelope = box.json(['skill', 'install']);

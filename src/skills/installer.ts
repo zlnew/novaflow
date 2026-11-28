@@ -213,7 +213,7 @@ function copyTree(source: string, dest: string): void {
 function writeCanonical(canonical: string, source: string, version: string, installedAt: string): void {
   const parent = dirname(canonical);
   mkdirSync(parent, { recursive: true });
-  const stage = `${canonical}.tmp-${process.pid}-${Date.now()}`;
+  const stage = join(parent, `.novaflow.tmp-${process.pid}-${Date.now()}`);
   try {
     mkdirSync(stage, { recursive: true });
     copyTree(source, stage);
