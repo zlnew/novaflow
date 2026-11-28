@@ -65,10 +65,21 @@ export function openDatabase(file: string): DatabaseSync {
 }
 
 function applyPragmas(db: DatabaseSync): void {
+  // Set busy_timeout first so journal_mode = WAL retries instead of failing immediately under contention.
+  db.exec(`PRAGMA busy_timeout = ${PRAGMA_SETTINGS.busy_timeout};`);
   db.exec(`PRAGMA journal_mode = ${PRAGMA_SETTINGS.journal_mode};`);
   db.exec(`PRAGMA synchronous = ${PRAGMA_SETTINGS.synchronous};`);
   db.exec(`PRAGMA foreign_keys = ${PRAGMA_SETTINGS.foreign_keys};`);
-  db.exec(`PRAGMA busy_timeout = ${PRAGMA_SETTINGS.busy_timeout};`);
+}
+
+function assertKnownVersion(version: number): void {
+  if (version > LATEST_SCHEMA_VERSION) {
+    throw new NovaError(
+      'SCHEMA_TOO_NEW',
+      `Database schema version ${version} is newer than this binary supports (${LATEST_SCHEMA_VERSION}). Upgrade novaflow before using this workspace.`,
+      { hint: 'Upgrade novaflow (npm install -g novaflow@latest) before using this workspace.' },
+    );
+  }
 }
 
 /**
@@ -79,29 +90,30 @@ function applyPragmas(db: DatabaseSync): void {
  */
 export function migrate(db: DatabaseSync): MigrationResult {
   const current = readSchemaVersion(db);
-  if (current > LATEST_SCHEMA_VERSION) {
-    throw new NovaError(
-      'SCHEMA_TOO_NEW',
-      `Database schema version ${current} is newer than this binary supports (${LATEST_SCHEMA_VERSION}). Upgrade novaflow before using this workspace.`,
-      { hint: 'Upgrade novaflow (npm install -g novaflow@latest) before using this workspace.' },
-    );
+  assertKnownVersion(current);
+
+  if (!MIGRATIONS.some((migration) => migration.version > current)) {
+    return { applied: [], version: current };
   }
 
-  const pending = MIGRATIONS.filter((migration) => migration.version > current);
-  const applied: number[] = [];
-  for (const migration of pending) {
-    withTx(db, (tx) => {
+  return withTx(db, (tx) => {
+    const liveVersion = readSchemaVersion(tx);
+    assertKnownVersion(liveVersion);
+
+    const applied: number[] = [];
+    for (const migration of MIGRATIONS) {
+      if (migration.version <= liveVersion) continue;
       tx.exec(migration.sql);
       tx.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
         migration.version,
         migration.name,
         new Date().toISOString(),
       );
-    });
-    applied.push(migration.version);
-  }
+      applied.push(migration.version);
+    }
 
-  return { applied, version: readSchemaVersion(db) };
+    return { applied, version: readSchemaVersion(tx) };
+  });
 }
 
 /**

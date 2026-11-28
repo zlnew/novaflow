@@ -14,7 +14,7 @@ import {
   withTx,
 } from '../../src/store/db.js';
 import { isNovaError } from '../../src/store/errors.js';
-import { sandbox } from './helpers.js';
+import { sandbox, type Sandbox } from './helpers.js';
 
 const EXPECTED_TABLES = [
   'events',
@@ -90,7 +90,7 @@ describe('store/migrations', () => {
 });
 
 describe('store/db', () => {
-  let box = sandbox();
+  let box: Sandbox;
   let dbPath = '';
   let db: ReturnType<typeof openDatabase>;
 
