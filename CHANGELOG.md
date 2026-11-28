@@ -2,6 +2,10 @@
 
 What changed for you, release by release. Newest first.
 
+## [1.0.1] — 2026-11-28
+
+- **Release dry-run fix:** `./release.sh publish --dry-run` now isolates `npm pack` and `npm install` in the tarball smoke test from inherited `npm_config_dry_run=true` during `prepublishOnly`.
+
 ## [1.0.0] — 2026-11-28
 
 Clean-slate redesign of NovaFlow as a local-first, daemonless CLI and MCP orchestration ledger.
