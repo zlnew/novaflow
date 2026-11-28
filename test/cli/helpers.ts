@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sandbox, type Sandbox } from '../store/helpers.js';
 
 /** Repository root of the checkout under test. */
 export const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+/** Live package version read from `package.json`. */
+export const PACKAGE_VERSION = (JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')) as { version: string }).version;
 /** The published entry point (`novaflow-v100/cli` §1). */
 export const BIN = join(REPO_ROOT, 'bin', 'novaflow');
 const DIST_ENTRY = join(REPO_ROOT, 'dist', 'cli', 'index.js');

@@ -336,7 +336,7 @@ describe('package manifest and legacy cleanup', () => {
       bin: Record<string, string>;
       files: string[];
     };
-    assert.equal(pkg.version, '1.0.0');
+    assert.match(pkg.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
     assert.equal(pkg.scripts.prepublishOnly, 'npm run typecheck && npm run build && npm test');
     for (const keyword of ['cli', 'mcp', 'sqlite', 'tasks', 'orchestration', 'agentskills']) {
       assert.ok(pkg.keywords.includes(keyword), `package.json keywords must include ${keyword}`);

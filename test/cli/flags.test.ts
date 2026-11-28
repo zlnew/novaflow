@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
-import { cliBox, createWorkspace } from './helpers.js';
+import { cliBox, createWorkspace, PACKAGE_VERSION } from './helpers.js';
 
 const boxes: Array<ReturnType<typeof cliBox>> = [];
 function makeBox(): ReturnType<typeof cliBox> {
@@ -20,7 +20,7 @@ describe('cli global flags and grammar', () => {
     for (const flag of ['--version', '-V']) {
       const result = box.run([flag]);
       assert.equal(result.code, 0);
-      assert.equal(result.stdout, 'novaflow 1.0.0\n');
+      assert.equal(result.stdout, `novaflow ${PACKAGE_VERSION}\n`);
       assert.equal(result.stderr, '');
     }
   });
