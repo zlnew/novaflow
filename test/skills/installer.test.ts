@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
+import { PACKAGE_VERSION } from '../cli/helpers.js';
 import { seedGitRoot, seedMarker, seedUnmanaged, skillBox, type SkillBox } from './helpers.js';
 
 const boxes: SkillBox[] = [];
@@ -28,7 +29,7 @@ describe('skill install', () => {
     assert.equal(envelope.command, 'skill.install');
     assert.equal(envelope.data.dry_run, false);
     assert.equal(envelope.data.changed, true);
-    assert.equal(envelope.data.version, '1.0.0');
+    assert.equal(envelope.data.version, PACKAGE_VERSION);
     assert.deepEqual(states(envelope.data.targets), { claude: 'linked', pi: 'linked' });
     assert.ok(envelope.data.targets.every((target: { mode: string }) => target.mode === 'symlink'));
 
@@ -48,7 +49,7 @@ describe('skill install', () => {
     const marker = box.marker(box.paths.canonical);
     assert.ok(marker, 'marker file must exist');
     assert.equal(marker.package, 'novaflow');
-    assert.equal(marker.version, '1.0.0');
+    assert.equal(marker.version, PACKAGE_VERSION);
     assert.match(marker.installed_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
   });
 
@@ -58,7 +59,7 @@ describe('skill install', () => {
     assert.equal(box.state(box.paths.harness('codex')), 'dir');
     assert.equal(envelope.data.targets[0].mode, 'copy');
     assert.equal(envelope.data.targets[0].state, 'copied');
-    assert.equal(box.marker(box.paths.harness('codex'))?.version, '1.0.0');
+    assert.equal(box.marker(box.paths.harness('codex'))?.version, PACKAGE_VERSION);
     assert.match(readFileSync(join(box.paths.harness('codex'), 'SKILL.md'), 'utf8'), /^---\nname: novaflow\n/);
   });
 
@@ -155,7 +156,7 @@ describe('skill status', () => {
     assert.equal(envelope.data.canonical.installed, false);
     assert.equal(envelope.data.canonical.version, null);
     assert.equal(envelope.data.canonical.version_match, false);
-    assert.equal(envelope.data.cli_version, '1.0.0');
+    assert.equal(envelope.data.cli_version, PACKAGE_VERSION);
     assert.deepEqual(envelope.data.targets, []);
   });
 
@@ -178,7 +179,7 @@ describe('skill status', () => {
     seedUnmanaged(box.paths.harness('pi'));
 
     const envelope = box.json(['skill', 'status']);
-    assert.equal(envelope.data.canonical.version, '1.0.0');
+    assert.equal(envelope.data.canonical.version, PACKAGE_VERSION);
     assert.equal(envelope.data.canonical.version_match, true);
     assert.deepEqual(states(envelope.data.targets), { claude: 'missing', codex: 'stale', pi: 'unmanaged' });
     assert.equal(envelope.data.targets.find((target: { harness: string }) => target.harness === 'codex').version, '0.9.0');
@@ -222,7 +223,7 @@ describe('skill status', () => {
     const envelope = box.json(['skill', 'install']);
     assert.equal(envelope.data.changed, true);
     assert.equal(envelope.data.canonical.changed, true);
-    assert.equal(box.marker(box.paths.canonical)?.version, '1.0.0');
+    assert.equal(box.marker(box.paths.canonical)?.version, PACKAGE_VERSION);
     assert.equal(box.state(box.paths.harness('claude')), 'symlink');
   });
 
@@ -316,7 +317,7 @@ describe('skill --local', () => {
     assert.equal(envelope.data.local, true);
     assert.equal(envelope.data.root, canonical);
     assert.equal(box.state(canonical), 'dir');
-    assert.equal(box.marker(canonical)?.version, '1.0.0');
+    assert.equal(box.marker(canonical)?.version, PACKAGE_VERSION);
     assert.equal(existsSync(box.paths.agentsHome), false, 'global ~/.agents must stay untouched');
     assert.equal(box.state(join(project, '.claude', 'skills', 'novaflow')), 'missing');
   });

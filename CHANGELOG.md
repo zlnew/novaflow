@@ -2,9 +2,9 @@
 
 What changed for you, release by release. Newest first.
 
-## [1.0.1] — unreleased
+## [1.0.1] — 2026-11-28
 
-Write what changed for the user, then run ./release.sh tag.
+- **Release dry-run fix:** `./release.sh publish --dry-run` now isolates `npm pack` and `npm install` in the tarball smoke test from inherited `npm_config_dry_run=true` during `prepublishOnly`.
 
 ## [1.0.0] — 2026-11-28
 
