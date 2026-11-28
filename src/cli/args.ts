@@ -9,7 +9,7 @@
 import { validationError } from '../core/errors.js';
 
 /** Value shape of a flag. */
-export type FlagKind = 'boolean' | 'string' | 'int';
+export type FlagKind = 'boolean' | 'string' | 'optional-string' | 'int';
 
 export interface FlagDef {
   /** Long name without the leading `--`. */
@@ -141,6 +141,20 @@ export function tokenize(argv: readonly string[], defs: readonly FlagDef[]): Raw
           throw validationError(`Flag "--${name}" does not take a value.`, `Pass "--${name}" on its own.`);
         }
         pushFlag(flags, name, 'true');
+        continue;
+      }
+      if (def.kind === 'optional-string') {
+        if (inline !== undefined) {
+          pushFlag(flags, name, inline);
+          continue;
+        }
+        const next = argv[cursor + 1];
+        if (next !== undefined && next !== '--' && !next.startsWith('-')) {
+          pushFlag(flags, name, next);
+          cursor += 1;
+        } else {
+          pushFlag(flags, name, '');
+        }
         continue;
       }
       let value = inline;

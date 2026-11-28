@@ -161,6 +161,20 @@ describe('cli workspace commands', () => {
     const registered = box.json(['workspace', 'register', '--name', 'reg-me', '--path', workspace.root]);
     assert.equal(registered.data.name, 'reg-me');
 
+    const dryUnregister = box.json(['workspace', 'unregister', 'reg-me', '--dry-run']);
+    assert.equal(dryUnregister.data.dry_run, true);
+    assert.equal(dryUnregister.data.removed, false);
+    assert.deepEqual(dryUnregister.next_actions, []);
+    const stillRegistered = JSON.parse(readFileSync(join(box.box.env.NOVAFLOW_HOME as string, 'workspaces.json'), 'utf8'));
+    assert.ok('reg-me' in stillRegistered.workspaces);
+
+    box.run(['workspace', 'unregister', 'reg-me']);
+    const dryRegister = box.json(['workspace', 'register', '--name', 'reg-me', '--path', workspace.root, '--dry-run']);
+    assert.equal(dryRegister.data.dry_run, true);
+    assert.deepEqual(dryRegister.next_actions, []);
+    const stillMissing = JSON.parse(readFileSync(join(box.box.env.NOVAFLOW_HOME as string, 'workspaces.json'), 'utf8'));
+    assert.deepEqual(Object.keys(stillMissing.workspaces), []);
+
     const error = box.jsonError(['workspace', 'unregister', 'ghost']);
     assert.equal(error.code, 'NOT_FOUND');
   });
@@ -276,10 +290,18 @@ describe('cli project commands', () => {
     assert.equal(badStatus.code, 'VALIDATION_ERROR');
   });
 
-  it('archives a project as a status transition', () => {
+  it('archives a project as a status transition and honours --dry-run', () => {
     const box = makeBox();
     const workspace = createWorkspace(box, 'project-archive');
     const project = createProject(box, workspace, 'Archivable');
+
+    const dryHuman = box.run(['project', 'archive', project.slug, '-w', workspace.root, '--dry-run']);
+    assert.equal(dryHuman.code, 0);
+    assert.match(dryHuman.stdout, /Dry run/);
+    const dryJson = box.json(['project', 'archive', project.slug, '-w', workspace.root, '--dry-run']);
+    assert.equal(dryJson.data.dry_run, true);
+    assert.deepEqual(dryJson.next_actions, []);
+
     const envelope = box.json(['project', 'archive', project.slug, '-w', workspace.root]);
     assert.equal(envelope.command, 'project.archive');
     assert.equal(envelope.data.project.status, 'archived');

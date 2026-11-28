@@ -464,6 +464,7 @@ export interface RegisterWorkspaceInput {
   cwd?: string | undefined;
   env?: Env | undefined;
   now?: Date | undefined;
+  dry_run?: boolean | undefined;
 }
 
 export interface RegisterWorkspaceResult {
@@ -471,6 +472,7 @@ export interface RegisterWorkspaceResult {
   root: string;
   registry_path: string;
   registered_at: string;
+  dry_run: boolean;
 }
 
 /** `workspace register`: adds an existing `.novaflow/` to the global index. */
@@ -493,20 +495,25 @@ export function registerWorkspace(input: RegisterWorkspaceInput): RegisterWorksp
     throw conflictError(`Workspace name "${name}" is already registered to ${registered.path}.`, 'Unregister the existing workspace first.');
   }
 
-  registerWorkspaceInIndex(name, root, env);
+  const dryRun = input.dry_run === true;
+  if (!dryRun) {
+    registerWorkspaceInIndex(name, root, env);
+  }
 
-  return { name, root, registry_path: registryFilePath(env), registered_at: now.toISOString() };
+  return { name, root, registry_path: registryFilePath(env), registered_at: now.toISOString(), dry_run: dryRun };
 }
 
 export interface UnregisterWorkspaceInput {
   name: string;
   env?: Env | undefined;
+  dry_run?: boolean | undefined;
 }
 
 export interface UnregisterWorkspaceResult {
   name: string;
   removed: boolean;
   registry_path: string;
+  dry_run: boolean;
 }
 
 /** `workspace unregister`: drops the registry entry, never the directory. */
@@ -516,8 +523,11 @@ export function unregisterWorkspace(input: UnregisterWorkspaceInput): Unregister
   if (!(input.name in registry.workspaces)) {
     throw notFoundError(`Workspace "${input.name}" is not registered.`, 'List registered workspaces with "novaflow workspace list".');
   }
-  unregisterWorkspaceFromIndex(input.name, env);
-  return { name: input.name, removed: true, registry_path: registryFilePath(env) };
+  const dryRun = input.dry_run === true;
+  if (!dryRun) {
+    unregisterWorkspaceFromIndex(input.name, env);
+  }
+  return { name: input.name, removed: !dryRun, registry_path: registryFilePath(env), dry_run: dryRun };
 }
 
 export interface OverviewStatusInput extends WorkspaceOptions {

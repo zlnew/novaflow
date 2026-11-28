@@ -30,16 +30,92 @@ interface Requested {
   help: boolean;
   json: boolean;
   quiet: boolean;
+  strippedArgv: string[];
 }
 
-/** Reads the flags that must be honoured even when the rest of argv is invalid. */
+/**
+ * Reads global output/meta flags before full validation, respecting `--` and
+ * skipping values consumed by value-taking flags.
+ */
 function requested(argv: readonly string[]): Requested {
-  return {
-    version: argv.includes('--version') || argv.includes('-V'),
-    help: argv.includes('--help') || argv.includes('-h'),
-    json: argv.includes('--json'),
-    quiet: argv.includes('--quiet') || argv.includes('-q'),
-  };
+  const long = new Map<string, FlagDef>();
+  const short = new Map<string, FlagDef>();
+  for (const def of ALL_FLAGS) {
+    long.set(def.name, def);
+    if (def.short !== undefined) short.set(def.short, def);
+  }
+
+  let version = false;
+  let help = false;
+  let json = false;
+  let quiet = false;
+  const strippedArgv: string[] = [];
+
+  for (let cursor = 0; cursor < argv.length; cursor += 1) {
+    const token = argv[cursor] as string;
+    if (token === '--') {
+      strippedArgv.push(...argv.slice(cursor));
+      break;
+    }
+    if (token.startsWith('--')) {
+      const body = token.slice(2);
+      const equals = body.indexOf('=');
+      const name = equals === -1 ? body : body.slice(0, equals);
+      if (name === 'version') version = true;
+      else if (name === 'help') {
+        help = true;
+        continue;
+      } else if (name === 'json') json = true;
+      else if (name === 'quiet') quiet = true;
+
+      strippedArgv.push(token);
+      const def = long.get(name);
+      if (equals === -1 && def !== undefined && (def.kind === 'string' || def.kind === 'int')) {
+        const next = argv[cursor + 1];
+        if (next !== undefined) {
+          strippedArgv.push(next);
+          cursor += 1;
+        }
+      } else if (equals === -1 && def?.kind === 'optional-string') {
+        const next = argv[cursor + 1];
+        if (next !== undefined && next !== '--' && !next.startsWith('-')) {
+          strippedArgv.push(next);
+          cursor += 1;
+        }
+      }
+      continue;
+    }
+    if (token.startsWith('-') && token !== '-') {
+      const body = token.slice(1);
+      const equals = body.indexOf('=');
+      const name = equals === -1 ? body : body.slice(0, equals);
+      if (name === 'V') version = true;
+      else if (name === 'h') {
+        help = true;
+        continue;
+      } else if (name === 'q') quiet = true;
+
+      strippedArgv.push(token);
+      const def = name.length === 1 ? short.get(name) : undefined;
+      if (equals === -1 && def !== undefined && (def.kind === 'string' || def.kind === 'int')) {
+        const next = argv[cursor + 1];
+        if (next !== undefined) {
+          strippedArgv.push(next);
+          cursor += 1;
+        }
+      } else if (equals === -1 && def?.kind === 'optional-string') {
+        const next = argv[cursor + 1];
+        if (next !== undefined && next !== '--' && !next.startsWith('-')) {
+          strippedArgv.push(next);
+          cursor += 1;
+        }
+      }
+      continue;
+    }
+    strippedArgv.push(token);
+  }
+
+  return { version, help, json, quiet, strippedArgv };
 }
 
 /** Best-effort `noun.verb` label for an envelope when parsing itself failed. */
@@ -140,7 +216,7 @@ export function main(argv: readonly string[] = process.argv.slice(2), streams: S
     return 0;
   }
 
-  const effectiveArgv = wants.help ? argv.filter((token) => token !== '--help' && token !== '-h') : [...argv];
+  const effectiveArgv = wants.help ? wants.strippedArgv : [...argv];
 
   let raw: RawArgs;
   try {
@@ -179,7 +255,7 @@ export function main(argv: readonly string[] = process.argv.slice(2), streams: S
 
   const resolution = resolveVerb(module, positionals);
   if ('error' in resolution) {
-    if (wants.help || positionals.length === 1) {
+    if (wants.help) {
       streams.stdout(renderModuleHelp(module));
       return 0;
     }

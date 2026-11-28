@@ -703,9 +703,9 @@ const noteVerb: VerbSpec = {
     );
     return {
       data: { note: result.task, event_seqs: result.event_seqs, dry_run: result.dry_run },
-      human: result.dry_run ? 'Dry run: would append the note.\nNo rows written.\n' : `Noted on ${id}.\n`,
-      quiet: identifiers([id]),
-      next_actions: result.dry_run ? [] : afterTaskNote({ key: id }),
+      human: result.dry_run ? 'Dry run: would append the note.\nNo rows written.\n' : `Noted on ${result.task_key}.\n`,
+      quiet: identifiers([result.task_key]),
+      next_actions: result.dry_run ? [] : afterTaskNote({ key: result.task_key }),
     };
   },
 };
@@ -741,9 +741,9 @@ const attachVerb: VerbSpec = {
       data: result,
       human: result.dry_run
         ? 'Dry run: would attach the artifact.\nNo rows written.\n'
-        : `Attached ${result.artifact.uri} (${result.artifact.kind}) to ${id}.\n`,
-      quiet: identifiers([id]),
-      next_actions: result.dry_run ? [] : afterTaskAttach({ key: id }),
+        : `Attached ${result.artifact.uri} (${result.artifact.kind}) to ${result.task_key}.\n`,
+      quiet: identifiers([result.task_key]),
+      next_actions: result.dry_run ? [] : afterTaskAttach({ key: result.task_key }),
     };
   },
 };

@@ -149,4 +149,30 @@ describe('cli global flags and grammar', () => {
     assert.ok(existsSync(join(root, '.novaflow', 'state.db')));
     assert.equal(result.stderr, '');
   });
+
+  it('fails exit 2 with JSON on stderr when a noun omits its verb', () => {
+    const box = makeBox();
+    const result = box.run(['task', '--json']);
+    assert.equal(result.code, 2);
+    assert.equal(result.stdout, '');
+    const envelope = JSON.parse(result.stderr);
+    assert.equal(envelope.ok, false);
+    assert.equal(envelope.error.code, 'VALIDATION_ERROR');
+  });
+
+  it('does not treat -V as --version when consumed as a flag value', () => {
+    const box = makeBox();
+    const workspace = createWorkspace(box, 'val-flag');
+    const envelope = box.json(['project', 'create', '--title', '-V', '--slug', 'dash-v', '-w', workspace.root]);
+    assert.equal(envelope.data.project.title, '-V');
+  });
+
+  it('accepts --local with or without a directory argument', () => {
+    const box = makeBox();
+    const withoutDir = box.jsonError(['skill', 'status', '--local', '--copy']);
+    assert.match(withoutDir.message, /Unknown flag|--copy|not wired/i);
+    const statusBare = box.jsonError(['skill', 'status', '--local']);
+    assert.equal(statusBare.code, 'VALIDATION_ERROR');
+    assert.match(statusBare.hint ?? '', /P4b/);
+  });
 });

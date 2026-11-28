@@ -193,15 +193,18 @@ const registerVerb: VerbSpec = {
       env: ctx.env,
       cwd: ctx.cwd,
       now: ctx.now,
+      dry_run: ctx.options.dryRun,
     });
-    const human = `Registered workspace ${result.name} at ${result.root}\nRegistry: ${result.registry_path}\n`;
+    const human = result.dry_run
+      ? `Dry run: would register workspace ${result.name} at ${result.root}\nNo registry changes written.\n`
+      : `Registered workspace ${result.name} at ${result.root}\nRegistry: ${result.registry_path}\n`;
     return {
       data: result,
       human,
       quiet: identifiers([result.name]),
-      next_actions: [
-        { command: `novaflow workspace show ${result.name}`, description: 'Inspect the registered workspace' },
-      ],
+      next_actions: result.dry_run
+        ? []
+        : [{ command: `novaflow workspace show ${result.name}`, description: 'Inspect the registered workspace' }],
     };
   },
 };
@@ -216,14 +219,16 @@ const unregisterVerb: VerbSpec = {
   examples: ['novaflow workspace unregister scratch'],
   run: (ctx) => {
     const name = ctx.args.positionals[0] as string;
-    const result = unregisterWorkspace({ name, env: ctx.env });
+    const result = unregisterWorkspace({ name, env: ctx.env, dry_run: ctx.options.dryRun });
     return {
       data: result,
-      human: `Unregistered workspace ${result.name}. Its .novaflow/ directory was not touched.\n`,
+      human: result.dry_run
+        ? `Dry run: would unregister workspace ${result.name}.\nNo registry changes written.\n`
+        : `Unregistered workspace ${result.name}. Its .novaflow/ directory was not touched.\n`,
       quiet: identifiers([result.name]),
-      next_actions: [
-        { command: 'novaflow workspace list', description: 'Confirm the registry contents' },
-      ],
+      next_actions: result.dry_run
+        ? []
+        : [{ command: 'novaflow workspace list', description: 'Confirm the registry contents' }],
     };
   },
 };

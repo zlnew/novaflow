@@ -1495,6 +1495,7 @@ export interface AddTaskNoteInput extends TaskRefInput {
 }
 
 export interface AddTaskNoteResult {
+  task_key: string;
   task: TaskNote;
   event_seqs: number[];
   dry_run: boolean;
@@ -1531,6 +1532,7 @@ export function addTaskNote(db: DatabaseSync, input: AddTaskNoteInput): AddTaskN
     });
 
     return {
+      task_key: task.key,
       task: { id, author: by, body, created_at: timestamp },
       event_seqs: [event.seq],
       dry_run: input.dry_run === true,
@@ -1547,6 +1549,7 @@ export interface AttachArtifactInput extends TaskRefInput {
 }
 
 export interface AttachArtifactResult {
+  task_key: string;
   artifact: TaskArtifact;
   event_seqs: number[];
   dry_run: boolean;
@@ -1584,6 +1587,7 @@ export function attachTaskArtifact(db: DatabaseSync, input: AttachArtifactInput)
     });
 
     return {
+      task_key: task.key,
       artifact: { id, uri, label, kind, created_at: timestamp },
       event_seqs: [event.seq],
       dry_run: input.dry_run === true,

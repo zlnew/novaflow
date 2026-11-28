@@ -248,11 +248,13 @@ const archiveVerb: VerbSpec = {
     const changed = result.changed.length === 0 ? 'already archived' : 'archived';
     return {
       data: result,
-      human: `Project ${result.project.slug}: ${changed}.\n`,
+      human: result.dry_run
+        ? `Dry run: would archive project ${result.project.slug}.\nNo rows written.\n`
+        : `Project ${result.project.slug}: ${changed}.\n`,
       quiet: identifiers([result.project.slug]),
-      next_actions: [
-        { command: `novaflow project show ${result.project.slug}`, description: 'Confirm the archived state' },
-      ],
+      next_actions: result.dry_run
+        ? []
+        : [{ command: `novaflow project show ${result.project.slug}`, description: 'Confirm the archived state' }],
     };
   },
 };
