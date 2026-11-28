@@ -39,11 +39,14 @@ describe('tools/list', () => {
   });
 
   it('gives every tool a description and an object input schema', async () => {
-    for (const tool of await h.tools()) {
+    const tools = await h.tools();
+    for (const tool of tools) {
       assert.equal(tool.inputSchema.type, 'object', `${tool.name} inputSchema must be an object`);
       assert.equal(typeof tool.description, 'string');
       assert.ok((tool.description as string).length > 0, `${tool.name} needs a description`);
     }
+    const projectUpdate = tools.find((tool) => tool.name === 'novaflow_project_update');
+    assert.deepEqual(projectUpdate?.inputSchema.required, ['project']);
   });
 
   it('never exposes the CLI-only machine-local commands', async () => {

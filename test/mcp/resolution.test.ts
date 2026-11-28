@@ -104,15 +104,22 @@ describe('workspace resolution', () => {
     }
   });
 
-  it('pins next_actions to the workspace it actually resolved', async () => {
+  it('pins next_actions to the workspace root path it actually resolved', async () => {
     const nested = box.mkdir('a', 'nested');
     await withServer({ cwd: nested }, async (h) => {
       const actions = await h.nextActions('novaflow_project_create', { title: 'Walk-up Project' });
       assert.ok(actions.length > 0);
       const workspace = actions[0]?.args.workspace;
-      assert.equal(workspace, 'ws-a', 'the follow-up call names the resolved workspace');
+      assert.equal(workspace, workspaceA, 'the follow-up call pins the resolved workspace root');
       const shown = await h.ok('novaflow_workspace_show', { workspace });
       assert.equal(shown.root, workspaceA);
+    });
+  });
+
+  it('treats blank workspace param as absent so server --workspace still wins', async () => {
+    await withServer({ workspace: workspaceB, env: { ...box.env, NOVAFLOW_WORKSPACE: 'ws-a' } }, async (h) => {
+      const board = await h.ok('novaflow_status', { workspace: '   ' });
+      assert.equal(board.workspace.root, workspaceB);
     });
   });
 

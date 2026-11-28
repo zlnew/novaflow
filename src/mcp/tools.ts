@@ -157,24 +157,25 @@ function projectRef(ctx: ToolContext, resolved: ResolvedWorkspace, name = 'proje
   };
 }
 
-/** The workspace identifier used in `next_actions`, preferring the call's own override. */
-function workspaceLabel(ctx: ToolContext, resolved: { name: string }): string {
-  return ctx.workspace ?? resolved.name;
+/** The workspace identifier used in `next_actions`: always pin the resolved root path. */
+function workspaceLabel(_ctx: ToolContext, resolved: { root: string }): string {
+  return resolved.root;
 }
 
 /**
- * Workspace name for `next_actions` when the handler only has the core result.
+ * Workspace root path for `next_actions` when the handler only has the core result.
  *
- * `withWorkspace` resolved the same target moments earlier, so this reads
- * `config.yaml` again (no database) to keep the advertised follow-up pinned to
- * the workspace the mutation landed in. An empty string means "no override" and
- * resolves exactly like an omitted `workspace` argument, so a workspace that
- * vanished mid-call downgrades the suggestion instead of failing a committed write.
+ * Pinning the resolved absolute root path guarantees follow-up calls land in
+ * the exact same workspace even for unregistered walk-up directories or
+ * colliding workspace names.
  */
 function workspaceName(ctx: ToolContext): string {
-  if (ctx.workspace !== null) return ctx.workspace;
   try {
-    return resolveWorkspace({ env: ctx.env, cwd: ctx.cwd }).name;
+    return resolveWorkspace({
+      ...(ctx.workspace !== null ? { workspace: ctx.workspace } : {}),
+      env: ctx.env,
+      cwd: ctx.cwd,
+    }).root;
   } catch {
     return '';
   }
@@ -340,16 +341,19 @@ export const TOOLS: readonly McpTool[] = [
     name: 'novaflow_project_update',
     description:
       'Update project metadata. JSON null clears a nullable field (or "" for text fields); tags replaces the full list.',
-    inputSchema: schema({
-      workspace: S.workspace(),
-      project: S.project(),
-      title: S.text('New title (cannot be cleared).'),
-      objective: S.nullableText('New objective; null or "" clears it.'),
-      repo_path: S.nullableText('New repository path; null or "" clears it.'),
-      verify_cmd: S.nullableText('New verification command; null or "" clears it.'),
-      tags: S.nullableList('Replaces the full tag list; null clears every tag.'),
-      status: { type: ['string', 'null'], enum: ['active', 'paused', 'archived', null], description: 'New status.' },
-    }),
+    inputSchema: schema(
+      {
+        workspace: S.workspace(),
+        project: S.project(),
+        title: S.text('New title (cannot be cleared).'),
+        objective: S.nullableText('New objective; null or "" clears it.'),
+        repo_path: S.nullableText('New repository path; null or "" clears it.'),
+        verify_cmd: S.nullableText('New verification command; null or "" clears it.'),
+        tags: S.nullableList('Replaces the full tag list; null clears every tag.'),
+        status: { type: ['string', 'null'], enum: ['active', 'paused', 'archived', null], description: 'New status.' },
+      },
+      ['project'],
+    ),
     handler: (ctx) => {
       const result = withWorkspace(ctx, (db) =>
         updateProject(db, {

@@ -87,11 +87,12 @@ export function createNovaflowServer(options: NovaflowServerOptions = {}): Serve
 
     try {
       const args = new ToolArgs(request.params.arguments ?? {}, tool.name);
+      const rawWorkspace = args.nullableString('workspace');
       const outcome = tool.handler({
         args,
-        // Per-call resolution: the tool param wins over the server `--workspace`;
-        // both are `undefined`-free so core can fall through to env/walk-up/default.
-        workspace: args.nullableString('workspace') ?? serverWorkspace,
+        // Per-call resolution: a non-blank tool param wins over the server `--workspace`;
+        // blank/absent falls through to server `--workspace`, then env/walk-up/default.
+        workspace: typeof rawWorkspace === 'string' && rawWorkspace.trim() !== '' ? rawWorkspace : serverWorkspace,
         env,
         cwd,
         now: clock(),
