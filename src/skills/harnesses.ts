@@ -55,11 +55,23 @@ export function isHarnessId(value: string): value is HarnessId {
 
 /** Parses one `--agent` value into harness ids, rejecting unknown names exit 2. */
 export function parseAgentList(value: string): HarnessId[] {
+  const trimmed = value.trim();
+  if (trimmed === 'auto') return [];
+  if (trimmed === '') {
+    throw validationError(
+      'Empty --agent harness list.',
+      `Use --agent auto or a comma-separated subset of: ${HARNESS_IDS.join(', ')}.`,
+    );
+  }
   const ids: HarnessId[] = [];
-  for (const raw of value.split(',')) {
+  for (const raw of trimmed.split(',')) {
     const name = raw.trim();
-    if (name === '') continue;
-    if (name === 'auto') return [];
+    if (name === '' || name === 'auto') {
+      throw validationError(
+        `Invalid --agent list "${value}".`,
+        `Use --agent auto by itself, or a comma-separated list of: ${HARNESS_IDS.join(', ')}.`,
+      );
+    }
     if (!isHarnessId(name)) {
       throw validationError(
         `Unknown agent harness "${name}".`,
@@ -81,6 +93,8 @@ export interface SelectedHarnesses {
   ids: LinkHarnessId[];
   /** True when `--agent` named them, so missing config dirs may be created. */
   explicit: boolean;
+  /** True when the canonical store itself is in scope (`auto` or `agents` named). */
+  includeCanonical: boolean;
 }
 
 /**
@@ -89,6 +103,10 @@ export interface SelectedHarnesses {
  */
 export function selectHarnesses(root: SkillRoot, agent: string | undefined): SelectedHarnesses {
   const wanted = agent === undefined ? [] : parseAgentList(agent);
-  if (wanted.length === 0) return { ids: detectHarnesses(root), explicit: false };
-  return { ids: wanted.filter((id): id is LinkHarnessId => id !== 'agents'), explicit: true };
+  if (wanted.length === 0) return { ids: detectHarnesses(root), explicit: false, includeCanonical: true };
+  return {
+    ids: wanted.filter((id): id is LinkHarnessId => id !== 'agents'),
+    explicit: true,
+    includeCanonical: wanted.includes('agents'),
+  };
 }

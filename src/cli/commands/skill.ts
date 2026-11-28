@@ -69,8 +69,15 @@ const installVerb: VerbSpec = {
       now: ctx.now,
     });
 
+    const canonicalVerb = report.dry_run
+      ? report.canonical.changed
+        ? 'Dry run: would write'
+        : 'Dry run: canonical up to date'
+      : report.canonical.changed
+        ? 'wrote'
+        : 'kept';
     const summary = [
-      `${report.dry_run ? 'Dry run: would write' : report.canonical.changed ? 'wrote' : 'kept'} canonical ${report.canonical.path} (version ${report.version})`,
+      `${canonicalVerb} canonical ${report.canonical.path} (version ${report.version})`,
       '',
       targetRows(report.targets),
     ].join('\n');

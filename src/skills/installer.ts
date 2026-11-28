@@ -16,6 +16,7 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -149,6 +150,11 @@ function writeMarker(dir: string, version: string, installedAt: string): void {
   writeFileSync(join(dir, MANAGED_MARKER), `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
 }
 
+function pointsAtCanonical(target: string, canonical: string): boolean {
+  if (samePath(target, canonical)) return true;
+  return resolve(target) === resolve(canonical) || resolve(target) === realpathOr(canonical);
+}
+
 /** Classifies one path against the canonical store and its version. */
 export function classifyEntry(path: string, canonical: string, canonicalVersion: string | null): EntryInfo {
   const stats = lstatOrNull(path);
@@ -159,9 +165,12 @@ export function classifyEntry(path: string, canonical: string, canonicalVersion:
     try {
       target = resolve(dirname(path), readlinkSync(path));
     } catch {
-      return { state: 'stale', version: null, mode: 'symlink' };
+      return { state: 'unmanaged', version: null, mode: 'symlink' };
     }
-    if (canonicalVersion !== null && samePath(target, canonical)) {
+    if (!pointsAtCanonical(target, canonical)) {
+      return { state: 'unmanaged', version: null, mode: 'symlink' };
+    }
+    if (canonicalVersion !== null) {
       return { state: 'linked', version: canonicalVersion, mode: 'symlink' };
     }
     return { state: 'stale', version: null, mode: 'symlink' };
@@ -200,13 +209,24 @@ function copyTree(source: string, dest: string): void {
   cpSync(source, dest, { recursive: true, dereference: true });
 }
 
-/** Writes the canonical store: a real directory, copied from the bundled asset. */
+/** Writes the canonical store atomically via a sibling temp directory + rename. */
 function writeCanonical(canonical: string, source: string, version: string, installedAt: string): void {
-  removeEntry(canonical);
-  mkdirSync(canonical, { recursive: true });
-  copyTree(source, canonical);
-  writeMarker(canonical, version, installedAt);
+  const parent = dirname(canonical);
+  mkdirSync(parent, { recursive: true });
+  const stage = `${canonical}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    mkdirSync(stage, { recursive: true });
+    copyTree(source, stage);
+    writeMarker(stage, version, installedAt);
+    removeEntry(canonical);
+    renameSync(stage, canonical);
+  } catch (error) {
+    rmSync(stage, { recursive: true, force: true });
+    throw error;
+  }
 }
+
+const SYMLINK_FALLBACK_CODES = new Set(['EPERM', 'EACCES', 'ENOTSUP', 'EROFS']);
 
 /**
  * Materialises one harness path: symlink first, copy on `EPERM`/restricted
@@ -225,8 +245,10 @@ function writeTarget(
     try {
       symlinkSync(canonical, path, 'dir');
       return { state: 'linked', mode: 'symlink' };
-    } catch {
-      // Fall through: some filesystems (and Windows without privileges) deny links.
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (code === undefined || !SYMLINK_FALLBACK_CODES.has(code)) throw error;
+      process.stderr.write(`novaflow: symlink unavailable for ${path} (${code}); falling back to copy.\n`);
     }
   }
   copyTree(canonical, path);
@@ -357,7 +379,9 @@ export function uninstallSkill(options: {
   const canonicalExists = lstatOrNull(root.canonical) !== null;
 
   const blockable: string[] = [];
-  if (canonicalExists && !canonical.managed) blockable.push(`Canonical skill directory ${root.canonical}`);
+  if (selection.includeCanonical && canonicalExists && !canonical.managed) {
+    blockable.push(`Canonical skill directory ${root.canonical}`);
+  }
 
   const targets = selection.ids.map((harness) => {
     const layout = layoutFor(harness, root);
@@ -373,7 +397,7 @@ export function uninstallSkill(options: {
     );
   }
 
-  const canonicalRemoved = canonicalExists;
+  const canonicalRemoved = selection.includeCanonical && canonicalExists;
   if (!options.dryRun && canonicalRemoved) removeEntry(root.canonical);
 
   const targetReports = targets.map(({ harness, path, info }) => {

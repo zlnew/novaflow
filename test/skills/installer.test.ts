@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { seedGitRoot, seedMarker, seedUnmanaged, skillBox, type SkillBox } from './helpers.js';
@@ -195,6 +195,58 @@ describe('skill status', () => {
       ['novaflow skill install'],
     );
   });
+
+  it('reports broken canonical symlinks as stale and foreign symlinks as unmanaged', () => {
+    const box = makeBox();
+    box.seed('claude');
+    box.seed('codex');
+    box.json(['skill', 'install']);
+    rmSync(box.paths.canonical, { recursive: true, force: true });
+
+    const foreign = join(box.box.root, 'dotfiles-skill');
+    seedUnmanaged(foreign);
+    unlinkSync(box.paths.harness('codex'));
+    symlinkSync(foreign, box.paths.harness('codex'), 'dir');
+
+    const envelope = box.json(['skill', 'status']);
+    assert.equal(envelope.data.canonical.installed, false);
+    assert.deepEqual(states(envelope.data.targets), { claude: 'stale', codex: 'unmanaged' });
+  });
+
+  it('upgrades a canonical store carrying an older version marker', () => {
+    const box = makeBox();
+    box.seed('claude');
+    seedMarker(box.paths.canonical, '0.9.0');
+
+    const envelope = box.json(['skill', 'install']);
+    assert.equal(envelope.data.changed, true);
+    assert.equal(envelope.data.canonical.changed, true);
+    assert.equal(box.marker(box.paths.canonical)?.version, '1.0.0');
+    assert.equal(box.state(box.paths.harness('claude')), 'symlink');
+  });
+
+  it('refuses to overwrite or unlink a foreign symlink without --force', () => {
+    const box = makeBox();
+    const foreign = join(box.box.root, 'foreign-skill');
+    seedUnmanaged(foreign);
+    const claudeSkills = join(box.paths.configDir('claude'), 'skills');
+    mkdirSync(claudeSkills, { recursive: true });
+    symlinkSync(foreign, box.paths.harness('claude'), 'dir');
+
+    const installRefused = box.run(['skill', 'install', '--json']);
+    assert.equal(installRefused.code, 3);
+    assert.equal(JSON.parse(installRefused.stderr).error.code, 'STATE_CONFLICT');
+    assert.equal(existsSync(box.paths.canonical), false);
+
+    const uninstallRefused = box.run(['skill', 'uninstall', '--agent', 'claude', '--json']);
+    assert.equal(uninstallRefused.code, 3);
+    assert.equal(JSON.parse(uninstallRefused.stderr).error.code, 'STATE_CONFLICT');
+    assert.equal(box.state(box.paths.harness('claude')), 'symlink');
+
+    const forced = box.json(['skill', 'install', '--force']);
+    assert.equal(forced.data.changed, true);
+    assert.deepEqual(states(forced.data.targets), { claude: 'linked' });
+  });
 });
 
 describe('skill uninstall', () => {
@@ -212,6 +264,19 @@ describe('skill uninstall', () => {
     assert.equal(box.state(box.paths.harness('claude')), 'missing');
     assert.equal(box.state(box.paths.harness('codex')), 'missing');
     assert.equal(readFileSync(join(sibling, 'SKILL.md'), 'utf8'), '# hand written skill\n');
+  });
+
+  it('keeps the canonical store and other links when uninstalling a subset with --agent', () => {
+    const box = makeBox();
+    box.seed('claude');
+    box.seed('codex');
+    box.json(['skill', 'install']);
+
+    const envelope = box.json(['skill', 'uninstall', '--agent', 'claude']);
+    assert.equal(envelope.data.canonical.removed, false);
+    assert.equal(existsSync(box.paths.canonical), true);
+    assert.equal(box.state(box.paths.harness('claude')), 'missing');
+    assert.equal(box.state(box.paths.harness('codex')), 'symlink');
   });
 
   it('refuses to delete an unmanaged directory without --force', () => {
@@ -322,5 +387,14 @@ describe('skill command surface', () => {
     assert.equal(result.code, 2);
     const envelope = JSON.parse(result.stderr) as { error: { code: string } };
     assert.equal(envelope.error.code, 'VALIDATION_ERROR');
+  });
+
+  it('rejects malformed --agent lists like claude,auto or , with exit 2', () => {
+    const box = makeBox();
+    for (const bad of ['claude,auto', ',', '']) {
+      const result = box.run(['skill', 'install', '--agent', bad, '--json']);
+      assert.equal(result.code, 2, `expected exit 2 for --agent ${JSON.stringify(bad)}`);
+      assert.equal(JSON.parse(result.stderr).error.code, 'VALIDATION_ERROR');
+    }
   });
 });
