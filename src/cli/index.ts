@@ -207,8 +207,14 @@ function checkPositionals(verb: VerbSpec, rest: readonly string[]): void {
 /**
  * Runs one invocation and returns its exit code. Never throws, never reads
  * `stdin`, and writes at most one JSON envelope per stream.
+ *
+ * Async only because long-lived commands (`mcp`) settle when their stream ends;
+ * every other command's `run` resolves immediately.
  */
-export function main(argv: readonly string[] = process.argv.slice(2), streams: Streams = processStreams): number {
+export async function main(
+  argv: readonly string[] = process.argv.slice(2),
+  streams: Streams = processStreams,
+): Promise<number> {
   const wants = requested(argv);
 
   if (wants.version) {
@@ -294,8 +300,9 @@ export function main(argv: readonly string[] = process.argv.slice(2), streams: S
   };
 
   try {
-    const result = verb.run(context);
-    writeSuccess(verb.command, result, options, streams);
+    const result = await verb.run(context);
+    // A command that owns stdout (`mcp`) must not have an envelope appended to it.
+    if (result.silent !== true) writeSuccess(verb.command, result, options, streams);
     return 0;
   } catch (error) {
     return writeFailure(verb.command, error, { json: options.json }, streams);
@@ -303,7 +310,7 @@ export function main(argv: readonly string[] = process.argv.slice(2), streams: S
 }
 
 try {
-  process.exitCode = main();
+  process.exitCode = await main();
 } catch (error) {
   const novaError = toNovaError(error);
   process.stderr.write(`novaflow: ${novaError.message}\n`);

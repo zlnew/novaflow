@@ -1,23 +1,34 @@
 /**
  * `novaflow mcp` — stateless stdio MCP server (`novaflow-v100/mcp`).
  *
- * P3 owns the dispatch only; the tool adapter lands in P4a. Until then the
- * command fails cleanly with a `VALIDATION_ERROR` (exit 2) instead of hanging on
- * `stdin`.
+ * The command's whole job is dispatch: build the server, attach stdio, and serve
+ * until `stdin` closes. `--workspace` gives every tool call its fallback target;
+ * a call's own `workspace` argument still wins (`novaflow-v100/mcp` §1).
+ *
+ * The result is marked `silent` because the transport owns `stdout`: writing a
+ * success envelope here would corrupt the JSON-RPC framing.
  */
+import { TOOL_NAMES, runStdioServer } from '../../mcp/index.js';
 import type { CommandModule, VerbSpec } from '../types.js';
-import { notImplemented } from './not-implemented.js';
 
 const mcpVerb: VerbSpec = {
   verb: null,
   command: 'mcp',
-  summary: 'Start the stateless stdio MCP server (wired in P4a)',
-  usage: 'novaflow mcp',
+  summary: 'Serve the NovaFlow workspace, project, task, event, and export tools over stdio',
+  usage: 'novaflow mcp [--workspace <name|path>]',
   positionals: [],
   flags: [],
-  examples: ['novaflow mcp'],
-  run: () => {
-    throw notImplemented('mcp', 'P4a', 'novaflow-v100/mcp');
+  examples: ['novaflow mcp', 'novaflow mcp --workspace personal', 'novaflow mcp -w ~/www/personal'],
+  run: async (ctx) => {
+    await runStdioServer({
+      workspace: ctx.options.workspace ?? null,
+      env: ctx.env,
+      cwd: ctx.cwd,
+    });
+    return {
+      data: { transport: 'stdio', tool_count: TOOL_NAMES.length, closed: true },
+      silent: true,
+    };
   },
 };
 

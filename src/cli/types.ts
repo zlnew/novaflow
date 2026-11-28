@@ -24,6 +24,11 @@ export interface CommandResult {
   quiet?: string;
   /** Actionable follow-ups; always emitted, as `[]` when there are none. */
   next_actions?: NextAction[];
+  /**
+   * The command owns `stdout` for the rest of the invocation (`mcp`), so the
+   * dispatcher writes no envelope, identifiers, or human rendering for it.
+   */
+  silent?: boolean;
 }
 
 /** Global options every command receives (`novaflow-v100/cli` §2). */
@@ -63,7 +68,11 @@ export interface VerbSpec {
   /** Flags specific to this verb; global flags are merged by the dispatcher. */
   flags: readonly FlagDef[];
   examples?: readonly string[];
-  run(context: CliContext): CommandResult;
+  /**
+   * Runs the command. A long-lived command (`mcp`) returns a promise that settles
+   * when its stream ends; every other command returns its result synchronously.
+   */
+  run(context: CliContext): CommandResult | Promise<CommandResult>;
 }
 
 export interface CommandModule {
