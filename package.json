@@ -1,7 +1,7 @@
 {
   "name": "novaflow",
   "version": "1.0.0",
-  "description": "Deterministic, daemonless local-first orchestration for chains of coding-agent tasks: SQLite state, DAG dependencies, leases, and MCP.",
+  "description": "Daemonless, local-first task ledger for coding agents: SQLite-backed workspaces, projects, and tasks with DAG dependencies, leases, handoff context, a CLI, and an MCP server.",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -24,21 +24,26 @@
   },
   "keywords": [
     "novaflow",
-    "coding-agent",
+    "agentskills",
     "agent-orchestration",
     "orchestration",
-    "workflow",
-    "fsm",
-    "sqlite",
+    "orchestrator",
     "cli",
     "mcp",
+    "sqlite",
+    "tasks",
+    "task-queue",
     "dag",
-    "task-queue"
+    "workflow",
+    "fsm",
+    "local-first",
+    "daemonless"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json",
-    "test": "tsx --test \"test/**/*.test.ts\""
+    "test": "tsx --test \"test/**/*.test.ts\"",
+    "prepublishOnly": "npm run typecheck && npm run build && npm test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
