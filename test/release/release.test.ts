@@ -73,9 +73,22 @@ function lib(script: string, env: ExtraEnv = {}): { code: number; stdout: string
   };
 }
 
+/** Strips npm-inherited config vars (e.g. from `npm publish --dry-run` prepublishOnly). */
+function cleanNpmEnv(extra: ExtraEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
+  delete env.npm_config_dry_run;
+  delete env.npm_config_pack_destination;
+  return env;
+}
+
 /** The `npm pack --dry-run --json` file list, normalised across npm versions. */
 function packPaths(args: readonly string[] = ['pack', '--dry-run', '--json']): string[] {
-  const result = spawnSync('npm', [...args], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000 });
+  const result = spawnSync('npm', [...args], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    timeout: 120_000,
+    env: cleanNpmEnv(),
+  });
   assert.equal(result.status, 0, `npm ${args.join(' ')} failed: ${result.stderr}`);
   const parsed: unknown = JSON.parse(result.stdout);
   const meta = (Array.isArray(parsed) ? parsed[0] : Object.values(parsed as Record<string, unknown>)[0]) as {
@@ -357,10 +370,11 @@ describe('published tarball', () => {
     ensureBuild();
     const work = scratchDir('novaflow-tarball-');
 
-    const packed = spawnSync('npm', ['pack', '--pack-destination', work], {
+    const packed = spawnSync('npm', ['pack', '--dry-run=false', '--pack-destination', work], {
       cwd: REPO_ROOT,
       encoding: 'utf8',
       timeout: 120_000,
+      env: cleanNpmEnv(),
     });
     assert.equal(packed.status, 0, `npm pack failed: ${packed.stderr}`);
     const tarball = readdirSync(work).find((name) => name.endsWith('.tgz'));
@@ -369,8 +383,8 @@ describe('published tarball', () => {
     const prefix = join(work, 'prefix');
     const installed = spawnSync(
       'npm',
-      ['install', '-g', '--prefix', prefix, '--no-audit', '--no-fund', '--offline', join(work, tarball)],
-      { cwd: work, encoding: 'utf8', timeout: 300_000 },
+      ['install', '-g', '--dry-run=false', '--prefix', prefix, '--no-audit', '--no-fund', '--offline', join(work, tarball)],
+      { cwd: work, encoding: 'utf8', timeout: 300_000, env: cleanNpmEnv() },
     );
     assert.equal(installed.status, 0, `npm install -g failed: ${installed.stderr}`);
     assert.doesNotMatch(installed.stdout + installed.stderr, /node-gyp|prebuild-install/, 'no native compilation');

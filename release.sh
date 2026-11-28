@@ -159,14 +159,14 @@ smoke_tarball() {
   local work tgz prefix log home workspace bin
   work="$(new_tmp)"
   step "packing a real tarball"
-  npm pack --pack-destination "$work" >/dev/null 2>&1 || die "npm pack failed"
+  env -u npm_config_dry_run -u npm_config_pack_destination npm pack --dry-run=false --pack-destination "$work" >/dev/null 2>&1 || die "npm pack failed"
   tgz="$(find "$work" -maxdepth 1 -name '*.tgz' -print -quit)"
   [ -n "$tgz" ] || die "npm pack produced no .tgz"
 
   prefix="$work/prefix"
   log="$work/install.log"
   step "installing the tarball into an isolated prefix"
-  if ! npm install -g --prefix "$prefix" --no-audit --no-fund --prefer-offline "$tgz" >"$log" 2>&1; then
+  if ! env -u npm_config_dry_run npm install -g --dry-run=false --prefix "$prefix" --no-audit --no-fund --prefer-offline "$tgz" >"$log" 2>&1; then
     printf '%s\n' "$(cat "$log")" >&2
     die "npm install -g failed for ${tgz}"
   fi
