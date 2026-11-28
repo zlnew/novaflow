@@ -197,21 +197,16 @@ describe('cli export', () => {
 });
 
 describe('cli extension hooks', () => {
-  it('answers skill with a clean not-implemented VALIDATION_ERROR', () => {
+  it('documents mcp and skill as real commands instead of placeholders', () => {
     const box = makeBox();
-    for (const args of [['skill', 'install'], ['skill', 'status'], ['skill', 'uninstall']]) {
-      const error = box.jsonError(args);
-      assert.equal(error.code, 'VALIDATION_ERROR');
-      assert.match(error.message, /not available in this build|not implemented/i);
-      assert.notEqual(box.run(args).code, 0);
-    }
-  });
+    const mcpHelp = box.run(['mcp', '--help']);
+    assert.equal(mcpHelp.code, 0);
+    assert.match(mcpHelp.stdout, /novaflow mcp/);
+    assert.doesNotMatch(mcpHelp.stdout, /wired in P4a/);
 
-  it('documents mcp as a real command instead of a placeholder', () => {
-    const box = makeBox();
-    const help = box.run(['mcp', '--help']);
-    assert.equal(help.code, 0);
-    assert.match(help.stdout, /novaflow mcp/);
-    assert.doesNotMatch(help.stdout, /wired in P4a/);
+    const skillHelp = box.run(['skill', '--help']);
+    assert.equal(skillHelp.code, 0);
+    assert.match(skillHelp.stdout, /novaflow skill/);
+    assert.doesNotMatch(skillHelp.stdout, /wired in P4b/);
   });
 });
