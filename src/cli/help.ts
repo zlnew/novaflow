@@ -1,86 +1,117 @@
-import { EXIT_CODES } from "./exitcode.ts";
-import { findVerb, nounNames, verbKey, verbsOf, type Verb } from "./verbs.ts";
-
 /**
- * The help renderers (srs 4.1.1; W4 R4.1). THREE surfaces, one table:
+ * Scoped help rendering (`novaflow-v100/cli` §2).
  *
- *   `nova <noun> <verb> --help` / `-h`  → that verb's usage, flags, ONE example (exit 0)
- *   `nova help <noun>`                  → the noun's verbs, one line each (exit 0)
- *   `nova help` (and bare `nova`)       → the program overview
- *
- * The verb block is what the observed defect asked for: an operator one flag
- * away from the answer gets one verb, not the whole manual. `OVERVIEW` is
- * generated from the same table the dispatcher refuses verbs against, so a
- * verb that exists cannot be missing from either list.
+ * Help goes to `stdout` and exits `0`: it is requested output, not a diagnostic.
  */
+import { GLOBAL_FLAGS, type FlagDef } from './args.js';
+import type { CommandModule, VerbSpec } from './types.js';
+import { VERSION_LINE } from './version.js';
 
-/** The program overview: every verb, one synopsis line each. */
-export function renderOverview(): string {
-  return [
-    "USAGE: nova <noun> <sub> [args] [flags]",
-    "  common flags: --workspace <slug|id>   --json   --watch",
-    "",
-    ...nounNames().flatMap((noun) => verbsOf(noun).map((verb) => `  ${verb.synopsis}`)),
-    "",
-    "Run `nova help <noun>` to list one noun's verbs,",
-    "`nova <noun> <verb> --help` for one verb's flags and an example.",
-  ].join("\n");
+const EXIT_CODES: readonly (readonly [string, string])[] = [
+  ['0', 'Success'],
+  ['1', 'Runtime / Internal Error'],
+  ['2', 'Usage / Validation Error'],
+  ['3', 'State / Domain Conflict'],
+  ['4', 'Not Found'],
+];
+
+function flagLine(def: FlagDef): string {
+  const short = def.short === undefined ? '' : `-${def.short}, `;
+  const value = def.kind === 'boolean' ? '' : ` ${def.placeholder ?? '<value>'}`;
+  return `${short}--${def.name}${value}`;
 }
 
-/** `nova chain clean --help` — this verb only. */
-export function renderVerbHelp(verb: Verb): string {
-  const flags: Array<[string, string]> = [
-    ...verb.flags.map((flag): [string, string] => {
-      const split = flag.search(/\s{2,}/);
-      return split < 0 ? [flag, ""] : [flag.slice(0, split), flag.slice(split).trim()];
-    }),
-    ["-h, --help", "print this usage and exit 0"],
-  ];
-  if (verb.json) flags.push(["--json", "print one JSON document instead of the table"]);
-  const width = Math.max(...flags.map(([name]) => name.length));
-
-  return [
-    `USAGE`,
-    `  ${verb.synopsis}`,
-    ``,
-    `PURPOSE`,
-    `  ${verb.purpose}`,
-    ``,
-    `FLAGS`,
-    ...flags.map(([name, desc]) => (desc === "" ? `  ${name}` : `  ${name.padEnd(width)}  ${desc}`)),
-    ``,
-    `EXAMPLE`,
-    `  ${verb.example}`,
-    ``,
-    `EXIT`,
-    `  ${verb.exits.join(" ")}   ${verb.exits
-      .map((code) => `${String(code)}=${EXIT_CODES[code].short}`)
-      .join("  ")}`,
-    ``,
-    verbsOf(verb.noun).length === 1
-      ? "Run `nova help` for the whole verb list."
-      : `Run \`nova help ${verb.noun}\` to list every ${verb.noun} verb.`,
-  ].join("\n");
+function flagBlock(flags: readonly FlagDef[]): string {
+  const width = Math.max(...flags.map((def) => flagLine(def).length));
+  return flags.map((def) => `  ${flagLine(def).padEnd(width)}  ${def.description}`).join('\n');
 }
 
-/** `nova help chain` — the noun's verbs, one line each. */
-export function renderNounHelp(noun: string): string {
-  const verbs = verbsOf(noun);
-  const width = Math.max(...verbs.map((verb) => (verb.sub ?? "").length));
-  return [
-    `USAGE: nova ${noun}${verbs.some((v) => v.sub !== null) ? " <verb> [args] [flags]" : " [args] [flags]"}`,
-    ``,
-    `VERBS`,
-    ...verbs.map((verb) => `  ${(verb.sub ?? "(none)").padEnd(width)}  ${verb.purpose}`),
-    ``,
-    `Run \`nova ${noun} <verb> --help\` for that verb's flags and one example.`,
-  ].join("\n");
+function exitCodeBlock(): string {
+  const width = Math.max(...EXIT_CODES.map(([code]) => code.length));
+  return EXIT_CODES.map(([code, meaning]) => `  ${code.padEnd(width)}  ${meaning}`).join('\n');
 }
 
-/** `nova help <noun> <verb>` — the same block `--help` prints. */
-export function verbHelpFor(noun: string, sub: string | undefined): string | null {
-  const verb = findVerb(noun, sub);
-  return verb === undefined ? null : renderVerbHelp(verb);
+/** Global help: command tree, global flags, exit codes. */
+export function renderGlobalHelp(modules: readonly CommandModule[]): string {
+  const lines: string[] = [];
+  lines.push(VERSION_LINE);
+  lines.push('');
+  lines.push('Usage: novaflow <noun> <verb> [args] [flags]');
+  lines.push('');
+  lines.push('Commands:');
+  const nounWidth = Math.max(...modules.map((module) => module.name.length));
+  for (const module of modules) {
+    const verbs = module.verbs.map((verb) => verb.verb ?? module.name).join('|');
+    lines.push(`  ${module.name.padEnd(nounWidth)}  ${verbs}`);
+  }
+  lines.push('');
+  lines.push('Global flags (accepted on every command, in any position):');
+  lines.push(flagBlock(GLOBAL_FLAGS));
+  lines.push('');
+  lines.push('Exit codes:');
+  lines.push(exitCodeBlock());
+  lines.push('');
+  lines.push('Run "novaflow <noun> --help" or "novaflow <noun> <verb> --help" for scoped help.');
+  return `${lines.join('\n')}\n`;
 }
 
-export { findVerb, verbKey };
+/** Noun-level help: every verb with its usage line. */
+export function renderModuleHelp(module: CommandModule): string {
+  const lines: string[] = [];
+  lines.push(VERSION_LINE);
+  lines.push('');
+  lines.push(module.summary);
+  lines.push('');
+  lines.push(`Usage: novaflow ${module.name} <verb> [args] [flags]`);
+  lines.push('');
+  lines.push('Verbs:');
+  const width = Math.max(...module.verbs.map((verb) => verb.command.length));
+  for (const verb of module.verbs) {
+    lines.push(`  ${verb.command.padEnd(width)}  ${verb.summary}`);
+  }
+  lines.push('');
+  lines.push('Global flags (accepted on every command, in any position):');
+  lines.push(flagBlock(GLOBAL_FLAGS));
+  lines.push('');
+  lines.push('Exit codes:');
+  lines.push(exitCodeBlock());
+  lines.push('');
+  lines.push(`Run "novaflow ${module.name} <verb> --help" for flags and examples.`);
+  return `${lines.join('\n')}\n`;
+}
+
+/** Verb-level help: usage, args, flags, examples, exit codes. */
+export function renderVerbHelp(verb: VerbSpec): string {
+  const lines: string[] = [];
+  lines.push(VERSION_LINE);
+  lines.push('');
+  lines.push(verb.summary);
+  lines.push('');
+  lines.push(`Usage: ${verb.usage}`);
+  if (verb.positionals.length > 0) {
+    lines.push('');
+    lines.push('Arguments:');
+    const width = Math.max(...verb.positionals.map((name) => name.length));
+    const required = verb.minPositionals ?? verb.positionals.length;
+    for (const [index, name] of verb.positionals.entries()) {
+      lines.push(`  ${name.padEnd(width)}  ${index < required ? 'required' : 'optional'}`);
+    }
+  }
+  if (verb.flags.length > 0) {
+    lines.push('');
+    lines.push('Flags:');
+    lines.push(flagBlock(verb.flags));
+  }
+  lines.push('');
+  lines.push('Global flags (accepted on every command, in any position):');
+  lines.push(flagBlock(GLOBAL_FLAGS));
+  if (verb.examples !== undefined && verb.examples.length > 0) {
+    lines.push('');
+    lines.push('Examples:');
+    for (const example of verb.examples) lines.push(`  ${example}`);
+  }
+  lines.push('');
+  lines.push('Exit codes:');
+  lines.push(exitCodeBlock());
+  return `${lines.join('\n')}\n`;
+}
